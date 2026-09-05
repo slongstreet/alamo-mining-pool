@@ -64,6 +64,8 @@ that draws its charts as inline SVG.
 
 ### alamo
 Config loading and validation, tracing setup, task supervision, graceful shutdown.
+SIGINT and SIGTERM take the same path: cancel every task, flush pending accounting to
+the store, and exit once the servers drain or after five seconds, whichever comes first.
 
 ## Payouts
 Solo means no payout ledger. The coinbase of every job pays the address the connecting

@@ -73,6 +73,8 @@ Work proceeds in waves. Each wave ends with something runnable and tested.
   library; the built dashboard is about 70 kB before compression.
 
 ## Wave 5 — Hardening and packaging
+- [x] SIGTERM triggers the same graceful shutdown and accounting flush as SIGINT, so
+  systemd and Docker stops no longer drop the last batch of shares.
 - ZMQ `hashblock` notifications instead of polling.
 - Node reconnect and template staleness handling.
 - Prometheus metrics endpoint.
