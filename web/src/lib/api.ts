@@ -26,6 +26,16 @@ export interface RoundStatus {
   luck_percent: number | null;
 }
 
+export interface NodeStatus {
+  connected: boolean;
+  stale: boolean;
+  failures: number;
+  last_error: string | null;
+  last_ok_seconds: number | null;
+  /** null when ZMQ is not configured, else whether the subscription is up. */
+  zmq: boolean | null;
+}
+
 export interface CoinStatus {
   symbol: string;
   chain: string;
@@ -35,6 +45,7 @@ export interface CoinStatus {
   coinbase_value: number;
   odds: OddsSummary;
   round: RoundStatus;
+  node: NodeStatus;
 }
 
 export interface AuxPayoutStatus {

@@ -5,6 +5,7 @@
 pub mod api;
 pub mod assets;
 pub mod config;
+pub mod metrics;
 pub mod snapshot;
 
 use alamo_store::Store;
@@ -18,7 +19,9 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
 pub use config::WebConfig;
-pub use snapshot::{AuxPayoutStatus, CoinStatus, PoolSnapshot, RoundStatus, WorkerStatus};
+pub use snapshot::{
+    AuxPayoutStatus, CoinStatus, NodeStatus, PoolSnapshot, RoundStatus, WorkerStatus,
+};
 
 /// State shared with request handlers.
 #[derive(Clone)]
@@ -111,6 +114,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/hashrate", get(api::hashrate))
         .route("/api/shares", get(api::shares))
         .route("/api/blocks", get(api::blocks))
+        .route("/metrics", get(metrics::metrics))
         .fallback(assets::serve)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

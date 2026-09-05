@@ -84,11 +84,8 @@ async fn mines_a_block_on_regtest() {
     let (parent_tx, parent_rx) = watch::channel(None);
     tokio::spawn(
         TemplateSource {
-            rpc: rpc.clone(),
-            coin: coin.clone(),
-            coinbase_tag: b"/alamo-test/".to_vec(),
             poll_interval: Duration::from_millis(200),
-            refresh_interval: Duration::from_secs(30),
+            ..TemplateSource::new(rpc.clone(), coin.clone(), b"/alamo-test/".to_vec())
         }
         .run(parent_tx, shutdown.child_token()),
     );
@@ -97,11 +94,12 @@ async fn mines_a_block_on_regtest() {
         let (aux_tx, aux_rx) = watch::channel(None);
         tokio::spawn(
             TemplateSource {
-                rpc: doge_rpc.clone(),
-                coin: Arc::new(Dogecoin),
-                coinbase_tag: b"/alamo-test/".to_vec(),
                 poll_interval: Duration::from_millis(200),
-                refresh_interval: Duration::from_secs(30),
+                ..TemplateSource::new(
+                    doge_rpc.clone(),
+                    Arc::new(Dogecoin),
+                    b"/alamo-test/".to_vec(),
+                )
             }
             .run(aux_tx, shutdown.child_token()),
         );

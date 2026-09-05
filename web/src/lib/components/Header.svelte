@@ -18,6 +18,7 @@
     polling: 'polling',
     offline: 'offline',
   };
+  const down = $derived(status?.coins.filter((c) => !c.node.connected) ?? []);
   const themeLabel = $derived(
     theme.theme === 'system' ? 'Auto theme' : theme.theme === 'dark' ? 'Dark theme' : 'Light theme',
   );
@@ -32,6 +33,9 @@
         {#if status.coins.length}
           · {status.coins.map((c) => `${c.symbol} ${c.chain}`).join(' + ')}
         {/if}
+        {#each down as c (c.symbol)}
+          <span class="badge bad" title={c.node.last_error ?? ''}>{c.symbol} node {c.node.stale ? 'stale' : 'unreachable'}</span>
+        {/each}
       {:else if error}
         {error}
       {:else}

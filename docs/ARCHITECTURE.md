@@ -32,6 +32,20 @@ combines the parent's stream with the aux streams into `Arc<MergedWork>`. A pare
 change is a clean job; an aux tip change is a non-clean job, so parent shares in flight
 stay valid.
 
+When a coin has `zmq_hashblock` configured, a `ZmqSubscriber` keeps a subscription to the
+node's `hashblock` topic and every notification triggers an immediate poll. The subscriber
+speaks just enough ZMTP 3.0 itself (greeting, NULL handshake, subscription, frames), so
+there is no libzmq dependency. Polling never stops; it slows to every 10 s while the
+subscription is up and is the fallback when it is not.
+
+Each source reports `NodeHealth` on its own watch channel: whether the last RPC call
+succeeded, consecutive failures, the last error, and the ZMQ state. At startup the daemon
+retries an unreachable node with backoff instead of exiting, so it can boot before its
+nodes do. If a node stays unreachable past `template_stale_secs`, the source withdraws its
+template (`None` on the channel): a withdrawn aux template drops out of merged work on the
+next job, while a withdrawn parent leaves miners on their last job because stratum v1 has
+no way to pause them. When the node returns, the template is refetched whatever the tip.
+
 ### alamo-stratum
 Tokio TCP server. One task per connection, line-delimited JSON-RPC. Each session derives
 its own job from the shared `MergedWork` because every coinbase pays the addresses the
@@ -59,7 +73,8 @@ what round progress and luck are computed from.
 Axum router. `/api/status` is the snapshot document the publisher rebuilds every two
 seconds; `/api/ws` pushes the same document on every rebuild through a watch channel.
 `/api/hashrate`, `/api/shares`, and `/api/blocks` read history straight from the store.
-Everything else is served from the embedded `web/dist`. The dashboard is a Svelte 5 SPA
+`/metrics` renders the same snapshot in the Prometheus text format, so scraping costs no
+database reads. Everything else is served from the embedded `web/dist`. The dashboard is a Svelte 5 SPA
 that draws its charts as inline SVG.
 
 ### alamo

@@ -202,6 +202,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_serves_prometheus_text() {
+        let (state, path) = state("metrics").await;
+        state.publish(PoolSnapshot {
+            shares_accepted: 3,
+            ..Default::default()
+        });
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()["content-type"],
+            crate::metrics::CONTENT_TYPE_TEXT
+        );
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("alamo_shares_total{result=\"accepted\"} 3\n"));
+        assert!(text.contains("alamo_info{version=\""));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
     async fn unknown_path_serves_dashboard_or_placeholder() {
         let (state, path) = state("spa").await;
         let res = router(state)

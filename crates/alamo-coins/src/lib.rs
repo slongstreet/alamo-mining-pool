@@ -11,6 +11,7 @@ pub mod ltc;
 pub mod merged;
 pub mod rpc;
 pub mod template;
+pub mod zmq;
 
 use alamo_core::{AddressParams, Algorithm};
 use std::sync::Arc;
@@ -20,7 +21,8 @@ pub use doge::Dogecoin;
 pub use ltc::Litecoin;
 pub use merged::merge;
 pub use rpc::{RpcClient, RpcError};
-pub use template::{RawTemplate, TemplateError, TemplateSource};
+pub use template::{NodeHealth, RawTemplate, TemplateError, TemplateSource};
+pub use zmq::{ZmqError, ZmqStatus, ZmqSubscriber};
 
 /// Which network a node is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

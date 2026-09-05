@@ -52,6 +52,26 @@ pub struct CoinStatus {
     pub odds: OddsSummary,
     /// The round in progress and lifetime luck on this chain.
     pub round: RoundStatus,
+    /// Whether the node behind this chain is answering.
+    pub node: NodeStatus,
+}
+
+/// Reachability of one chain's node.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct NodeStatus {
+    /// Whether the most recent RPC call succeeded.
+    pub connected: bool,
+    /// Whether the template was withdrawn because the node stayed unreachable too long.
+    /// The figures shown for this chain come from the last template it did serve.
+    pub stale: bool,
+    /// Consecutive failed polls.
+    pub failures: u32,
+    /// The most recent RPC failure while unreachable.
+    pub last_error: Option<String>,
+    /// Seconds since the node last answered, if it ever has.
+    pub last_ok_seconds: Option<u64>,
+    /// ZMQ block notifications: `null` when not configured, else whether subscribed.
+    pub zmq: Option<bool>,
 }
 
 /// Work since the last block on a chain, compared with what a block is expected to take.

@@ -19,3 +19,6 @@ tracing.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 futures.workspace = true
+
+[dev-dependencies]
+alamo-core = { workspace = true, features = ["test-util"] }
