@@ -1,0 +1,23 @@
+[Unit]
+Description=Alamo solo mining pool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alamo
+Group=alamo
+ExecStart=/usr/local/bin/alamo --config /etc/alamo/alamo.toml
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/var/lib/alamo
+Environment=RUST_LOG=info
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/alamo
+
+[Install]
+WantedBy=multi-user.target

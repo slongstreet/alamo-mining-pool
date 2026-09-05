@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/alamo-core",
+    "crates/alamo-coins",
+    "crates/alamo-stratum",
+    "crates/alamo-store",
+    "crates/alamo-web",
+    "crates/alamo",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/slongstreet/alamo-mining-pool"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates
+alamo-core = { path = "crates/alamo-core" }
+alamo-coins = { path = "crates/alamo-coins" }
+alamo-stratum = { path = "crates/alamo-stratum" }
+alamo-store = { path = "crates/alamo-store" }
+alamo-web = { path = "crates/alamo-web" }
+
+# Async runtime and utilities
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+bytes = "1.12"
+parking_lot = "0.12"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Serialization and config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+humantime-serde = "1.1"
+
+# Errors and CLI
+anyhow = "1.0"
+thiserror = "2.0"
+clap = { version = "4.6", features = ["derive", "env"] }
+
+# Crypto and consensus
+bitcoin = { version = "0.32", features = ["serde"] }
+scrypt = { version = "0.12", default-features = false }
+sha2 = "0.11"
+hex = "0.4"
+primitive-types = { version = "0.14", default-features = false }
+rand = "0.10"
+
+# Node RPC
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+# Storage
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Web
+axum = { version = "0.8", features = ["json", "ws"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+rust-embed = { version = "8.12", features = ["include-exclude"] }
+mime_guess = "2.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = true
+panic = "abort"
+
+[profile.dev.package."*"]
+# Optimize dependencies (scrypt, sha2) even in dev so tests are not painfully slow.
+opt-level = 2

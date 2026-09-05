@@ -1,0 +1,49 @@
+# Alamo Mining Pool example configuration.
+# Copy to alamo.toml and edit. Run with: alamo --config alamo.toml
+
+[pool]
+name = "Alamo Solo Pool"
+# Directory for the SQLite database and other state.
+data_dir = "./data"
+
+[stratum]
+listen = "0.0.0.0:3333"
+
+[stratum.vardiff]
+# Share difficulty a new connection starts at.
+initial_difficulty = 65536
+min_difficulty = 1024
+max_difficulty = 16777216
+# Aim for roughly one share every N seconds per worker.
+target_share_seconds = 10
+# How often to re-evaluate a worker's difficulty.
+retarget_seconds = 60
+# Only retarget when the observed interval is off by more than this percentage.
+variance_percent = 30
+
+[web]
+listen = "0.0.0.0:8080"
+
+# Litecoin is the parent chain. Miners connect with an LTC address as username.
+[coins.ltc]
+enabled = true
+rpc_url = "http://127.0.0.1:9332"
+rpc_user = "alamo"
+rpc_password = "change-me"
+# Optional: block notifications instead of polling.
+# zmq_hashblock = "tcp://127.0.0.1:28332"
+# Paid if a worker's username is not a valid LTC address.
+fallback_address = "ltc1qexampleexampleexampleexampleexampleexamp"
+# Text placed in the coinbase scriptSig.
+coinbase_tag = "/alamo/"
+
+# Dogecoin is merge-mined against Litecoin.
+[coins.doge]
+enabled = true
+merge_mined_with = "ltc"
+rpc_url = "http://127.0.0.1:22555"
+rpc_user = "alamo"
+rpc_password = "change-me"
+# zmq_hashblock = "tcp://127.0.0.1:28333"
+# Paid when a worker does not supply a DOGE address in the stratum password field.
+fallback_address = "DExampleExampleExampleExampleExampl"

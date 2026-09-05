@@ -1,0 +1,16 @@
+[package]
+name = "alamo-core"
+description = "Pure types and math for the Alamo mining pool: hashing, targets, difficulty, jobs, odds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sha2.workspace = true
+scrypt.workspace = true
+primitive-types.workspace = true
+hex.workspace = true
+serde.workspace = true
+thiserror.workspace = true

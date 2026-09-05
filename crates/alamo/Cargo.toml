@@ -1,0 +1,28 @@
+[package]
+name = "alamo"
+description = "Self-hosted solo mining pool with merge mining and live block odds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+default-run = "alamo"
+
+[[bin]]
+name = "alamo"
+path = "src/main.rs"
+
+[dependencies]
+alamo-coins.workspace = true
+alamo-core.workspace = true
+alamo-store.workspace = true
+alamo-stratum.workspace = true
+alamo-web.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,24 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Frontend
+web/node_modules
+web/dist
+web/.svelte-kit
+
+# Runtime data
+/data
+*.db
+*.db-wal
+*.db-shm
+
+# Local config
+/alamo.toml
+/config/*.local.toml
+
+# Editors / OS
+.DS_Store
+.idea
+.vscode
+*.swp
