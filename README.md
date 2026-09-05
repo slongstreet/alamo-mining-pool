@@ -13,8 +13,8 @@ next to your own full nodes, and watch your odds of hitting the next block in re
   time to block, and luck versus expectation, all live.
 
 > Status: Litecoin solo mining and Dogecoin merge mining work end to end on regtest,
-> including Litecoin MWEB blocks. Persistence, stats, and the dashboard are next. See
-> [docs/ROADMAP.md](docs/ROADMAP.md) for the waves.
+> including Litecoin MWEB blocks. Shares, workers, hashrate samples, and blocks persist
+> across restarts. The dashboard is next. See [docs/ROADMAP.md](docs/ROADMAP.md) for the waves.
 
 ## Layout
 

@@ -52,7 +52,7 @@ Work proceeds in waves. Each wave ends with something runnable and tested.
   `prepare-dogecoin.sh` mines past the auxpow start height, and the end-to-end test submits
   the same share as a Litecoin block and a merge-mined Dogecoin block. CI runs it.
 
-## Wave 3 — Persistence and stats
+## Wave 3 — Persistence and stats (done)
 - Share accounting, hashrate samples (per worker, per pool), blocks found, worker last-seen.
 - Retention and downsampling so the database stays small.
 - Restart safety: jobs and sessions rebuild cleanly.

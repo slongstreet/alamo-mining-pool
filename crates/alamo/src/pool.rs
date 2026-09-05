@@ -2,6 +2,7 @@
 //! confirmation tracking, and the status snapshot for the dashboard.
 
 use crate::config::Config;
+use crate::persist::Persistence;
 use crate::stats::Stats;
 use alamo_coins::{merge, Chain, Coin, CoinConfig, RpcClient, TemplateSource};
 use alamo_core::odds::OddsSummary;
@@ -14,7 +15,7 @@ use alamo_web::{AppState, CoinStatus, PoolSnapshot};
 use anyhow::{bail, Context};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -392,17 +393,43 @@ async fn publisher(
     chain: Chain,
     shutdown: CancellationToken,
 ) -> &'static str {
-    let mut stats = Stats::default();
+    let now = now_unix();
+    let mut stats = match Stats::load(&store, now).await {
+        Ok(s) => {
+            tracing::info!(
+                workers = s.workers(now).len(),
+                shares_accepted = s.shares_accepted(),
+                "restored stats"
+            );
+            s
+        }
+        Err(err) => {
+            tracing::warn!(%err, "could not restore stats");
+            Stats::default()
+        }
+    };
+    let mut persist = Persistence::new(store.clone(), now);
     let mut blocks: Vec<BlockRow> = Vec::new();
     let mut ticks: u32 = 0;
     let mut interval = tokio::time::interval(PUBLISH_INTERVAL);
     loop {
         tokio::select! {
             next = events.recv() => {
-                let Some(event) = next else { return "publisher" };
-                stats.apply(event, Instant::now());
+                let Some(event) = next else {
+                    flush_persist(&mut persist).await;
+                    return "publisher";
+                };
+                let ts = now_unix();
+                persist.observe(&event, ts);
+                stats.apply(&event, ts);
+                if persist.should_flush() {
+                    flush_persist(&mut persist).await;
+                }
             }
             _ = interval.tick() => {
+                if let Err(err) = persist.on_tick(&stats, now_unix()).await {
+                    tracing::warn!(%err, "could not persist accounting");
+                }
                 if ticks % BLOCKS_REFRESH_TICKS == 0 {
                     match store.recent_blocks(25).await {
                         Ok(rows) => blocks = rows,
@@ -412,8 +439,17 @@ async fn publisher(
                 ticks = ticks.wrapping_add(1);
                 state.publish(build_snapshot(&stats, &work, blocks.clone(), chain));
             }
-            _ = shutdown.cancelled() => return "publisher",
+            _ = shutdown.cancelled() => {
+                flush_persist(&mut persist).await;
+                return "publisher";
+            }
         }
+    }
+}
+
+async fn flush_persist(persist: &mut Persistence) {
+    if let Err(err) = persist.flush().await {
+        tracing::warn!(%err, "could not persist accounting");
     }
 }
 
@@ -434,7 +470,7 @@ fn build_snapshot(
     blocks: Vec<BlockRow>,
     chain: Chain,
 ) -> PoolSnapshot {
-    let now = Instant::now();
+    let now = now_unix();
     let workers = stats.workers(now);
     let hashrate = workers.iter().map(|w| w.hashrate).fold(0.0, |a, b| a + b);
     let current = work.borrow().clone();
