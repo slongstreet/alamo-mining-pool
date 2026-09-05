@@ -13,7 +13,6 @@ alamo-core.workspace = true
 alamo-store.workspace = true
 axum.workspace = true
 mime_guess.workspace = true
-parking_lot.workspace = true
 rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,4 +23,6 @@ tower-http.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
+tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }

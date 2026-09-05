@@ -19,6 +19,8 @@ struct WorkerStats {
     accepted: u64,
     rejected: u64,
     best_difficulty: f64,
+    /// Lifetime accepted work in difficulty units.
+    work_accepted: f64,
     last_share: Option<u64>,
     /// Accepted shares in the hashrate window: (unix time, job difficulty).
     window: VecDeque<(u64, f64)>,
@@ -54,6 +56,7 @@ impl Stats {
                 accepted: row.shares_accepted.max(0) as u64,
                 rejected: row.shares_rejected.max(0) as u64,
                 best_difficulty: row.best_difficulty,
+                work_accepted: row.work_accepted,
                 last_share: (row.shares_accepted > 0).then_some(row.last_seen.max(0) as u64),
                 window: VecDeque::new(),
             };
@@ -138,6 +141,7 @@ impl Stats {
                     self.shares_accepted += 1;
                     w.last_share = Some(now);
                     w.best_difficulty = w.best_difficulty.max(*share_difficulty);
+                    w.work_accepted += *job_difficulty;
                     w.window.push_back((now, *job_difficulty));
                 }
                 trim(&mut w.window, now);
@@ -165,6 +169,19 @@ impl Stats {
     /// Rejected shares recorded (lifetime, including restored).
     pub fn shares_rejected(&self) -> u64 {
         self.shares_rejected
+    }
+
+    /// Lifetime accepted work in difficulty units, summed over every worker.
+    pub fn total_work(&self) -> f64 {
+        self.workers.values().map(|w| w.work_accepted).sum()
+    }
+
+    /// Best share difficulty any worker has found.
+    pub fn best_difficulty(&self) -> f64 {
+        self.workers
+            .values()
+            .map(|w| w.best_difficulty)
+            .fold(0.0, f64::max)
     }
 
     /// Per-worker hashrate samples plus the pool total (empty name).
@@ -198,6 +215,7 @@ impl Stats {
                 shares_accepted: w.accepted,
                 shares_rejected: w.rejected,
                 best_difficulty: w.best_difficulty,
+                work_accepted: w.work_accepted,
                 last_share_seconds: w.last_share.map(|t| now.saturating_sub(t)),
             })
             .collect();
@@ -288,6 +306,9 @@ mod tests {
         );
         assert_eq!(w.shares_accepted, 10);
         assert_eq!(w.best_difficulty, 2.0);
+        assert_eq!(w.work_accepted, 10.0);
+        assert_eq!(s.total_work(), 10.0);
+        assert_eq!(s.best_difficulty(), 2.0);
         assert_eq!(w.connections, 1);
         s.apply(
             &PoolEvent::Disconnected {
@@ -341,6 +362,7 @@ mod tests {
         assert_eq!(w.connections, 0);
         assert_eq!(w.shares_accepted, 10);
         assert_eq!(w.best_difficulty, 2.0);
+        assert_eq!(restored.total_work(), 10.0);
         assert!(
             (w.hashrate - 10.0 * HASHES_PER_DIFF1 / 90.0).abs() < 1.0,
             "{}",

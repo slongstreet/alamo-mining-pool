@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(blocks_found = store.block_count().await?, "loaded state");
 
     let shutdown = CancellationToken::new();
-    let state = alamo_web::AppState::new(config.pool.name.clone());
+    let state = alamo_web::AppState::new(config.pool.name.clone(), store.clone());
 
     let web = tokio::spawn(alamo_web::serve(
         config.web.clone(),

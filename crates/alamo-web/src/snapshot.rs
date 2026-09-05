@@ -13,7 +13,9 @@ pub struct PoolSnapshot {
     pub version: String,
     /// Seconds since start.
     pub uptime_seconds: u64,
-    /// Chains being mined.
+    /// Unix time the snapshot was built.
+    pub now: u64,
+    /// Chains being mined, parent first.
     pub coins: Vec<CoinStatus>,
     /// Pool hashrate estimate over the recent window, hashes per second.
     pub hashrate: f64,
@@ -21,12 +23,14 @@ pub struct PoolSnapshot {
     pub shares_accepted: u64,
     /// Rejected shares recorded (lifetime).
     pub shares_rejected: u64,
+    /// Lifetime accepted work in difficulty units.
+    pub total_work: f64,
+    /// Best share difficulty any worker has found.
+    pub best_share_difficulty: f64,
     /// Workers seen, connected first.
     pub workers: Vec<WorkerStatus>,
     /// Recent blocks, newest first.
     pub blocks: Vec<BlockRow>,
-    /// Block odds for the parent chain at the current hashrate.
-    pub odds: Option<OddsSummary>,
 }
 
 /// Status of one chain.
@@ -44,6 +48,28 @@ pub struct CoinStatus {
     pub template_age_seconds: u64,
     /// Coinbase value of the current template, in base units.
     pub coinbase_value: u64,
+    /// Block odds on this chain at the pool's current hashrate.
+    pub odds: OddsSummary,
+    /// The round in progress and lifetime luck on this chain.
+    pub round: RoundStatus,
+}
+
+/// Work since the last block on a chain, compared with what a block is expected to take.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RoundStatus {
+    /// Blocks the node has accepted on this chain.
+    pub blocks_found: u64,
+    /// Unix time the last block was found, which started this round.
+    pub started_at: Option<i64>,
+    /// Accepted work this round, in difficulty units.
+    pub work: f64,
+    /// Work one block is expected to take: the network difficulty.
+    pub expected_work: f64,
+    /// `work / expected_work`. Above 1 means the round is running long.
+    pub progress: f64,
+    /// Lifetime luck in percent: expected work over actual work for the blocks found.
+    /// 100 is average, above 100 is lucky. `None` until the first block.
+    pub luck_percent: Option<f64>,
 }
 
 /// Status of one worker.
@@ -69,6 +95,8 @@ pub struct WorkerStatus {
     pub shares_rejected: u64,
     /// Best share difficulty seen.
     pub best_difficulty: f64,
+    /// Lifetime accepted work in difficulty units.
+    pub work_accepted: f64,
     /// Seconds since the last accepted share, if any.
     pub last_share_seconds: Option<u64>,
 }
