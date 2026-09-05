@@ -22,7 +22,9 @@ dependencies = [
  "alamo-web",
  "anyhow",
  "clap",
+ "hex",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
  "toml",
@@ -41,6 +43,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -48,6 +52,7 @@ dependencies = [
 name = "alamo-core"
 version = "0.1.0"
 dependencies = [
+ "bitcoin",
  "hex",
  "primitive-types",
  "scrypt",
@@ -74,6 +79,8 @@ version = "0.1.0"
 dependencies = [
  "alamo-core",
  "futures",
+ "hex",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "thiserror",
@@ -89,6 +96,7 @@ dependencies = [
  "alamo-core",
  "axum",
  "mime_guess",
+ "parking_lot",
  "rust-embed",
  "serde",
  "serde_json",

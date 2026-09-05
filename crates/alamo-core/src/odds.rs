@@ -73,8 +73,8 @@ pub struct OddsSummary {
     pub p_month: f64,
     /// Probability of a block within one year.
     pub p_year: f64,
-    /// Expected seconds to the next block.
-    pub expected_seconds: f64,
+    /// Expected seconds to the next block; `None` when the hashrate is zero.
+    pub expected_seconds: Option<f64>,
 }
 
 impl OddsSummary {
@@ -88,7 +88,8 @@ impl OddsSummary {
             p_week: probability_within(hashrate, difficulty, WEEK),
             p_month: probability_within(hashrate, difficulty, MONTH),
             p_year: probability_within(hashrate, difficulty, YEAR),
-            expected_seconds: expected_seconds_to_block(hashrate, difficulty),
+            expected_seconds: Some(expected_seconds_to_block(hashrate, difficulty))
+                .filter(|s| s.is_finite()),
         }
     }
 }
@@ -130,6 +131,8 @@ mod tests {
         assert!(s.p_hour < s.p_day && s.p_day < s.p_week);
         assert!(s.p_week < s.p_month && s.p_month < s.p_year);
         assert!(s.p_year <= 1.0);
+        assert!(s.expected_seconds.unwrap() > 0.0);
+        assert_eq!(OddsSummary::compute(0.0, 1e6).expected_seconds, None);
     }
 
     #[test]

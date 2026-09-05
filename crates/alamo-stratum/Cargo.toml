@@ -9,6 +9,8 @@ rust-version.workspace = true
 
 [dependencies]
 alamo-core.workspace = true
+hex.workspace = true
+rand.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true

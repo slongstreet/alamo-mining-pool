@@ -1,0 +1,29 @@
+# Regtest nodes for local development and the integration tests.
+#
+#   docker compose -f deploy/regtest/docker-compose.yml up -d
+#   ALAMO_REGTEST_RPC=http://alamo:alamo@127.0.0.1:19443 cargo test -p alamo --test regtest -- --nocapture
+services:
+  litecoind:
+    build:
+      context: .
+      dockerfile: litecoind.Dockerfile
+    image: alamo-litecoind-regtest:local
+    command:
+      - -regtest
+      - -server=1
+      - -printtoconsole
+      - -rpcuser=alamo
+      - -rpcpassword=alamo
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -txindex=1
+      - -fallbackfee=0.0001
+      - -zmqpubhashblock=tcp://0.0.0.0:28332
+    ports:
+      - "127.0.0.1:19443:19443"
+      - "127.0.0.1:28332:28332"
+    volumes:
+      - litecoind-regtest:/home/litecoin/.litecoin
+
+volumes:
+  litecoind-regtest:

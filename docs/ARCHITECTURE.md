@@ -31,10 +31,13 @@ one or more aux coins: the parent's coinbase commits to the aux merkle root, and
 share that meets an aux target is assembled into an auxpow block for that aux chain.
 
 ### alamo-stratum
-Tokio TCP server. One task per connection, line-delimited JSON-RPC. Sessions track
-extranonce1, authorized workers, current difficulty, and the set of live job ids. A job
-broadcaster fans new jobs out over a `watch` channel. Vardiff adjusts per-session difficulty
-toward a target share interval.
+Tokio TCP server. One task per connection, line-delimited JSON-RPC. The template source
+publishes `Arc<WorkTemplate>` on a `watch` channel; each session derives its own job from it
+because the coinbase pays the address the session authorized with. Sessions track
+extranonce1, authorized workers, current difficulty, the last few jobs (for late shares),
+and per-job seen-share sets. Vardiff adjusts per-session difficulty toward a target share
+interval. Session logic is pure (`Session::handle` returns effects), so it is unit-tested
+without sockets.
 
 ### alamo-store
 SQLite via sqlx with embedded migrations. Stores blocks found, hashrate samples, worker

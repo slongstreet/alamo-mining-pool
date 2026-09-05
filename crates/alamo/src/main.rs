@@ -1,14 +1,11 @@
-//! The `alamo` daemon: load config, start the stratum and web servers, run until signaled.
+//! The `alamo` daemon: load config, start the pool and web servers, run until signaled.
 
 #![forbid(unsafe_code)]
 
-mod config;
-
-use anyhow::{bail, Context};
+use alamo::Config;
+use anyhow::Context;
 use clap::Parser;
-use config::Config;
 use std::path::PathBuf;
-use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -47,12 +44,7 @@ async fn main() -> anyhow::Result<()> {
         .filter(|(_, c)| c.enabled)
         .map(|(k, _)| k)
         .collect();
-    tracing::info!(
-        pool = %config.pool.name,
-        version = env!("CARGO_PKG_VERSION"),
-        coins = ?enabled,
-        "starting alamo"
-    );
+    tracing::info!(pool = %config.pool.name, version = env!("CARGO_PKG_VERSION"), coins = ?enabled, "starting alamo");
 
     let store = alamo_store::Store::open(&config.database_path())
         .await
@@ -62,23 +54,34 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     let state = alamo_web::AppState::new(config.pool.name.clone());
 
-    let mut stratum = tokio::spawn(alamo_stratum::serve(
-        config.stratum.clone(),
+    let web = tokio::spawn(alamo_web::serve(
+        config.web.clone(),
+        state.clone(),
         shutdown.child_token(),
     ));
-    let mut web = tokio::spawn(alamo_web::serve(
-        config.web.clone(),
+    let pool = tokio::spawn(alamo::pool::run(
+        config,
+        store,
         state,
         shutdown.child_token(),
     ));
+    tokio::pin!(web, pool);
 
     let outcome = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("received ctrl-c, shutting down");
             Ok(())
         }
-        res = &mut stratum => exited(res, "stratum"),
-        res = &mut web => exited(res, "web"),
+        res = &mut pool => match res {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(err.context("pool failed")),
+            Err(join) => Err(anyhow::Error::new(join).context("pool task panicked")),
+        },
+        res = &mut web => match res {
+            Ok(Ok(())) => Err(anyhow::anyhow!("web server exited unexpectedly")),
+            Ok(Err(err)) => Err(anyhow::Error::new(err).context("web server failed")),
+            Err(join) => Err(anyhow::Error::new(join).context("web task panicked")),
+        },
     };
 
     shutdown.cancel();
@@ -86,8 +89,8 @@ async fn main() -> anyhow::Result<()> {
         if !web.is_finished() {
             let _ = (&mut web).await;
         }
-        if !stratum.is_finished() {
-            let _ = (&mut stratum).await;
+        if !pool.is_finished() {
+            let _ = (&mut pool).await;
         }
     };
     if tokio::time::timeout(std::time::Duration::from_secs(5), drain)
@@ -96,24 +99,7 @@ async fn main() -> anyhow::Result<()> {
     {
         tracing::warn!("servers did not stop within 5s; exiting anyway");
     }
-
     outcome?;
     tracing::info!("bye");
     Ok(())
 }
-
-/// Turn a server task finishing before shutdown into an error that stops the daemon.
-fn exited<E>(result: Result<Result<(), E>, JoinError>, name: &str) -> anyhow::Result<()>
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    match result {
-        Ok(Ok(())) => bail!("{name} server exited unexpectedly"),
-        Ok(Err(err)) => Err(anyhow::Error::new(err).context(format!("{name} server failed"))),
-        Err(err) => Err(anyhow::Error::new(err).context(format!("{name} task panicked"))),
-    }
-}
-
-/// Unused for now; keeps the JoinHandle type in scope for future supervisors.
-#[allow(dead_code)]
-type ServerTask<E> = JoinHandle<Result<(), E>>;

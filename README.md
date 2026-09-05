@@ -12,7 +12,8 @@ next to your own full nodes, and watch your odds of hitting the next block in re
 - **Odds visualizer.** Probability of a block in the next hour, day, week, and year, expected
   time to block, and luck versus expectation, all live.
 
-> Status: early scaffolding. See [docs/ROADMAP.md](docs/ROADMAP.md) for the implementation waves.
+> Status: Litecoin solo mining works end to end on regtest, including MWEB blocks.
+> Dogecoin merge mining is next. See [docs/ROADMAP.md](docs/ROADMAP.md) for the waves.
 
 ## Layout
 
@@ -50,6 +51,23 @@ Run the checks:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+```
+
+## Regtest
+
+A throwaway Litecoin regtest node lives in `deploy/regtest`:
+
+```bash
+docker compose -f deploy/regtest/docker-compose.yml up -d --build
+./deploy/regtest/activate-mweb.sh          # optional: mine past MWEB activation
+cargo run -p alamo -- --config config/alamo.regtest.toml
+```
+
+The end-to-end test mines a real block through the stratum path and verifies the node
+accepted it and that the coinbase paid the worker's address:
+
+```bash
+ALAMO_REGTEST_RPC=http://alamo:alamo@127.0.0.1:19443 cargo test -p alamo --test regtest -- --nocapture
 ```
 
 ## Configuration

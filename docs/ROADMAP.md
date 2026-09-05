@@ -2,7 +2,7 @@
 
 Work proceeds in waves. Each wave ends with something runnable and tested.
 
-## Wave 0 — Scaffolding (current)
+## Wave 0 — Scaffolding (done)
 - Cargo workspace with six crates, pinned toolchain, fmt/clippy/test in CI.
 - `alamo-core`: hashing (sha256d, scrypt), target/difficulty math, block odds math, with tests.
 - Stratum protocol types and a listener that accepts connections and parses messages.
@@ -12,15 +12,25 @@ Work proceeds in waves. Each wave ends with something runnable and tested.
 - Svelte dashboard skeleton.
 - Dockerfile, compose file, systemd unit.
 
-## Wave 1 — LTC solo, end to end on regtest
-- JSON-RPC client for `litecoind` (`getblocktemplate`, `submitblock`, `getblockchaininfo`).
-- Job builder: coinbase with payout to the worker's address, merkle branch, header fields.
-- Stratum v1: `mining.subscribe`, `mining.authorize`, `mining.submit`, `mining.notify`,
-  `mining.set_difficulty`, extranonce handling, clean-jobs on new template.
-- Share validation: scrypt PoW hash, share target, block target, duplicate detection.
-- Vardiff.
-- Block submission and confirmation tracking.
-- Regtest compose with `litecoind` and a CPU miner for integration tests.
+## Wave 1 — LTC solo, end to end on regtest (done)
+- JSON-RPC client for `litecoind` (`getblocktemplate`, `submitblock`, `getblock`, tip polling).
+- Template source: polls the tip twice a second, refreshes every 30s, publishes work over a
+  watch channel with `clean_jobs` on a new tip.
+- Coinbase builder: BIP34 height, tag, extranonce, payout to the worker's address, witness
+  commitment output; split into coinb1/coinb2 for stratum.
+- Stratum v1: subscribe, authorize, submit, notify, set_difficulty, configure,
+  suggest_difficulty, extranonce.subscribe. Per-session jobs so every worker's coinbase pays
+  its own address. Stale, duplicate, ntime, and extranonce checks.
+- Share validation with scrypt, share and network targets, block assembly.
+- Vardiff with bounded steps and idle lowering.
+- Block submission, status recording, and confirmation tracking (orphan detection, maturity).
+- Litecoin MWEB: templates are requested with the `mweb` rule; the HogEx transaction comes
+  in the transaction list and the `mweb` payload is appended after the transactions with a
+  presence byte. Verified on regtest before and after activation.
+- Regtest harness: `deploy/regtest` runs `litecoind`, `activate-mweb.sh` brings the chain
+  past MWEB activation, and `cargo test -p alamo --test regtest` mines a real block through
+  the stratum path and checks the coinbase pays the worker's address. CI runs it.
+- Status API (`/api/status`) with workers, hashrate, blocks, and block odds.
 
 ## Wave 2 — DOGE merge mining
 - `dogecoind` template fetching and auxpow block submission.

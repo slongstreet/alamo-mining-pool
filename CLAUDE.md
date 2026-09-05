@@ -24,6 +24,16 @@ coinbase to the address the miner used as its stratum username.
 - Run `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and
   `cargo test --workspace` before declaring anything done.
 
+## Regtest and verification
+- `deploy/regtest/docker-compose.yml` runs litecoind on regtest (rpc alamo/alamo, port 19443).
+- `deploy/regtest/activate-mweb.sh` mines to 432 with a peg-in so MWEB activates; the first
+  MWEB block needs a peg-in or the node cannot build it.
+- `ALAMO_REGTEST_RPC=http://alamo:alamo@127.0.0.1:19443 cargo test -p alamo --test regtest`
+  is the proof that block construction is right. Run it before and after MWEB activation when
+  touching coinbase, merkle, template, or block assembly code.
+- Litecoin block serialization after MWEB: header, txs (HogEx last, as given by the
+  template), then `0x01` + the template's `mweb` hex. Nothing is appended before activation.
+
 ## Frontend
 - `web/` is Svelte 5 + TypeScript + Vite. `npm run build` writes `web/dist`, which
   `alamo-web` embeds with `rust-embed`. A missing `web/dist` must not break `cargo build`.

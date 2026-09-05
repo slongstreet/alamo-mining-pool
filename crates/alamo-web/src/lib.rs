@@ -5,6 +5,7 @@
 pub mod api;
 pub mod assets;
 pub mod config;
+pub mod snapshot;
 
 use axum::routing::get;
 use axum::Router;
@@ -15,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
 pub use config::WebConfig;
+pub use snapshot::{BlockStatus, CoinStatus, PoolSnapshot, WorkerStatus};
 
 /// State shared with request handlers.
 #[derive(Clone)]
@@ -25,15 +27,23 @@ pub struct AppState {
 struct Inner {
     pool_name: String,
     started_at: Instant,
+    snapshot: parking_lot::RwLock<PoolSnapshot>,
 }
 
 impl AppState {
     /// Create the application state.
     pub fn new(pool_name: impl Into<String>) -> Self {
+        let pool_name = pool_name.into();
+        let snapshot = PoolSnapshot {
+            pool_name: pool_name.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            ..Default::default()
+        };
         Self {
             inner: Arc::new(Inner {
-                pool_name: pool_name.into(),
+                pool_name,
                 started_at: Instant::now(),
+                snapshot: parking_lot::RwLock::new(snapshot),
             }),
         }
     }
@@ -46,6 +56,21 @@ impl AppState {
     /// Seconds since the daemon started.
     pub fn uptime_seconds(&self) -> u64 {
         self.inner.started_at.elapsed().as_secs()
+    }
+
+    /// Replace the published status document. Name, version, and uptime are filled in.
+    pub fn publish(&self, mut snapshot: PoolSnapshot) {
+        snapshot.pool_name = self.inner.pool_name.clone();
+        snapshot.version = env!("CARGO_PKG_VERSION").to_string();
+        snapshot.uptime_seconds = self.uptime_seconds();
+        *self.inner.snapshot.write() = snapshot;
+    }
+
+    /// The current status document.
+    pub fn snapshot(&self) -> PoolSnapshot {
+        let mut s = self.inner.snapshot.read().clone();
+        s.uptime_seconds = self.uptime_seconds();
+        s
     }
 }
 

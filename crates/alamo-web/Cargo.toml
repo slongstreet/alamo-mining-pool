@@ -12,6 +12,7 @@ build = "build.rs"
 alamo-core.workspace = true
 axum.workspace = true
 mime_guess.workspace = true
+parking_lot.workspace = true
 rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true

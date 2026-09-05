@@ -1,0 +1,29 @@
+# Configuration for the regtest node started by deploy/regtest/docker-compose.yml.
+# Share difficulty is tiny so a CPU can find shares (and blocks) in seconds.
+
+[pool]
+name = "Alamo Regtest"
+data_dir = "./data/regtest"
+
+[stratum]
+listen = "127.0.0.1:3333"
+
+[stratum.vardiff]
+initial_difficulty = 0.0000005
+min_difficulty = 0.0000001
+max_difficulty = 1000000
+target_share_seconds = 10
+retarget_seconds = 60
+variance_percent = 30
+
+[web]
+listen = "127.0.0.1:8080"
+
+[coins.ltc]
+enabled = true
+rpc_url = "http://127.0.0.1:19443"
+rpc_user = "alamo"
+rpc_password = "alamo"
+# Any regtest bech32 address; miners normally supply their own as the username.
+fallback_address = "rltc1qyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zwc5c93"
+coinbase_tag = "/alamo/"

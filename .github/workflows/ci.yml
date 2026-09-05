@@ -67,3 +67,35 @@ jobs:
         with:
           name: alamo-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/alamo
+
+  regtest:
+    name: Regtest end-to-end (Litecoin)
+    needs: dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: regtest
+      - name: Start litecoind (regtest)
+        run: docker compose -f deploy/regtest/docker-compose.yml up -d --build
+      - name: Build tests
+        run: cargo test -p alamo --test regtest --no-run
+      - name: Mine before MWEB activation
+        env:
+          ALAMO_REGTEST_RPC: http://alamo:alamo@127.0.0.1:19443
+        run: cargo test -p alamo --test regtest -- --nocapture
+      - name: Activate MWEB
+        run: ./deploy/regtest/activate-mweb.sh
+      - name: Mine after MWEB activation
+        env:
+          ALAMO_REGTEST_RPC: http://alamo:alamo@127.0.0.1:19443
+        run: cargo test -p alamo --test regtest -- --nocapture
+      - name: Node logs
+        if: failure()
+        run: docker compose -f deploy/regtest/docker-compose.yml logs --tail 100

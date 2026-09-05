@@ -1,6 +1,6 @@
 //! JSON API handlers.
 
-use crate::AppState;
+use crate::{AppState, PoolSnapshot};
 use axum::extract::State;
 use axum::Json;
 use serde::Serialize;
@@ -16,17 +16,6 @@ pub struct Health {
     pub uptime_seconds: u64,
 }
 
-/// Response body for `/api/status`.
-#[derive(Serialize)]
-pub struct Status {
-    /// Configured pool name.
-    pub pool_name: String,
-    /// Daemon version.
-    pub version: &'static str,
-    /// Seconds since start.
-    pub uptime_seconds: u64,
-}
-
 /// Liveness probe.
 pub async fn health(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
@@ -36,13 +25,9 @@ pub async fn health(State(state): State<AppState>) -> Json<Health> {
     })
 }
 
-/// Pool status summary. Grows with each wave.
-pub async fn status(State(state): State<AppState>) -> Json<Status> {
-    Json(Status {
-        pool_name: state.pool_name().to_string(),
-        version: env!("CARGO_PKG_VERSION"),
-        uptime_seconds: state.uptime_seconds(),
-    })
+/// Full pool status document.
+pub async fn status(State(state): State<AppState>) -> Json<PoolSnapshot> {
+    Json(state.snapshot())
 }
 
 #[cfg(test)]
