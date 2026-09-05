@@ -1,59 +1,65 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type Status } from './lib/api';
-  import { formatDuration } from './lib/format';
+  import { LiveStatus } from './lib/live.svelte';
+  import { ThemePreference } from './lib/theme.svelte';
+  import Header from './lib/components/Header.svelte';
+  import StatTiles from './lib/components/StatTiles.svelte';
+  import OddsPanel from './lib/components/OddsPanel.svelte';
+  import HashrateChart from './lib/components/HashrateChart.svelte';
+  import WorkerTable from './lib/components/WorkerTable.svelte';
+  import ShareLog from './lib/components/ShareLog.svelte';
+  import BlockHistory from './lib/components/BlockHistory.svelte';
 
-  let status = $state<Status | null>(null);
-  let error = $state<string | null>(null);
-
-  async function refresh() {
-    try {
-      status = await api.status();
-      error = null;
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-    }
-  }
+  const live = new LiveStatus();
+  const theme = new ThemePreference();
+  theme.apply();
 
   onMount(() => {
-    refresh();
-    const timer = setInterval(refresh, 5000);
-    return () => clearInterval(timer);
+    live.start();
+    return () => live.stop();
   });
+
+  const status = $derived(live.status);
+  const now = $derived(status?.now ?? Math.floor(Date.now() / 1000));
+  const workerNames = $derived(status?.workers.map((w) => w.name) ?? []);
 </script>
 
 <main>
-  <header>
-    <h1>{status?.pool_name ?? 'Alamo'}</h1>
-    <p class="muted">
-      {#if status}
-        v{status.version} · up {formatDuration(status.uptime_seconds)}
-      {:else if error}
-        {error}
-      {:else}
-        connecting…
-      {/if}
-    </p>
-  </header>
+  <Header {status} connection={live.connection} error={live.error} {theme} />
 
-  <section class="panel">
-    <h2>Next block odds</h2>
-    <p class="muted">The odds visualizer lands in Wave 4. This shell proves the dashboard builds and embeds.</p>
-  </section>
+  {#if status}
+    <div class="grid">
+      <StatTiles {status} />
+
+      <div class="grid two">
+        {#each status.coins as coin (coin.symbol)}
+          <OddsPanel {coin} bestShare={status.best_share_difficulty} {now} />
+        {/each}
+        {#if status.coins.length === 0}
+          <section class="panel">
+            <h2>Block odds</h2>
+            <div class="empty">Waiting for the first block template from the node.</div>
+          </section>
+        {/if}
+      </div>
+
+      <HashrateChart live={status.hashrate} workers={workerNames} />
+      <WorkerTable workers={status.workers} />
+
+      <div class="grid two">
+        <ShareLog {now} />
+        <BlockHistory blocks={status.blocks} coins={status.coins} {now} />
+      </div>
+    </div>
+  {:else}
+    <section class="panel">
+      <div class="empty">
+        {#if live.error}
+          Cannot reach the daemon: {live.error}
+        {:else}
+          Connecting to the pool…
+        {/if}
+      </div>
+    </section>
+  {/if}
 </main>
-
-<style>
-  header {
-    margin-bottom: 1.5rem;
-  }
-  h1 {
-    margin: 0;
-    font-size: 2rem;
-    letter-spacing: -0.02em;
-  }
-  h2 {
-    margin-top: 0;
-    font-size: 1.1rem;
-    color: var(--accent);
-  }
-</style>

@@ -82,6 +82,8 @@ pub struct BlockCandidate {
     pub network_difficulty: f64,
     /// Difficulty the hash achieved.
     pub share_difficulty: f64,
+    /// Coinbase value of the template, in base units.
+    pub coinbase_value: u64,
     /// Unix time the share arrived.
     pub found_at: u64,
 }

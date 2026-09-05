@@ -7,16 +7,18 @@ pub mod assets;
 pub mod config;
 pub mod snapshot;
 
+use alamo_store::Store;
 use axum::routing::get;
 use axum::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
 pub use config::WebConfig;
-pub use snapshot::{AuxPayoutStatus, CoinStatus, PoolSnapshot, WorkerStatus};
+pub use snapshot::{AuxPayoutStatus, CoinStatus, PoolSnapshot, RoundStatus, WorkerStatus};
 
 /// State shared with request handlers.
 #[derive(Clone)]
@@ -27,19 +29,33 @@ pub struct AppState {
 struct Inner {
     pool_name: String,
     started_at: Instant,
-    snapshot: parking_lot::RwLock<PoolSnapshot>,
+    /// The latest status document. WebSocket clients subscribe to it.
+    snapshot: watch::Sender<PoolSnapshot>,
+    /// History (shares, samples, blocks) is read straight from the store.
+    store: Store,
 }
 
 impl AppState {
     /// Create the application state.
-    pub fn new(pool_name: impl Into<String>) -> Self {
+    pub fn new(pool_name: impl Into<String>, store: Store) -> Self {
         Self {
             inner: Arc::new(Inner {
                 pool_name: pool_name.into(),
                 started_at: Instant::now(),
-                snapshot: parking_lot::RwLock::new(PoolSnapshot::default()),
+                snapshot: watch::Sender::new(PoolSnapshot::default()),
+                store,
             }),
         }
+    }
+
+    /// The database behind the history endpoints.
+    pub fn store(&self) -> &Store {
+        &self.inner.store
+    }
+
+    /// Subscribe to snapshot updates.
+    pub fn subscribe(&self) -> watch::Receiver<PoolSnapshot> {
+        self.inner.snapshot.subscribe()
     }
 
     /// Configured pool name.
@@ -52,14 +68,17 @@ impl AppState {
         self.inner.started_at.elapsed().as_secs()
     }
 
-    /// Replace the published status document.
-    pub fn publish(&self, snapshot: PoolSnapshot) {
-        *self.inner.snapshot.write() = snapshot;
+    /// Replace the published status document and wake WebSocket clients.
+    pub fn publish(&self, mut snapshot: PoolSnapshot) {
+        snapshot.pool_name = self.inner.pool_name.clone();
+        snapshot.version = env!("CARGO_PKG_VERSION").to_string();
+        snapshot.uptime_seconds = self.uptime_seconds();
+        self.inner.snapshot.send_replace(snapshot);
     }
 
-    /// The current status document, with identity and uptime stamped on.
+    /// The current status document.
     pub fn snapshot(&self) -> PoolSnapshot {
-        let mut s = self.inner.snapshot.read().clone();
+        let mut s = self.inner.snapshot.borrow().clone();
         s.pool_name = self.inner.pool_name.clone();
         s.version = env!("CARGO_PKG_VERSION").to_string();
         s.uptime_seconds = self.uptime_seconds();
@@ -88,6 +107,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(api::health))
         .route("/api/status", get(api::status))
+        .route("/api/ws", get(api::ws))
+        .route("/api/hashrate", get(api::hashrate))
+        .route("/api/shares", get(api::shares))
+        .route("/api/blocks", get(api::blocks))
         .fallback(assets::serve)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

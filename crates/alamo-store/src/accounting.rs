@@ -35,6 +35,8 @@ pub struct WorkerRow {
     pub shares_rejected: i64,
     /// Best share difficulty seen.
     pub best_difficulty: f64,
+    /// Lifetime accepted work: the sum of job difficulty over accepted shares.
+    pub work_accepted: f64,
 }
 
 /// Fields written when a worker authorizes.
@@ -70,7 +72,7 @@ pub struct NewShare {
 }
 
 /// A stored share.
-#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+#[derive(Clone, Debug, PartialEq, Serialize, sqlx::FromRow)]
 pub struct ShareRow {
     /// Row id.
     pub id: i64,
@@ -82,14 +84,14 @@ pub struct ShareRow {
     pub difficulty: f64,
     /// Difficulty the hash achieved.
     pub share_diff: f64,
-    /// 1 if accepted.
-    pub accepted: i64,
+    /// Whether the share was accepted.
+    pub accepted: bool,
     /// Rejection slug, if rejected.
     pub reject_reason: Option<String>,
 }
 
 /// One hashrate sample.
-#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+#[derive(Clone, Debug, PartialEq, Serialize, sqlx::FromRow)]
 pub struct HashrateSample {
     /// Unix time of the sample, aligned to the sample interval.
     pub ts: i64,
@@ -110,6 +112,7 @@ struct WorkerSql {
     shares_accepted: i64,
     shares_rejected: i64,
     best_difficulty: f64,
+    work_accepted: f64,
 }
 
 impl From<WorkerSql> for WorkerRow {
@@ -125,6 +128,7 @@ impl From<WorkerSql> for WorkerRow {
             shares_accepted: row.shares_accepted,
             shares_rejected: row.shares_rejected,
             best_difficulty: row.best_difficulty,
+            work_accepted: row.work_accepted,
         }
     }
 }
@@ -201,18 +205,21 @@ impl Store {
             let accepted = s.accepted as i64;
             let rejected = (!s.accepted) as i64;
             let best = if s.accepted { s.share_diff } else { 0.0 };
+            let work = if s.accepted { s.difficulty } else { 0.0 };
             sqlx::query(
                 "UPDATE workers SET
                     last_seen = MAX(last_seen, ?),
                     shares_accepted = shares_accepted + ?,
                     shares_rejected = shares_rejected + ?,
-                    best_difficulty = MAX(best_difficulty, ?)
+                    best_difficulty = MAX(best_difficulty, ?),
+                    work_accepted = work_accepted + ?
                  WHERE name = ?",
             )
             .bind(s.ts)
             .bind(accepted)
             .bind(rejected)
             .bind(best)
+            .bind(work)
             .bind(&s.worker)
             .execute(&mut *tx)
             .await?;
@@ -225,12 +232,21 @@ impl Store {
     pub async fn load_workers(&self) -> Result<Vec<WorkerRow>, StoreError> {
         let rows: Vec<WorkerSql> = sqlx::query_as(
             "SELECT name, payout_address, aux_payouts, fallback, first_seen, last_seen,
-                    shares_accepted, shares_rejected, best_difficulty
+                    shares_accepted, shares_rejected, best_difficulty, work_accepted
              FROM workers ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(WorkerRow::from).collect())
+    }
+
+    /// Pool-wide accepted work in difficulty units, summed over every worker.
+    pub async fn total_work(&self) -> Result<f64, StoreError> {
+        let (work,): (f64,) =
+            sqlx::query_as("SELECT COALESCE(SUM(work_accepted), 0.0) FROM workers")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(work)
     }
 
     /// Accepted shares at or after `since`, oldest first, capped so a restart stays bounded.
@@ -370,8 +386,11 @@ mod tests {
         assert_eq!(workers[0].shares_accepted, 1);
         assert_eq!(workers[0].shares_rejected, 1);
         assert_eq!(workers[0].best_difficulty, 32.0);
+        assert_eq!(workers[0].work_accepted, 16.0);
+        assert_eq!(store.total_work().await.unwrap(), 16.0);
 
         let accepted = store.accepted_shares_since(0).await.unwrap();
+        assert!(accepted[0].accepted);
         assert_eq!(accepted.len(), 1);
         assert_eq!(accepted[0].difficulty, 16.0);
         let recent = store.recent_shares(10).await.unwrap();

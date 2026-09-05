@@ -57,12 +57,20 @@ Work proceeds in waves. Each wave ends with something runnable and tested.
 - Retention and downsampling so the database stays small.
 - Restart safety: jobs and sessions rebuild cleanly.
 
-## Wave 4 — Dashboard
-- Live hashrate, worker table, share log.
-- Odds visualizer: P(block) in the next hour/day/week/year, expected time to block,
-  luck vs expectation, best share vs network target.
-- Block history with confirmations.
-- Polished visuals, dark and light themes.
+## Wave 4 — Dashboard (done)
+- `/api/ws` streams every status snapshot; the dashboard falls back to polling `/api/status`
+  while the socket is down and reconnects with backoff. `/api/hashrate`, `/api/shares`, and
+  `/api/blocks` serve history from the store.
+- Per-coin odds: P(block) in the next hour/day/week/30 days/year and expected time to block
+  at the pool's hashrate. Rounds: workers accumulate lifetime accepted work and every block
+  banks the pool total at the moment it was found, so the current round's work, its progress
+  against the network difficulty, and lifetime luck survive share retention. Best share is
+  shown against the network target on a log scale.
+- Live hashrate chart (pool or one worker; 1h/24h/7d/30d) drawn as inline SVG from the
+  downsampled samples, worker table with payout addresses and fallback flags, live share
+  log, and block history with reward, share difficulty, and confirmations.
+- Dark and light themes follow the system with a remembered manual override. No chart
+  library; the built dashboard is about 70 kB before compression.
 
 ## Wave 5 — Hardening and packaging
 - ZMQ `hashblock` notifications instead of polling.

@@ -46,6 +46,10 @@ pub struct RetentionReport {
 
 impl Store {
     /// Trim old shares and downsample hashrate samples.
+    ///
+    /// Every tier boundary is aligned down to its bucket width so only complete buckets are
+    /// folded. A bucket that straddles a boundary is left alone until it has fully aged in,
+    /// otherwise its partial average would be averaged again on the next pass.
     pub async fn retain(
         &self,
         policy: &RetentionPolicy,
@@ -53,22 +57,28 @@ impl Store {
     ) -> Result<RetentionReport, StoreError> {
         let mut report = RetentionReport::default();
         report.shares_deleted += self.trim_shares(policy, now).await?;
+        let long_start = align_down(
+            now.saturating_sub(policy.sample_long_secs),
+            policy.sample_long_bucket,
+        );
+        let mid_start = now.saturating_sub(policy.sample_mid_secs);
+        let raw_start = now.saturating_sub(policy.sample_raw_secs);
         report.samples_deleted += self
             .downsample_range(
-                now.saturating_sub(policy.sample_long_secs),
-                now.saturating_sub(policy.sample_mid_secs),
+                long_start,
+                align_down(mid_start, policy.sample_long_bucket),
                 policy.sample_long_bucket,
             )
             .await?;
         report.samples_deleted += self
             .downsample_range(
-                now.saturating_sub(policy.sample_mid_secs),
-                now.saturating_sub(policy.sample_raw_secs),
+                align_down(mid_start, policy.sample_mid_bucket),
+                align_down(raw_start, policy.sample_mid_bucket),
                 policy.sample_mid_bucket,
             )
             .await?;
         let expired = sqlx::query("DELETE FROM hashrate_samples WHERE ts < ?")
-            .bind(now.saturating_sub(policy.sample_long_secs))
+            .bind(long_start)
             .execute(&self.pool)
             .await?;
         report.samples_deleted += expired.rows_affected();
@@ -100,10 +110,12 @@ impl Store {
     }
 
     /// Average samples in `[lo, hi)` into `bucket`-second rows, then drop the originals.
+    /// `lo` and `hi` must be multiples of `bucket`.
     async fn downsample_range(&self, lo: i64, hi: i64, bucket: i64) -> Result<u64, StoreError> {
         if hi <= lo || bucket <= 0 {
             return Ok(0);
         }
+        debug_assert!(lo % bucket == 0 && hi % bucket == 0);
         sqlx::query(
             "INSERT INTO hashrate_samples (ts, worker, hashrate)
              SELECT (ts / ?) * ? AS bucket_ts, worker, AVG(hashrate)
@@ -130,6 +142,14 @@ impl Store {
         .await?;
         Ok(dropped.rows_affected())
     }
+}
+
+/// Round `ts` down to a multiple of `bucket`.
+fn align_down(ts: i64, bucket: i64) -> i64 {
+    if bucket <= 0 {
+        return ts;
+    }
+    ts.div_euclid(bucket) * bucket
 }
 
 #[cfg(test)]
@@ -174,53 +194,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn downsamples_hashrate_samples() {
-        let path = temp_path("retain-samples");
+    async fn expires_samples_older_than_the_long_window() {
+        let path = temp_path("retain-expire");
         let store = Store::open(&path).await.unwrap();
-        // now=10_000: mid window is [9_000, 9_900). Three 60s samples collapse to one 300s bucket.
-        let samples: Vec<HashrateSample> = [9_000, 9_060, 9_120]
+        // now=20_000, long_secs=10_000: the long window starts at 10_000, aligned down to
+        // the hour it is 7_200. Anything below that is gone; a fresh raw sample stays.
+        let samples: Vec<HashrateSample> = [3_600, 7_140, 7_200, 19_950]
             .into_iter()
             .map(|ts| HashrateSample {
                 ts,
                 worker: String::new(),
-                hashrate: 10.0,
+                hashrate: ts as f64,
             })
             .collect();
         store.insert_hashrate_samples(&samples).await.unwrap();
-        // A sample old enough to expire (long_secs=10_000, now=10_000 => ts<0, so use ts=0
-        // with a later now). Use now=20_000 so ts=9_000 is in the long window [10_000, 19_000).
-        store
-            .insert_hashrate_samples(&[
-                HashrateSample {
-                    ts: 10_000,
-                    worker: String::new(),
-                    hashrate: 1.0,
-                },
-                HashrateSample {
-                    ts: 19_950,
-                    worker: String::new(),
-                    hashrate: 99.0,
-                },
-            ])
-            .await
-            .unwrap();
         let report = store.retain(&policy(), 20_000).await.unwrap();
-        assert!(report.samples_deleted > 0);
-        let left = store.hashrate_samples_since(None, 0).await.unwrap();
-        // Raw window is last 100s: [19_900, 20_000] keeps 19_950.
-        // Mid window [10_000, 19_900) buckets 10_000 (already aligned to 300).
-        // Long window [10_000, 19_000) wait: now=20000, long_secs=10000 => [10000, 19000)
-        // mid_secs=1000 => mid [19000, 19900).
-        // 9000 is < 10000 so expired.
-        // 9060, 9120 expired too.
-        // 10000 is at the long-window start: [10000, 19000) bucket 3600 -> stays as 10000
-        // if 10000 % 3600 == 10000 - 2*3600 = 2800... (10000/3600)*3600 = 2*3600 = 7200.
-        // That's below lo=10000 so the insert of bucket 7200 might be outside the delete
-        // range. Keep the test focused on: expired 9k samples gone, raw 19950 kept.
-        assert!(left.iter().any(|s| s.ts == 19_950 && s.hashrate == 99.0));
-        assert!(left
-            .iter()
-            .all(|s| s.ts != 9_000 && s.ts != 9_060 && s.ts != 9_120));
+        assert_eq!(report.samples_deleted, 2);
+        let left: Vec<i64> = store
+            .hashrate_samples_since(None, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.ts)
+            .collect();
+        assert_eq!(left, vec![7_200, 19_950]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn partial_buckets_wait_until_complete_so_averages_do_not_drift() {
+        let path = temp_path("retain-drift");
+        let store = Store::open(&path).await.unwrap();
+        // Five 60s samples in bucket [300, 600) with mean 30.
+        let samples: Vec<HashrateSample> = [300, 360, 420, 480, 540]
+            .into_iter()
+            .zip([10.0, 20.0, 30.0, 40.0, 50.0])
+            .map(|(ts, hashrate)| HashrateSample {
+                ts,
+                worker: "rig".into(),
+                hashrate,
+            })
+            .collect();
+        store.insert_hashrate_samples(&samples).await.unwrap();
+
+        // now=520, raw=100: the mid window ends at 420, mid-bucket, so nothing is folded.
+        store.retain(&policy(), 520).await.unwrap();
+        assert_eq!(
+            store
+                .hashrate_samples_since(Some("rig"), 0)
+                .await
+                .unwrap()
+                .len(),
+            5
+        );
+
+        // now=700: the mid window ends at 600 and the whole bucket has aged in.
+        store.retain(&policy(), 700).await.unwrap();
+        let left = store.hashrate_samples_since(Some("rig"), 0).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].ts, 300);
+        assert!(
+            (left[0].hashrate - 30.0).abs() < 1e-9,
+            "{}",
+            left[0].hashrate
+        );
+
+        // Folding again is idempotent.
+        store.retain(&policy(), 800).await.unwrap();
+        let again = store.hashrate_samples_since(Some("rig"), 0).await.unwrap();
+        assert_eq!(again, left);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

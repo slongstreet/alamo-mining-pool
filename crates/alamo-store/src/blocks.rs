@@ -43,6 +43,23 @@ pub struct BlockRow {
     pub status: BlockStatus,
     /// Confirmations at last check.
     pub confirmations: i64,
+    /// Pool-wide accepted work (difficulty units) when the block was found, if recorded.
+    pub work_at_found: Option<f64>,
+}
+
+/// Per-coin round and luck figures derived from the blocks table.
+#[derive(Clone, Debug, Default, PartialEq, sqlx::FromRow)]
+pub struct CoinRounds {
+    /// Coin ticker.
+    pub coin: String,
+    /// Blocks the node accepted (whether or not they later matured or were orphaned).
+    pub blocks_found: i64,
+    /// Sum of network difficulty over those blocks: the work they were expected to take.
+    pub expected_work: f64,
+    /// When the most recent one was found.
+    pub last_found_at: Option<i64>,
+    /// Pool-wide work when the most recent one was found; the current round starts here.
+    pub last_work_at_found: Option<f64>,
 }
 
 /// A block to record.
@@ -77,11 +94,14 @@ impl Store {
         Ok(n)
     }
 
-    /// Record a found block. Returns its row id.
+    /// Record a found block, stamping it with the pool's total accepted work so far.
+    /// Returns its row id.
     pub async fn insert_block(&self, block: &NewBlock) -> Result<i64, StoreError> {
         let result = sqlx::query(
-            "INSERT INTO blocks (coin, height, hash, worker, difficulty, share_diff, reward_sats, found_at, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO blocks (coin, height, hash, worker, difficulty, share_diff, reward_sats,
+                                 found_at, status, work_at_found)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     (SELECT COALESCE(SUM(work_accepted), 0.0) FROM workers))
              ON CONFLICT (coin, hash) DO UPDATE SET status = excluded.status",
         )
         .bind(&block.coin)
@@ -114,6 +134,24 @@ impl Store {
             "SELECT * FROM blocks WHERE coin = ? AND status = 'accepted' ORDER BY height",
         )
         .bind(coin)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Round and luck inputs for every coin that has found a block. Rejected blocks do not
+    /// count: no work was banked and no round ended.
+    pub async fn coin_rounds(&self) -> Result<Vec<CoinRounds>, StoreError> {
+        Ok(sqlx::query_as(
+            "SELECT b.coin AS coin,
+                    COUNT(*) AS blocks_found,
+                    SUM(b.difficulty) AS expected_work,
+                    MAX(b.found_at) AS last_found_at,
+                    (SELECT work_at_found FROM blocks l
+                     WHERE l.coin = b.coin AND l.status != 'rejected'
+                     ORDER BY l.found_at DESC, l.id DESC LIMIT 1) AS last_work_at_found
+             FROM blocks b WHERE b.status != 'rejected'
+             GROUP BY b.coin ORDER BY b.coin",
+        )
         .fetch_all(&self.pool)
         .await?)
     }
@@ -168,6 +206,68 @@ mod tests {
         let recent = store.recent_blocks(5).await.unwrap();
         assert_eq!(recent[0].status, BlockStatus::Confirmed);
         assert_eq!(recent[0].confirmations, 120);
+        assert_eq!(recent[0].work_at_found, Some(0.0));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn rounds_bank_work_at_each_block_and_skip_rejected_ones() {
+        use crate::NewShare;
+        let path = temp_path("rounds");
+        let store = Store::open(&path).await.unwrap();
+        let share = |ts: i64, difficulty: f64| NewShare {
+            ts,
+            worker: "w".into(),
+            difficulty,
+            share_diff: difficulty,
+            accepted: true,
+            reject_reason: None,
+        };
+        let block = |hash: &str, found_at: u64, status: BlockStatus| NewBlock {
+            coin: "LTC".into(),
+            height: 1,
+            hash: hash.into(),
+            worker: "w".into(),
+            difficulty: 100.0,
+            share_diff: 150.0,
+            reward_sats: Some(1),
+            found_at,
+            status,
+        };
+        assert!(store.coin_rounds().await.unwrap().is_empty());
+
+        store.persist_batch(&[], &[share(1, 30.0)]).await.unwrap();
+        store
+            .insert_block(&block("a", 10, BlockStatus::Accepted))
+            .await
+            .unwrap();
+        store
+            .persist_batch(&[], &[share(11, 50.0), share(12, 20.0)])
+            .await
+            .unwrap();
+        store
+            .insert_block(&block("bad", 20, BlockStatus::Rejected))
+            .await
+            .unwrap();
+        store
+            .insert_block(&block("b", 30, BlockStatus::Accepted))
+            .await
+            .unwrap();
+        store.persist_batch(&[], &[share(31, 5.0)]).await.unwrap();
+
+        let rounds = store.coin_rounds().await.unwrap();
+        assert_eq!(
+            rounds,
+            vec![CoinRounds {
+                coin: "LTC".into(),
+                blocks_found: 2,
+                expected_work: 200.0,
+                last_found_at: Some(30),
+                last_work_at_found: Some(100.0),
+            }]
+        );
+        // Current round: 105 total minus 100 banked at block "b".
+        assert_eq!(store.total_work().await.unwrap() - 100.0, 5.0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -10,7 +10,7 @@ mod blocks;
 mod retention;
 
 pub use accounting::{AuxPayoutRecord, HashrateSample, NewShare, ShareRow, WorkerRow, WorkerWrite};
-pub use blocks::{BlockRow, BlockStatus, NewBlock};
+pub use blocks::{BlockRow, BlockStatus, CoinRounds, NewBlock};
 pub use retention::{RetentionPolicy, RetentionReport};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};

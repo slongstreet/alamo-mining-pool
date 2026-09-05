@@ -92,6 +92,7 @@ pub fn validate(
             block: job.work.assemble_block(&header, &[], &coinbase),
             network_difficulty: job.work.network_difficulty(),
             share_difficulty: difficulty,
+            coinbase_value: job.work.coinbase_value,
             found_at: now_unix,
         });
     }
@@ -120,6 +121,7 @@ pub fn validate(
                 .assemble_block(&aux.header, &auxpow.serialize(), &aux.coinbase),
             network_difficulty: aux.work.network_difficulty(),
             share_difficulty: difficulty,
+            coinbase_value: aux.work.coinbase_value,
             found_at: now_unix,
         });
     }
@@ -279,8 +281,10 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         let (ltc, doge) = (&blocks[0], &blocks[1]);
         assert_eq!(ltc.coin, "LTC");
+        assert_eq!(ltc.coinbase_value, j.work.coinbase_value);
         assert_eq!(doge.coin, "DOGE");
         assert_eq!(doge.height, 31);
+        assert_eq!(doge.coinbase_value, j.aux[0].work.coinbase_value);
         assert_eq!(doge.address, "D");
         assert_eq!(&doge.block[..4], &0x0062_0104i32.to_le_bytes());
 

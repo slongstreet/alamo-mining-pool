@@ -9,9 +9,9 @@ use alamo_core::odds::OddsSummary;
 use alamo_core::payout::{AuxPayoutTable, PayoutSet, PayoutTable};
 use alamo_core::time::now_unix;
 use alamo_core::work::WorkTemplate;
-use alamo_store::{BlockRow, BlockStatus, NewBlock, Store};
+use alamo_store::{BlockRow, BlockStatus, CoinRounds, NewBlock, Store};
 use alamo_stratum::{BlockCandidate, PoolEvent, StratumServer, WorkReceiver};
-use alamo_web::{AppState, CoinStatus, PoolSnapshot};
+use alamo_web::{AppState, CoinStatus, PoolSnapshot, RoundStatus};
 use anyhow::{bail, Context};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -184,7 +184,7 @@ pub async fn submit_candidate(
             worker: candidate.worker.clone(),
             difficulty: candidate.network_difficulty,
             share_diff: candidate.share_difficulty,
-            reward_sats: None,
+            reward_sats: Some(candidate.coinbase_value as i64),
             found_at: candidate.found_at,
             status: outcome.status(),
         })
@@ -410,6 +410,7 @@ async fn publisher(
     };
     let mut persist = Persistence::new(store.clone(), now);
     let mut blocks: Vec<BlockRow> = Vec::new();
+    let mut rounds: Vec<CoinRounds> = Vec::new();
     let mut ticks: u32 = 0;
     let mut interval = tokio::time::interval(PUBLISH_INTERVAL);
     loop {
@@ -433,11 +434,15 @@ async fn publisher(
                 if ticks % BLOCKS_REFRESH_TICKS == 0 {
                     match store.recent_blocks(25).await {
                         Ok(rows) => blocks = rows,
-                        Err(err) => tracing::warn!(%err, "could not load recent blocks"),
+                        Err(err) => tracing::warn!(%err, "could not read blocks"),
+                    }
+                    match store.coin_rounds().await {
+                        Ok(rows) => rounds = rows,
+                        Err(err) => tracing::warn!(%err, "could not read rounds"),
                     }
                 }
                 ticks = ticks.wrapping_add(1);
-                state.publish(build_snapshot(&stats, &work, blocks.clone(), chain));
+                state.publish(build_snapshot(&stats, &work, blocks.clone(), &rounds, chain));
             }
             _ = shutdown.cancelled() => {
                 flush_persist(&mut persist).await;
@@ -453,14 +458,49 @@ async fn flush_persist(persist: &mut Persistence) {
     }
 }
 
-fn coin_status(w: &WorkTemplate, chain: Chain) -> CoinStatus {
+fn coin_status(
+    w: &WorkTemplate,
+    chain: Chain,
+    hashrate: f64,
+    total_work: f64,
+    rounds: Option<&CoinRounds>,
+) -> CoinStatus {
+    let network_difficulty = w.network_difficulty();
     CoinStatus {
         symbol: w.coin.to_string(),
         chain: chain.to_string(),
         height: w.height,
-        network_difficulty: w.network_difficulty(),
+        network_difficulty,
         template_age_seconds: now_unix().saturating_sub(w.created_at),
         coinbase_value: w.coinbase_value,
+        odds: OddsSummary::compute(hashrate, network_difficulty),
+        round: round_status(network_difficulty, total_work, rounds),
+    }
+}
+
+/// The current round on one chain. Before the first block the round spans all work.
+fn round_status(
+    network_difficulty: f64,
+    total_work: f64,
+    rounds: Option<&CoinRounds>,
+) -> RoundStatus {
+    let banked = rounds.and_then(|r| r.last_work_at_found).unwrap_or(0.0);
+    let work = (total_work - banked).max(0.0);
+    let expected_work = network_difficulty;
+    let luck_percent = rounds
+        .filter(|r| r.blocks_found > 0 && total_work > 0.0)
+        .map(|r| alamo_core::odds::luck_percent(r.expected_work, total_work));
+    RoundStatus {
+        blocks_found: rounds.map_or(0, |r| r.blocks_found.max(0) as u64),
+        started_at: rounds.and_then(|r| r.last_found_at),
+        work,
+        expected_work,
+        progress: if expected_work > 0.0 {
+            work / expected_work
+        } else {
+            0.0
+        },
+        luck_percent,
     }
 }
 
@@ -468,28 +508,66 @@ fn build_snapshot(
     stats: &Stats,
     work: &WorkReceiver,
     blocks: Vec<BlockRow>,
+    rounds: &[CoinRounds],
     chain: Chain,
 ) -> PoolSnapshot {
     let now = now_unix();
     let workers = stats.workers(now);
     let hashrate = workers.iter().map(|w| w.hashrate).fold(0.0, |a, b| a + b);
+    let total_work = stats.total_work();
     let current = work.borrow().clone();
     let coins = current
         .iter()
         .flat_map(|m| std::iter::once(&m.parent).chain(m.aux.iter()))
-        .map(|w| coin_status(w, chain))
+        .map(|w| {
+            let r = rounds.iter().find(|r| r.coin == w.coin);
+            coin_status(w, chain, hashrate, total_work, r)
+        })
         .collect();
-    let odds = current
-        .as_ref()
-        .map(|m| OddsSummary::compute(hashrate, m.parent.network_difficulty()));
     PoolSnapshot {
+        now,
         coins,
         hashrate,
         shares_accepted: stats.shares_accepted(),
         shares_rejected: stats.shares_rejected(),
+        total_work,
+        best_share_difficulty: stats.best_difficulty(),
         workers,
         blocks,
-        odds,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_before_any_block_counts_all_work_and_has_no_luck() {
+        let r = round_status(1_000.0, 250.0, None);
+        assert_eq!(r.blocks_found, 0);
+        assert_eq!(r.started_at, None);
+        assert_eq!(r.work, 250.0);
+        assert_eq!(r.expected_work, 1_000.0);
+        assert_eq!(r.progress, 0.25);
+        assert_eq!(r.luck_percent, None);
+    }
+
+    #[test]
+    fn round_after_blocks_starts_at_the_banked_work() {
+        let rounds = CoinRounds {
+            coin: "LTC".into(),
+            blocks_found: 2,
+            expected_work: 2_000.0,
+            last_found_at: Some(500),
+            last_work_at_found: Some(1_600.0),
+        };
+        // 2 blocks expected to take 2_000 work; the pool did 2_400: luck 83%.
+        let r = round_status(1_000.0, 2_400.0, Some(&rounds));
+        assert_eq!(r.blocks_found, 2);
+        assert_eq!(r.started_at, Some(500));
+        assert_eq!(r.work, 800.0);
+        assert_eq!(r.progress, 0.8);
+        assert!((r.luck_percent.unwrap() - 83.333).abs() < 0.01);
     }
 }
