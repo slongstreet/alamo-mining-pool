@@ -2,25 +2,60 @@
   color-scheme: dark light;
   --bg: #0b0e14;
   --panel: #131823;
+  --panel-2: #1a2130;
+  --border: rgb(255 255 255 / 7%);
   --text: #e6e9ef;
   --muted: #8b93a7;
   --accent: #f2a900;
   --accent-2: #4cc9f0;
   --ok: #3ddc97;
+  --warn: #ffb84d;
   --bad: #ff5c5c;
+  --grid: rgb(255 255 255 / 6%);
   --radius: 12px;
+  --shadow: 0 1px 0 rgb(255 255 255 / 4%) inset, 0 8px 24px rgb(0 0 0 / 20%);
   font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   font-size: 15px;
   line-height: 1.5;
 }
 
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme='dark']) {
     --bg: #f6f7fb;
     --panel: #ffffff;
+    --panel-2: #eef1f7;
+    --border: rgb(0 0 0 / 8%);
     --text: #151922;
     --muted: #5d6578;
+    --accent: #c98a00;
+    --accent-2: #0a8fb8;
+    --ok: #1f9d6a;
+    --warn: #b97300;
+    --bad: #d23b3b;
+    --grid: rgb(0 0 0 / 7%);
+    --shadow: 0 1px 2px rgb(0 0 0 / 6%), 0 8px 24px rgb(0 0 0 / 6%);
   }
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f6f7fb;
+  --panel: #ffffff;
+  --panel-2: #eef1f7;
+  --border: rgb(0 0 0 / 8%);
+  --text: #151922;
+  --muted: #5d6578;
+  --accent: #c98a00;
+  --accent-2: #0a8fb8;
+  --ok: #1f9d6a;
+  --warn: #b97300;
+  --bad: #d23b3b;
+  --grid: rgb(0 0 0 / 7%);
+  --shadow: 0 1px 2px rgb(0 0 0 / 6%), 0 8px 24px rgb(0 0 0 / 6%);
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
 }
 
 * {
@@ -34,18 +69,182 @@ body {
 }
 
 main {
-  max-width: 1100px;
+  max-width: 1200px;
   margin: 0 auto;
-  padding: 2rem 1.25rem;
+  padding: 1.5rem 1.25rem 3rem;
+}
+
+h2 {
+  margin: 0 0 0.75rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
 }
 
 .panel {
   background: var(--panel);
   border-radius: var(--radius);
-  padding: 1.25rem 1.5rem;
-  box-shadow: 0 1px 0 rgb(255 255 255 / 4%) inset, 0 8px 24px rgb(0 0 0 / 20%);
+  padding: 1.1rem 1.25rem;
+  box-shadow: var(--shadow);
+  min-width: 0;
 }
 
 .muted {
   color: var(--muted);
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+.grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.grid.two {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+}
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 1rem;
+}
+
+.tile {
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 0.9rem 1.1rem;
+  box-shadow: var(--shadow);
+}
+
+.tile .label {
+  font-size: 0.78rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.tile .value {
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  margin-top: 0.2rem;
+}
+
+.tile .sub {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-top: 0.15rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+th {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+td.r,
+th.r {
+  text-align: right;
+}
+
+tr:last-child td {
+  border-bottom: 0;
+}
+
+.scroll {
+  overflow-x: auto;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.badge.ok {
+  color: var(--ok);
+}
+
+.badge.warn {
+  color: var(--warn);
+}
+
+.badge.bad {
+  color: var(--bad);
+}
+
+.badge.accent {
+  color: var(--accent);
+}
+
+.empty {
+  color: var(--muted);
+  padding: 1rem 0;
+  text-align: center;
+}
+
+button.ghost {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.3rem 0.7rem;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+button.ghost:hover {
+  border-color: var(--muted);
+}
+
+button.ghost[aria-pressed='true'] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.meter {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.meter > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.6s ease;
 }

@@ -1,4 +1,4 @@
-/** Typed client for the daemon's JSON API. */
+/** Typed client for the daemon's JSON API. Mirrors `alamo-web::snapshot` and the store rows. */
 
 export interface Health {
   status: string;
@@ -6,10 +6,104 @@ export interface Health {
   uptime_seconds: number;
 }
 
+export interface OddsSummary {
+  hashrate: number;
+  difficulty: number;
+  p_hour: number;
+  p_day: number;
+  p_week: number;
+  p_month: number;
+  p_year: number;
+  expected_seconds: number | null;
+}
+
+export interface RoundStatus {
+  blocks_found: number;
+  started_at: number | null;
+  work: number;
+  expected_work: number;
+  progress: number;
+  luck_percent: number | null;
+}
+
+export interface CoinStatus {
+  symbol: string;
+  chain: string;
+  height: number;
+  network_difficulty: number;
+  template_age_seconds: number;
+  coinbase_value: number;
+  odds: OddsSummary;
+  round: RoundStatus;
+}
+
+export interface AuxPayoutStatus {
+  coin: string;
+  address: string;
+  fallback: boolean;
+}
+
+export interface WorkerStatus {
+  name: string;
+  address: string;
+  fallback: boolean;
+  aux_payouts: AuxPayoutStatus[];
+  connections: number;
+  difficulty: number;
+  hashrate: number;
+  shares_accepted: number;
+  shares_rejected: number;
+  best_difficulty: number;
+  work_accepted: number;
+  last_share_seconds: number | null;
+}
+
+export type BlockStatus = 'accepted' | 'rejected' | 'confirmed' | 'orphaned';
+
+export interface BlockRow {
+  id: number;
+  coin: string;
+  height: number;
+  hash: string;
+  worker: string;
+  difficulty: number;
+  share_diff: number;
+  reward_sats: number | null;
+  found_at: number;
+  status: BlockStatus;
+  confirmations: number;
+  work_at_found: number | null;
+}
+
+export interface ShareRow {
+  id: number;
+  ts: number;
+  worker: string;
+  difficulty: number;
+  share_diff: number;
+  accepted: boolean;
+  reject_reason: string | null;
+}
+
+export interface HashrateSample {
+  ts: number;
+  worker: string;
+  hashrate: number;
+}
+
 export interface Status {
   pool_name: string;
   version: string;
   uptime_seconds: number;
+  now: number;
+  coins: CoinStatus[];
+  hashrate: number;
+  shares_accepted: number;
+  shares_rejected: number;
+  total_work: number;
+  best_share_difficulty: number;
+  workers: WorkerStatus[];
+  blocks: BlockRow[];
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -23,4 +117,17 @@ async function getJson<T>(path: string): Promise<T> {
 export const api = {
   health: () => getJson<Health>('/api/health'),
   status: () => getJson<Status>('/api/status'),
+  /** Samples for the pool (empty worker) or one worker over the last `span` seconds. */
+  hashrate: (span: number, worker = '') =>
+    getJson<HashrateSample[]>(
+      `/api/hashrate?span=${span}${worker ? `&worker=${encodeURIComponent(worker)}` : ''}`,
+    ),
+  shares: (limit: number) => getJson<ShareRow[]>(`/api/shares?limit=${limit}`),
+  blocks: (limit: number) => getJson<BlockRow[]>(`/api/blocks?limit=${limit}`),
 };
+
+/** WebSocket URL for the live snapshot stream, relative to where the page was served. */
+export function wsUrl(): string {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}/api/ws`;
+}

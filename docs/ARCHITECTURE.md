@@ -47,13 +47,20 @@ unit-tested without sockets.
 
 ### alamo-store
 SQLite via sqlx with embedded migrations. Stores blocks found, hashrate samples, worker
-metadata, and recent shares. Retention runs periodically to keep the file small. On
+metadata, and recent shares. Retention runs periodically to keep the file small: shares
+are kept for a day, hashrate samples are folded from 1-minute to 5-minute to 1-hour
+buckets (only complete buckets, so averages never drift) and expire after 30 days. On
 startup the publisher restores worker counters and the hashrate window; jobs and sessions
-are rebuilt from the current template when miners reconnect.
+are rebuilt from the current template when miners reconnect. Workers carry lifetime
+accepted work and each block records the pool total at the moment it was found, which is
+what round progress and luck are computed from.
 
 ### alamo-web
-Axum router. `/api/*` JSON endpoints, `/api/ws` for live updates, and everything else served
-from the embedded `web/dist`. The dashboard is a Svelte SPA.
+Axum router. `/api/status` is the snapshot document the publisher rebuilds every two
+seconds; `/api/ws` pushes the same document on every rebuild through a watch channel.
+`/api/hashrate`, `/api/shares`, and `/api/blocks` read history straight from the store.
+Everything else is served from the embedded `web/dist`. The dashboard is a Svelte 5 SPA
+that draws its charts as inline SVG.
 
 ### alamo
 Config loading and validation, tracing setup, task supervision, graceful shutdown.
