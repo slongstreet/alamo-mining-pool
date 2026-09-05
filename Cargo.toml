@@ -55,7 +55,10 @@ primitive-types = { version = "0.14", default-features = false }
 rand = "0.10"
 
 # Node RPC
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# TLS through rustls with the ring provider: pure Rust plus C that cc builds anywhere,
+# so the static musl release targets need no cmake or NASM (aws-lc would).
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 # Storage
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }

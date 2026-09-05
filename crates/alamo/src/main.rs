@@ -68,8 +68,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::pin!(web, pool);
 
     let outcome = tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received ctrl-c, shutting down");
+        signal = shutdown_signal() => {
+            tracing::info!(signal, "shutting down");
             Ok(())
         }
         res = &mut pool => match res {
@@ -102,4 +102,32 @@ async fn main() -> anyhow::Result<()> {
     outcome?;
     tracing::info!("bye");
     Ok(())
+}
+
+/// Resolve to the name of the first termination signal received.
+///
+/// systemd and Docker stop the daemon with SIGTERM; a terminal sends SIGINT. Both must
+/// run the same graceful path so the final accounting flush is not skipped.
+#[cfg(unix)]
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(err) => {
+            tracing::warn!(%err, "could not listen for SIGTERM; only SIGINT will stop the daemon");
+            let _ = tokio::signal::ctrl_c().await;
+            return "SIGINT";
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = terminate.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "ctrl-c"
 }

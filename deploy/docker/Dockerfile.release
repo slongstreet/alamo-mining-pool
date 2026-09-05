@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1.7
+# Runtime-only image assembled from the static release binaries. The release workflow
+# builds those natively per architecture and puts them in dist/bin/{amd64,arm64}/alamo,
+# so this file has no RUN steps and needs no emulation for the arm64 half of the manifest.
+#
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     -f deploy/docker/Dockerfile.release -t ghcr.io/slongstreet/alamo-mining-pool .
+#
+# The image runs as the distroless `nonroot` user (uid 65532) and expects the config at
+# /etc/alamo/alamo.toml and a writable /var/lib/alamo for the database.
+
+FROM --platform=$BUILDPLATFORM busybox:1.37 AS prep
+RUN mkdir -p /data && chown 65532:65532 /data
+
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG TARGETARCH
+COPY dist/bin/${TARGETARCH}/alamo /usr/local/bin/alamo
+COPY --from=prep --chown=65532:65532 /data /var/lib/alamo
+WORKDIR /var/lib/alamo
+EXPOSE 3333 8080
+ENTRYPOINT ["/usr/local/bin/alamo"]
+CMD ["--config", "/etc/alamo/alamo.toml"]

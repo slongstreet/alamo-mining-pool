@@ -73,11 +73,18 @@ Work proceeds in waves. Each wave ends with something runnable and tested.
   library; the built dashboard is about 70 kB before compression.
 
 ## Wave 5 — Hardening and packaging
-- ZMQ `hashblock` notifications instead of polling.
-- Node reconnect and template staleness handling.
-- Prometheus metrics endpoint.
-- Release builds for x86-64 and arm64 Linux, multi-arch Docker image.
-- Operator docs.
+- [x] SIGTERM triggers the same graceful shutdown and accounting flush as SIGINT, so
+  systemd and Docker stops no longer drop the last batch of shares.
+- [x] ZMQ `hashblock` notifications with a built-in ZMTP subscriber (no libzmq); polling
+  stays on as the fallback.
+- [x] Node reconnect and template staleness: retry unreachable nodes at startup, report
+  node health on the dashboard and in metrics, withdraw templates from nodes that stay
+  unreachable past `template_stale_secs`, refetch when they return.
+- [x] Prometheus metrics at `/metrics`.
+- [x] Release builds: static musl binaries for x86-64 and arm64 Linux built natively per
+  architecture, a GitHub release per `vX.Y.Z` tag, and a multi-arch distroless image on
+  GHCR assembled from those binaries.
+- [x] Operator docs in `docs/OPERATING.md`.
 
 ## Later
 - Additional coins via the `Coin` abstraction (BTC/BCH sha256d solo are cheap).

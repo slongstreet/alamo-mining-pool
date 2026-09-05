@@ -14,8 +14,10 @@ next to your own full nodes, and watch your odds of hitting the next block in re
 
 > Status: Litecoin solo mining and Dogecoin merge mining work end to end on regtest,
 > including Litecoin MWEB blocks. Shares, workers, hashrate samples, and blocks persist
-> across restarts, and the live dashboard (odds, rounds and luck, hashrate, workers, shares,
-> blocks) is in. Hardening and packaging are next. See [docs/ROADMAP.md](docs/ROADMAP.md).
+> across restarts; the live dashboard covers odds, rounds and luck, hashrate, workers,
+> shares, and blocks; the daemon survives node outages, takes ZMQ block notifications,
+> and exposes Prometheus metrics. Releases ship static Linux binaries and a multi-arch
+> Docker image. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Layout
 
@@ -30,7 +32,7 @@ crates/
 web/              Svelte + TypeScript dashboard, built by Vite and embedded into `alamo`
 config/           Example configuration
 deploy/           Dockerfile, docker-compose, systemd unit
-docs/             Architecture and roadmap
+docs/             Architecture, operating guide, roadmap
 ```
 
 ## Quick start (development)
@@ -77,6 +79,13 @@ ALAMO_REGTEST_DOGE_RPC=http://alamo:alamo@127.0.0.1:18332 \
 ```
 
 Leave `ALAMO_REGTEST_DOGE_RPC` unset to test Litecoin alone.
+
+## Running it for real
+
+[docs/OPERATING.md](docs/OPERATING.md) covers node settings, installing from a release
+tarball or the Docker image, the systemd unit, backups, the `/metrics` endpoint, and
+troubleshooting. Releases are cut by tagging `vX.Y.Z`; the workflow builds static binaries
+for x86-64 and arm64 Linux and publishes `ghcr.io/slongstreet/alamo-mining-pool`.
 
 ## Configuration
 

@@ -1,6 +1,7 @@
 //! Fetch block templates from a node and turn them into [`WorkTemplate`]s.
 
 use crate::rpc::{RpcClient, RpcError};
+use crate::zmq::ZmqStatus;
 use crate::Coin;
 use alamo_core::encode::{push_data, push_script_num};
 use alamo_core::hash::from_display_hex;
@@ -116,6 +117,24 @@ pub fn convert(
     Ok(work)
 }
 
+/// What the template source knows about its node, for the dashboard and metrics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeHealth {
+    /// Whether the most recent RPC call succeeded.
+    pub connected: bool,
+    /// Consecutive failed polls.
+    pub failures: u32,
+    /// The most recent RPC failure, if the node is currently unreachable.
+    pub last_error: Option<String>,
+    /// Unix time of the last successful poll.
+    pub last_ok: Option<u64>,
+    /// Whether the published template was withdrawn because the node stayed unreachable
+    /// past `template_stale_secs`.
+    pub withdrawn: bool,
+    /// ZMQ subscription state: `None` when not configured.
+    pub zmq: Option<bool>,
+}
+
 /// Polls a node for templates and publishes them on a watch channel.
 pub struct TemplateSource {
     /// Node client.
@@ -128,9 +147,36 @@ pub struct TemplateSource {
     pub poll_interval: Duration,
     /// How often to refresh the template even without a new tip (picks up new fees).
     pub refresh_interval: Duration,
+    /// How long the node may stay unreachable before the template is withdrawn.
+    pub stale_after: Duration,
+    /// Block notifications from a [`ZmqSubscriber`](crate::ZmqSubscriber), if configured.
+    /// Each notification triggers an immediate poll; polling continues as the fallback,
+    /// just less often while the subscription is up.
+    pub zmq: Option<watch::Receiver<ZmqStatus>>,
+    /// Where node health is reported, if anyone is listening.
+    pub health: Option<watch::Sender<NodeHealth>>,
 }
 
+/// Tip polling cadence while ZMQ notifications are flowing.
+const ZMQ_FALLBACK_POLL: Duration = Duration::from_secs(10);
+/// Minimum delay between polls while the node is unreachable.
+const FAILURE_POLL: Duration = Duration::from_secs(2);
+
 impl TemplateSource {
+    /// A source with default timings, no notifications, and no health reporting.
+    pub fn new(rpc: RpcClient, coin: Arc<dyn Coin>, coinbase_tag: Vec<u8>) -> Self {
+        Self {
+            rpc,
+            coin,
+            coinbase_tag,
+            poll_interval: Duration::from_millis(500),
+            refresh_interval: Duration::from_secs(30),
+            stale_after: Duration::from_secs(120),
+            zmq: None,
+            health: None,
+        }
+    }
+
     /// Run until cancelled, publishing each new template to `tx`.
     pub async fn run(
         self,
@@ -140,42 +186,116 @@ impl TemplateSource {
         shutdown.run_until_cancelled(self.poll_loop(tx)).await;
     }
 
-    async fn poll_loop(self, tx: watch::Sender<Option<Arc<WorkTemplate>>>) {
+    async fn poll_loop(mut self, tx: watch::Sender<Option<Arc<WorkTemplate>>>) {
         let mut next_id: u64 = 1;
         let mut last_tip: Option<String> = None;
         let mut last_refresh = Instant::now() - self.refresh_interval;
-        let mut failures: u32 = 0;
+        let mut last_ok: Option<Instant> = None;
+        let mut health = NodeHealth::default();
+        let mut zmq_blocks = self
+            .zmq
+            .as_mut()
+            .map_or(0, |rx| rx.borrow_and_update().blocks);
         loop {
             match self.fetch(&last_tip, last_refresh, JobId(next_id)).await {
-                Ok(Some((tip, work))) => {
-                    failures = 0;
-                    next_id += 1;
-                    last_refresh = Instant::now();
-                    tracing::info!(
-                        coin = work.coin,
-                        height = work.height,
-                        txs = work.transactions.len(),
-                        clean = work.clean_jobs,
-                        difficulty = work.network_difficulty(),
-                        "new work"
-                    );
-                    last_tip = Some(tip);
-                    tx.send_replace(Some(Arc::new(work)));
+                Ok(fetched) => {
+                    if health.failures > 0 {
+                        tracing::info!(coin = self.coin.symbol(), "node reachable again");
+                    }
+                    last_ok = Some(Instant::now());
+                    health.connected = true;
+                    health.failures = 0;
+                    health.last_error = None;
+                    health.last_ok = Some(now_unix());
+                    if let Some((tip, work)) = fetched {
+                        next_id += 1;
+                        last_refresh = Instant::now();
+                        tracing::info!(
+                            coin = work.coin,
+                            height = work.height,
+                            txs = work.transactions.len(),
+                            clean = work.clean_jobs,
+                            difficulty = work.network_difficulty(),
+                            "new work"
+                        );
+                        last_tip = Some(tip);
+                        health.withdrawn = false;
+                        tx.send_replace(Some(Arc::new(work)));
+                    }
                 }
-                Ok(None) => {}
                 Err(err) => {
-                    failures += 1;
-                    if failures == 1 || failures % 30 == 0 {
-                        tracing::warn!(coin = self.coin.symbol(), %err, failures, "template fetch failed");
+                    health.connected = false;
+                    health.failures += 1;
+                    if health.failures == 1 || health.failures % 30 == 0 {
+                        tracing::warn!(coin = self.coin.symbol(), %err, failures = health.failures, "template fetch failed");
+                    }
+                    health.last_error = Some(err.to_string());
+                    let unreachable_for = last_ok.map_or(Duration::MAX, |t| t.elapsed());
+                    if !health.withdrawn
+                        && last_tip.is_some()
+                        && unreachable_for >= self.stale_after
+                    {
+                        tracing::warn!(
+                            coin = self.coin.symbol(),
+                            unreachable_secs = unreachable_for.as_secs(),
+                            "node unreachable too long; withdrawing template"
+                        );
+                        health.withdrawn = true;
+                        // Force a full refetch once the node is back, whatever the tip.
+                        last_refresh = Instant::now() - self.refresh_interval;
+                        tx.send_replace(None);
                     }
                 }
             }
-            let delay = if failures > 0 {
-                self.poll_interval.max(Duration::from_secs(2))
+            let zmq_live = self.zmq.as_ref().is_some_and(|rx| rx.borrow().connected);
+            health.zmq = self.zmq.as_ref().map(|_| zmq_live);
+            if let Some(report) = &self.health {
+                report.send_if_modified(|current| {
+                    if *current == health {
+                        false
+                    } else {
+                        *current = health.clone();
+                        true
+                    }
+                });
+            }
+
+            let delay = if health.failures > 0 {
+                self.poll_interval.max(FAILURE_POLL)
+            } else if zmq_live {
+                self.poll_interval.max(ZMQ_FALLBACK_POLL)
             } else {
                 self.poll_interval
             };
-            tokio::time::sleep(delay).await;
+            self.wait(delay, &mut zmq_blocks).await;
+        }
+    }
+
+    /// Sleep for `delay`, or return early when ZMQ reports a new block.
+    async fn wait(&mut self, delay: Duration, zmq_blocks: &mut u64) {
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            let Some(rx) = self.zmq.as_mut() else {
+                sleep.await;
+                return;
+            };
+            tokio::select! {
+                _ = &mut sleep => return,
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        self.zmq = None;
+                        continue;
+                    }
+                    let blocks = rx.borrow_and_update().blocks;
+                    if blocks != *zmq_blocks {
+                        *zmq_blocks = blocks;
+                        tracing::debug!(coin = self.coin.symbol(), "block notification; polling now");
+                        return;
+                    }
+                    // Connection state changed but no new block: keep waiting.
+                }
+            }
         }
     }
 

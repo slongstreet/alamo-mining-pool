@@ -32,6 +32,11 @@ pub struct CoinConfig {
     /// How often to refresh the template without a new tip, in seconds.
     #[serde(default = "default_refresh_secs")]
     pub template_refresh_secs: u64,
+    /// How long the node may stay unreachable before its template is withdrawn, in
+    /// seconds. A withdrawn aux template drops out of merged work; a withdrawn parent
+    /// template leaves miners on their last job until the node returns.
+    #[serde(default = "default_stale_secs")]
+    pub template_stale_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -44,6 +49,10 @@ fn default_poll_ms() -> u64 {
 
 fn default_refresh_secs() -> u64 {
     30
+}
+
+fn default_stale_secs() -> u64 {
+    120
 }
 
 impl std::fmt::Display for CoinConfig {

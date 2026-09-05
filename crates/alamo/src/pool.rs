@@ -4,14 +4,16 @@
 use crate::config::Config;
 use crate::persist::Persistence;
 use crate::stats::Stats;
-use alamo_coins::{merge, Chain, Coin, CoinConfig, RpcClient, TemplateSource};
+use alamo_coins::{
+    merge, Chain, Coin, CoinConfig, NodeHealth, RpcClient, TemplateSource, ZmqStatus, ZmqSubscriber,
+};
 use alamo_core::odds::OddsSummary;
 use alamo_core::payout::{AuxPayoutTable, PayoutSet, PayoutTable};
 use alamo_core::time::now_unix;
 use alamo_core::work::WorkTemplate;
 use alamo_store::{BlockRow, BlockStatus, CoinRounds, NewBlock, Store};
 use alamo_stratum::{BlockCandidate, PoolEvent, StratumServer, WorkReceiver};
-use alamo_web::{AppState, CoinStatus, PoolSnapshot, RoundStatus};
+use alamo_web::{AppState, CoinStatus, NodeStatus, PoolSnapshot, RoundStatus};
 use anyhow::{bail, Context};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -83,13 +85,51 @@ impl Chains {
     }
 }
 
-async fn connect_node(key: &str, cfg: &CoinConfig) -> anyhow::Result<ChainNode> {
+/// Delays between attempts to reach a node at startup.
+const CONNECT_BACKOFF: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+
+/// Connect to one node, retrying until it answers or `shutdown` is cancelled (`Ok(None)`).
+/// Configuration problems fail immediately; an unreachable node only logs and waits, so a
+/// pool started before its nodes finish booting comes up on its own.
+async fn connect_node(
+    key: &str,
+    cfg: &CoinConfig,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<Option<ChainNode>> {
     let coin = alamo_coins::builtin(key).with_context(|| format!("unknown coin '{key}'"))?;
+    if let Some(endpoint) = &cfg.zmq_hashblock {
+        alamo_coins::zmq::parse_endpoint(endpoint)
+            .with_context(|| format!("coins.{key}.zmq_hashblock"))?;
+    }
     let rpc = RpcClient::new(&cfg.rpc_url, &cfg.rpc_user, &cfg.rpc_password);
-    let info = rpc
-        .get_blockchain_info()
-        .await
-        .with_context(|| format!("connecting to {} node at {}", coin.name(), cfg.rpc_url))?;
+    let mut attempt: usize = 0;
+    let info = loop {
+        match rpc.get_blockchain_info().await {
+            Ok(info) => break info,
+            Err(err) => {
+                let delay = CONNECT_BACKOFF[attempt.min(CONNECT_BACKOFF.len() - 1)];
+                attempt += 1;
+                tracing::warn!(
+                    coin = coin.symbol(),
+                    url = %cfg.rpc_url,
+                    %err,
+                    attempt,
+                    retry_in_secs = delay.as_secs(),
+                    "node unreachable"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown.cancelled() => return Ok(None),
+                }
+            }
+        }
+    };
     let chain =
         Chain::parse(&info.chain).with_context(|| format!("unknown chain '{}'", info.chain))?;
     tracing::info!(coin = coin.symbol(), %chain, height = info.blocks, "node connected");
@@ -100,18 +140,22 @@ async fn connect_node(key: &str, cfg: &CoinConfig) -> anyhow::Result<ChainNode> 
                 coin.symbol()
             )
         })?;
-    Ok(ChainNode {
+    Ok(Some(ChainNode {
         key: key.to_string(),
         coin,
         rpc,
         chain,
         payouts,
         config: cfg.clone(),
-    })
+    }))
 }
 
 /// Connect to the configured parent chain and every aux chain merge-mined with it.
-pub async fn connect_chains(config: &Config) -> anyhow::Result<Chains> {
+/// `Ok(None)` means shutdown was requested while waiting for a node.
+pub async fn connect_chains(
+    config: &Config,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<Option<Chains>> {
     let parents: Vec<(&String, &CoinConfig)> = config
         .coins
         .iter()
@@ -125,7 +169,9 @@ pub async fn connect_chains(config: &Config) -> anyhow::Result<Chains> {
             many.len()
         ),
     };
-    let parent = connect_node(key, cfg).await?;
+    let Some(parent) = connect_node(key, cfg, shutdown).await? else {
+        return Ok(None);
+    };
 
     let mut aux = Vec::new();
     for (aux_key, aux_cfg) in config
@@ -133,7 +179,9 @@ pub async fn connect_chains(config: &Config) -> anyhow::Result<Chains> {
         .iter()
         .filter(|(_, c)| c.enabled && c.merge_mined_with.as_deref() == Some(key.as_str()))
     {
-        let node = connect_node(aux_key, aux_cfg).await?;
+        let Some(node) = connect_node(aux_key, aux_cfg, shutdown).await? else {
+            return Ok(None);
+        };
         if node.coin.aux_chain_id().is_none() {
             bail!("coin '{aux_key}' cannot be merge-mined");
         }
@@ -151,7 +199,7 @@ pub async fn connect_chains(config: &Config) -> anyhow::Result<Chains> {
         );
         aux.push(node);
     }
-    Ok(Chains { parent, aux })
+    Ok(Some(Chains { parent, aux }))
 }
 
 /// Submit a block candidate to the node and record the result.
@@ -223,20 +271,81 @@ pub async fn track_confirmations(
     Ok(())
 }
 
-fn template_source(node: &ChainNode) -> TemplateSource {
+/// A node's template source plus the tasks and channels that feed it.
+struct NodeFeed {
+    source: TemplateSource,
+    health: watch::Receiver<NodeHealth>,
+    zmq: Option<ZmqFeed>,
+}
+
+fn node_feed(node: &ChainNode) -> NodeFeed {
     let tag = node
         .config
         .coinbase_tag
         .clone()
         .unwrap_or_else(|| "/alamo/".into())
         .into_bytes();
-    TemplateSource {
-        rpc: node.rpc.clone(),
-        coin: node.coin.clone(),
-        coinbase_tag: tag,
+    let (health_tx, health) = watch::channel(NodeHealth::default());
+    let (zmq, zmq_rx) = match &node.config.zmq_hashblock {
+        Some(endpoint) => {
+            let (status_tx, status_rx) = watch::channel(ZmqStatus::default());
+            // The subscriber owns the sender; the source watches the receiver.
+            let subscriber = ZmqSubscriber {
+                endpoint: endpoint.clone(),
+                coin: node.coin.symbol(),
+            };
+            (
+                Some(ZmqFeed {
+                    subscriber,
+                    status: status_tx,
+                }),
+                Some(status_rx),
+            )
+        }
+        None => (None, None),
+    };
+    let source = TemplateSource {
         poll_interval: Duration::from_millis(node.config.poll_interval_ms),
         refresh_interval: Duration::from_secs(node.config.template_refresh_secs),
+        stale_after: Duration::from_secs(node.config.template_stale_secs),
+        zmq: zmq_rx,
+        health: Some(health_tx),
+        ..TemplateSource::new(node.rpc.clone(), node.coin.clone(), tag)
+    };
+    NodeFeed {
+        source,
+        health,
+        zmq,
     }
+}
+
+/// A ZMQ subscriber and the channel it reports on.
+struct ZmqFeed {
+    subscriber: ZmqSubscriber,
+    status: watch::Sender<ZmqStatus>,
+}
+
+/// Start a node's template source and, if configured, its ZMQ subscriber.
+fn spawn_feed(
+    tasks: &mut JoinSet<&'static str>,
+    feed: NodeFeed,
+    tx: watch::Sender<Option<Arc<WorkTemplate>>>,
+    shutdown: &CancellationToken,
+    name: &'static str,
+) -> watch::Receiver<NodeHealth> {
+    let token = shutdown.child_token();
+    tasks.spawn(async move {
+        feed.source.run(tx, token).await;
+        name
+    });
+    if let Some(zmq) = feed.zmq {
+        let token = shutdown.child_token();
+        tasks.spawn(async move {
+            zmq.subscriber.run(zmq.status, token).await;
+            "zmq subscriber"
+        });
+    }
+    feed.health
 }
 
 /// Run the pool until `shutdown` is cancelled or a component stops.
@@ -246,7 +355,9 @@ pub async fn run(
     state: AppState,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let chains = connect_chains(&config).await?;
+    let Some(chains) = connect_chains(&config, &shutdown).await? else {
+        return Ok(());
+    };
 
     let (work_tx, work_rx) = watch::channel(None);
     let (events_tx, events_rx) = mpsc::channel::<PoolEvent>(4096);
@@ -255,22 +366,28 @@ pub async fn run(
     // Every task returns its name when it stops; none of them stops on its own.
     let mut tasks: JoinSet<&'static str> = JoinSet::new();
 
+    // Node health, parent first, in the order the snapshot lists coins.
+    let mut nodes: Vec<(&'static str, watch::Receiver<NodeHealth>)> = Vec::new();
     let (parent_tx, parent_rx) = watch::channel::<Option<Arc<WorkTemplate>>>(None);
-    let source = template_source(&chains.parent);
-    let token = shutdown.child_token();
-    tasks.spawn(async move {
-        source.run(parent_tx, token).await;
-        "template source"
-    });
+    let health = spawn_feed(
+        &mut tasks,
+        node_feed(&chains.parent),
+        parent_tx,
+        &shutdown,
+        "template source",
+    );
+    nodes.push((chains.parent.coin.symbol(), health));
     let mut aux_rxs = Vec::with_capacity(chains.aux.len());
     for node in &chains.aux {
         let (aux_tx, aux_rx) = watch::channel::<Option<Arc<WorkTemplate>>>(None);
-        let source = template_source(node);
-        let token = shutdown.child_token();
-        tasks.spawn(async move {
-            source.run(aux_tx, token).await;
-            "aux template source"
-        });
+        let health = spawn_feed(
+            &mut tasks,
+            node_feed(node),
+            aux_tx,
+            &shutdown,
+            "aux template source",
+        );
+        nodes.push((node.coin.symbol(), health));
         aux_rxs.push(aux_rx);
     }
     let token = shutdown.child_token();
@@ -317,6 +434,7 @@ pub async fn run(
     tasks.spawn(publisher(
         events_rx,
         work_rx,
+        nodes,
         store.clone(),
         state,
         chains.parent.chain,
@@ -388,6 +506,7 @@ const BLOCKS_REFRESH_TICKS: u32 = 5;
 async fn publisher(
     mut events: mpsc::Receiver<PoolEvent>,
     work: WorkReceiver,
+    nodes: Vec<(&'static str, watch::Receiver<NodeHealth>)>,
     store: Store,
     state: AppState,
     chain: Chain,
@@ -411,6 +530,9 @@ async fn publisher(
     let mut persist = Persistence::new(store.clone(), now);
     let mut blocks: Vec<BlockRow> = Vec::new();
     let mut rounds: Vec<CoinRounds> = Vec::new();
+    // Last template seen per coin, so a coin whose template was withdrawn keeps its
+    // place on the dashboard, flagged stale, instead of vanishing.
+    let mut templates: HashMap<&'static str, Arc<WorkTemplate>> = HashMap::new();
     let mut ticks: u32 = 0;
     let mut interval = tokio::time::interval(PUBLISH_INTERVAL);
     loop {
@@ -442,7 +564,15 @@ async fn publisher(
                     }
                 }
                 ticks = ticks.wrapping_add(1);
-                state.publish(build_snapshot(&stats, &work, blocks.clone(), &rounds, chain));
+                remember_templates(&work, &mut templates);
+                state.publish(build_snapshot(
+                    &stats,
+                    &templates,
+                    &nodes,
+                    blocks.clone(),
+                    &rounds,
+                    chain,
+                ));
             }
             _ = shutdown.cancelled() => {
                 flush_persist(&mut persist).await;
@@ -464,6 +594,8 @@ fn coin_status(
     hashrate: f64,
     total_work: f64,
     rounds: Option<&CoinRounds>,
+    health: &NodeHealth,
+    now: u64,
 ) -> CoinStatus {
     let network_difficulty = w.network_difficulty();
     CoinStatus {
@@ -471,10 +603,36 @@ fn coin_status(
         chain: chain.to_string(),
         height: w.height,
         network_difficulty,
-        template_age_seconds: now_unix().saturating_sub(w.created_at),
+        template_age_seconds: now.saturating_sub(w.created_at),
         coinbase_value: w.coinbase_value,
         odds: OddsSummary::compute(hashrate, network_difficulty),
         round: round_status(network_difficulty, total_work, rounds),
+        node: node_status(health, now),
+    }
+}
+
+fn node_status(health: &NodeHealth, now: u64) -> NodeStatus {
+    NodeStatus {
+        connected: health.connected,
+        stale: health.withdrawn,
+        failures: health.failures,
+        last_error: health.last_error.clone(),
+        last_ok_seconds: health.last_ok.map(|t| now.saturating_sub(t)),
+        zmq: health.zmq,
+    }
+}
+
+/// Note the templates in the current merged work.
+fn remember_templates(
+    work: &WorkReceiver,
+    templates: &mut HashMap<&'static str, Arc<WorkTemplate>>,
+) {
+    let current = work.borrow().clone();
+    for w in current
+        .iter()
+        .flat_map(|m| std::iter::once(&m.parent).chain(m.aux.iter()))
+    {
+        templates.insert(w.coin, w.clone());
     }
 }
 
@@ -506,7 +664,8 @@ fn round_status(
 
 fn build_snapshot(
     stats: &Stats,
-    work: &WorkReceiver,
+    templates: &HashMap<&'static str, Arc<WorkTemplate>>,
+    nodes: &[(&'static str, watch::Receiver<NodeHealth>)],
     blocks: Vec<BlockRow>,
     rounds: &[CoinRounds],
     chain: Chain,
@@ -515,13 +674,14 @@ fn build_snapshot(
     let workers = stats.workers(now);
     let hashrate = workers.iter().map(|w| w.hashrate).fold(0.0, |a, b| a + b);
     let total_work = stats.total_work();
-    let current = work.borrow().clone();
-    let coins = current
+    // Coins appear once they have had a template; node health rides along.
+    let coins = nodes
         .iter()
-        .flat_map(|m| std::iter::once(&m.parent).chain(m.aux.iter()))
-        .map(|w| {
-            let r = rounds.iter().find(|r| r.coin == w.coin);
-            coin_status(w, chain, hashrate, total_work, r)
+        .filter_map(|(coin, health)| {
+            let w = templates.get(coin)?;
+            let r = rounds.iter().find(|r| r.coin == *coin);
+            let health = health.borrow().clone();
+            Some(coin_status(w, chain, hashrate, total_work, r, &health, now))
         })
         .collect();
     PoolSnapshot {

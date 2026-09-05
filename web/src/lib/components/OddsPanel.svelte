@@ -28,12 +28,30 @@
     bestRatio <= 0 ? 0 : Math.min(100, Math.max(2, ((Math.log10(bestRatio) + 6) / 6) * 100)),
   );
   const luck = $derived(coin.round.luck_percent);
+  const nodeTitle = $derived(
+    coin.node.connected
+      ? coin.node.zmq === true
+        ? 'Node answering; block notifications over ZMQ'
+        : coin.node.zmq === false
+          ? 'Node answering; ZMQ subscription down, polling instead'
+          : 'Node answering; polling for new blocks'
+      : `${coin.node.failures} failed polls${coin.node.last_error ? `: ${coin.node.last_error}` : ''}`,
+  );
   const luckClass = $derived(luck == null ? '' : luck >= 100 ? 'ok' : luck >= 70 ? 'warn' : 'bad');
 </script>
 
 <section class="panel">
   <div class="head">
-    <h2>{coin.symbol} block odds</h2>
+    <h2>
+      {coin.symbol} block odds
+      {#if !coin.node.connected}
+        <span class="badge bad" title={nodeTitle}>node {coin.node.stale ? 'stale' : 'unreachable'}</span>
+      {:else if coin.node.zmq === false}
+        <span class="badge warn" title={nodeTitle}>zmq down</span>
+      {:else if coin.node.zmq}
+        <span class="badge ok" title={nodeTitle}>zmq</span>
+      {/if}
+    </h2>
     <span class="muted num">
       height {coin.height.toLocaleString()} · diff {formatDifficulty(coin.network_difficulty)} ·
       {formatCoins(coin.coinbase_value, coin.symbol)} reward

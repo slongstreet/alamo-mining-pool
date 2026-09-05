@@ -30,8 +30,14 @@ enabled = true
 rpc_url = "http://127.0.0.1:9332"
 rpc_user = "alamo"
 rpc_password = "change-me"
-# Optional: block notifications instead of polling.
+# Optional: instant block notifications from the node's `-zmqpubhashblock` socket.
+# Polling continues as a fallback (every 10 s while ZMQ is up).
 # zmq_hashblock = "tcp://127.0.0.1:28332"
+# How often to check the tip without ZMQ (ms), refresh the template for new fees (s), and
+# how long the node may stay unreachable before its template is withdrawn (s).
+# poll_interval_ms = 500
+# template_refresh_secs = 30
+# template_stale_secs = 120
 # Paid if a worker's username is not a valid LTC address.
 fallback_address = "ltc1qexampleexampleexampleexampleexampleexamp"
 # Text placed in the coinbase scriptSig.
