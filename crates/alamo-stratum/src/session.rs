@@ -379,7 +379,13 @@ impl Session {
             seen: Default::default(),
         };
         self.next_job += 1;
-        fx.notify(Notification::new("mining.notify", job.notify_params(clean)));
+        // A new session — including a miner reconnecting after a pool restart — must
+        // start with a clean job so the miner drops work from a previous connection.
+        let clean_jobs = clean || self.jobs.is_empty();
+        fx.notify(Notification::new(
+            "mining.notify",
+            job.notify_params(clean_jobs),
+        ));
         self.jobs.push_back(job);
         while self.jobs.len() > MAX_JOBS {
             self.jobs.pop_front();
@@ -538,6 +544,32 @@ mod tests {
         assert_eq!(n.params[8], true);
         assert_eq!(n.params[5], "20000000");
         assert_eq!(n.params[6], "207fffff");
+    }
+
+    #[test]
+    fn first_job_after_reconnect_is_clean_even_if_the_template_is_not() {
+        // Pool restart: the miner reconnects, the current template is a refresh
+        // (clean_jobs=false), but the new session has no prior jobs to keep.
+        let mut s = session();
+        s.handle(
+            req("mining.authorize", json!([addr(1), "x"])),
+            Instant::now(),
+            0,
+        );
+        let fx = s.on_work(work(false));
+        let Outgoing::Notification(n) = &fx.outgoing[0] else {
+            panic!()
+        };
+        assert_eq!(n.method, "mining.notify");
+        assert_eq!(n.params[0], "1");
+        assert_eq!(n.params[8], true);
+
+        let fx = s.on_work(work(false));
+        let Outgoing::Notification(n) = &fx.outgoing[0] else {
+            panic!()
+        };
+        assert_eq!(n.params[0], "2");
+        assert_eq!(n.params[8], false);
     }
 
     #[test]

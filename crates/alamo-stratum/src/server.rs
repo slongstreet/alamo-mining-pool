@@ -132,6 +132,8 @@ async fn handle_connection(
     let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(MAX_LINE_LEN));
     tracing::info!(session = id, %peer, "miner connected");
 
+    // Sessions and jobs are process-local: a restart is a new session id, a new
+    // extranonce1, and jobs rebuilt from the current template after authorize.
     let mut session = Session::new(
         id,
         extranonce1(id),

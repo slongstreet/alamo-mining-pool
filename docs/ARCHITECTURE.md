@@ -47,7 +47,9 @@ unit-tested without sockets.
 
 ### alamo-store
 SQLite via sqlx with embedded migrations. Stores blocks found, hashrate samples, worker
-metadata, and recent shares. Retention runs periodically to keep the file small.
+metadata, and recent shares. Retention runs periodically to keep the file small. On
+startup the publisher restores worker counters and the hashrate window; jobs and sessions
+are rebuilt from the current template when miners reconnect.
 
 ### alamo-web
 Axum router. `/api/*` JSON endpoints, `/api/ws` for live updates, and everything else served

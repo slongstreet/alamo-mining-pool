@@ -17,9 +17,9 @@ pub struct PoolSnapshot {
     pub coins: Vec<CoinStatus>,
     /// Pool hashrate estimate over the recent window, hashes per second.
     pub hashrate: f64,
-    /// Accepted shares since start.
+    /// Accepted shares recorded (lifetime).
     pub shares_accepted: u64,
-    /// Rejected shares since start.
+    /// Rejected shares recorded (lifetime).
     pub shares_rejected: u64,
     /// Workers seen, connected first.
     pub workers: Vec<WorkerStatus>,
@@ -63,9 +63,9 @@ pub struct WorkerStatus {
     pub difficulty: f64,
     /// Hashrate estimate, hashes per second.
     pub hashrate: f64,
-    /// Accepted shares.
+    /// Accepted shares (lifetime).
     pub shares_accepted: u64,
-    /// Rejected shares.
+    /// Rejected shares (lifetime).
     pub shares_rejected: u64,
     /// Best share difficulty seen.
     pub best_difficulty: f64,

@@ -65,6 +65,19 @@ impl RejectReason {
             RejectReason::Unauthorized => "Unauthorized worker",
         }
     }
+
+    /// Stable slug stored with a rejected share.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RejectReason::StaleJob => "stale_job",
+            RejectReason::UnknownJob => "unknown_job",
+            RejectReason::LowDifficulty => "low_difficulty",
+            RejectReason::Duplicate => "duplicate",
+            RejectReason::InvalidNtime => "invalid_ntime",
+            RejectReason::InvalidExtranonce2 => "invalid_extranonce2",
+            RejectReason::Unauthorized => "unauthorized",
+        }
+    }
 }
 
 /// The result of validating a share.

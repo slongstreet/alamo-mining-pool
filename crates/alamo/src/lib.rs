@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod persist;
 pub mod pool;
 pub mod stats;
 
