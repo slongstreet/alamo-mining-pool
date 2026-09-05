@@ -184,7 +184,7 @@ pub async fn submit_candidate(
             worker: candidate.worker.clone(),
             difficulty: candidate.network_difficulty,
             share_diff: candidate.share_difficulty,
-            reward_sats: None,
+            reward_sats: Some(candidate.coinbase_value as i64),
             found_at: candidate.found_at,
             status: outcome.status(),
         })
