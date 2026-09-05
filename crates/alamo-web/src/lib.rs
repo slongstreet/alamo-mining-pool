@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
 pub use config::WebConfig;
-pub use snapshot::{BlockStatus, CoinStatus, PoolSnapshot, WorkerStatus};
+pub use snapshot::{CoinStatus, PoolSnapshot, WorkerStatus};
 
 /// State shared with request handlers.
 #[derive(Clone)]
@@ -33,17 +33,11 @@ struct Inner {
 impl AppState {
     /// Create the application state.
     pub fn new(pool_name: impl Into<String>) -> Self {
-        let pool_name = pool_name.into();
-        let snapshot = PoolSnapshot {
-            pool_name: pool_name.clone(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            ..Default::default()
-        };
         Self {
             inner: Arc::new(Inner {
-                pool_name,
+                pool_name: pool_name.into(),
                 started_at: Instant::now(),
-                snapshot: parking_lot::RwLock::new(snapshot),
+                snapshot: parking_lot::RwLock::new(PoolSnapshot::default()),
             }),
         }
     }
@@ -58,17 +52,16 @@ impl AppState {
         self.inner.started_at.elapsed().as_secs()
     }
 
-    /// Replace the published status document. Name, version, and uptime are filled in.
-    pub fn publish(&self, mut snapshot: PoolSnapshot) {
-        snapshot.pool_name = self.inner.pool_name.clone();
-        snapshot.version = env!("CARGO_PKG_VERSION").to_string();
-        snapshot.uptime_seconds = self.uptime_seconds();
+    /// Replace the published status document.
+    pub fn publish(&self, snapshot: PoolSnapshot) {
         *self.inner.snapshot.write() = snapshot;
     }
 
-    /// The current status document.
+    /// The current status document, with identity and uptime stamped on.
     pub fn snapshot(&self) -> PoolSnapshot {
         let mut s = self.inner.snapshot.read().clone();
+        s.pool_name = self.inner.pool_name.clone();
+        s.version = env!("CARGO_PKG_VERSION").to_string();
         s.uptime_seconds = self.uptime_seconds();
         s
     }

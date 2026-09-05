@@ -1,6 +1,7 @@
 //! The pool status document served to the dashboard.
 
 use alamo_core::odds::OddsSummary;
+use alamo_store::BlockRow;
 use serde::Serialize;
 
 /// Everything the dashboard shows, refreshed by the daemon every couple of seconds.
@@ -23,7 +24,7 @@ pub struct PoolSnapshot {
     /// Workers seen, connected first.
     pub workers: Vec<WorkerStatus>,
     /// Recent blocks, newest first.
-    pub blocks: Vec<BlockStatus>,
+    pub blocks: Vec<BlockRow>,
     /// Block odds for the parent chain at the current hashrate.
     pub odds: Option<OddsSummary>,
 }
@@ -68,25 +69,4 @@ pub struct WorkerStatus {
     pub best_difficulty: f64,
     /// Seconds since the last accepted share, if any.
     pub last_share_seconds: Option<u64>,
-}
-
-/// A block the pool found.
-#[derive(Clone, Debug, Serialize)]
-pub struct BlockStatus {
-    /// Ticker.
-    pub coin: String,
-    /// Height.
-    pub height: i64,
-    /// Hash, display hex.
-    pub hash: String,
-    /// Finder.
-    pub worker: String,
-    /// Unix time found.
-    pub found_at: i64,
-    /// Status string.
-    pub status: String,
-    /// Confirmations.
-    pub confirmations: i64,
-    /// Reward in base units, if known.
-    pub reward_sats: Option<i64>,
 }

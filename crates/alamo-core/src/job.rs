@@ -1,6 +1,5 @@
 //! Job and share types shared between the stratum server and the validator.
 
-use crate::hash::Hash256;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -20,21 +19,6 @@ impl std::str::FromStr for JobId {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         u64::from_str_radix(s, 16).map(JobId)
     }
-}
-
-/// A share submitted by a worker via `mining.submit`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Share {
-    /// The job the share was mined against.
-    pub job_id: JobId,
-    /// Worker name as authorized (payout address plus optional worker suffix).
-    pub worker: String,
-    /// Worker-chosen extranonce2 bytes.
-    pub extranonce2: Vec<u8>,
-    /// Header timestamp the worker used.
-    pub ntime: u32,
-    /// Header nonce the worker found.
-    pub nonce: u32,
 }
 
 /// Why a share was rejected.
@@ -91,14 +75,10 @@ pub enum ShareOutcome {
         /// Difficulty actually achieved by the hash.
         difficulty: f64,
     },
-    /// The share met one or more network targets and produced block candidates.
+    /// The share also met the network target: a block was found.
     Block {
         /// Difficulty actually achieved by the hash.
         difficulty: f64,
-        /// Proof-of-work hash of the header.
-        pow_hash: Hash256,
-        /// Symbols of the chains whose targets were met (e.g. `["LTC", "DOGE"]`).
-        chains: Vec<&'static str>,
     },
     /// The share was rejected.
     Rejected(RejectReason),

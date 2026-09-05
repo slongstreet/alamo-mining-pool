@@ -40,14 +40,9 @@ pub fn payout_script(address: &str, params: &AddressParams) -> Result<Vec<u8>, A
             }
             return segwit_script(version.to_u8(), &program);
         }
-        // If it looked like bech32 for some other hrp, say so.
-        if let Some((prefix, _)) = address.rsplit_once('1') {
-            if prefix.chars().all(|c| c.is_ascii_alphabetic())
-                && !prefix.is_empty()
-                && bech32::decode(address).is_ok()
-            {
-                return Err(AddressError::WrongNetwork);
-            }
+        // Valid bech32 for some other hrp: say so rather than "malformed".
+        if bech32::decode(address).is_ok() {
+            return Err(AddressError::WrongNetwork);
         }
     }
     let payload = bitcoin::base58::decode_check(address).map_err(|_| AddressError::Malformed)?;

@@ -9,7 +9,6 @@ pub mod auxpow;
 pub mod config;
 pub mod doge;
 pub mod ltc;
-pub mod payouts;
 pub mod rpc;
 pub mod template;
 
@@ -19,9 +18,8 @@ use std::sync::Arc;
 pub use config::CoinConfig;
 pub use doge::Dogecoin;
 pub use ltc::Litecoin;
-pub use payouts::CoinPayouts;
 pub use rpc::{RpcClient, RpcError};
-pub use template::TemplateSource;
+pub use template::{RawTemplate, TemplateError, TemplateSource};
 
 /// Which network a node is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +30,16 @@ pub enum Chain {
     Test,
     /// Local regression test network.
     Regtest,
+}
+
+impl std::fmt::Display for Chain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Chain::Main => "main",
+            Chain::Test => "test",
+            Chain::Regtest => "regtest",
+        })
+    }
 }
 
 impl Chain {
@@ -60,6 +68,12 @@ pub trait Coin: Send + Sync + 'static {
     fn address_params(&self, chain: Chain) -> AddressParams;
     /// Rules to pass to `getblocktemplate`.
     fn template_rules(&self) -> &'static [&'static str];
+    /// Confirmations before a coinbase can be spent; a block is final after this many.
+    fn coinbase_maturity(&self) -> i64;
+    /// Coin-specific bytes appended after the transactions in a serialized block.
+    fn extra_block_payload(&self, _raw: &RawTemplate) -> Result<Vec<u8>, TemplateError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Look up a built-in coin by its config key (`"ltc"`, `"doge"`).

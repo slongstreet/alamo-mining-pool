@@ -1,5 +1,6 @@
 //! In-memory pool statistics built from stratum events.
 
+use alamo_core::odds::HASHES_PER_DIFF1;
 use alamo_stratum::PoolEvent;
 use alamo_web::WorkerStatus;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -7,9 +8,6 @@ use std::time::{Duration, Instant};
 
 /// Window over which hashrate is estimated.
 const HASHRATE_WINDOW: Duration = Duration::from_secs(600);
-
-/// Hashes represented by one share at difficulty 1.
-const HASHES_PER_DIFF1: f64 = 4_294_967_296.0;
 
 #[derive(Debug, Default)]
 struct WorkerStats {
@@ -29,7 +27,6 @@ struct WorkerStats {
 #[derive(Debug, Default)]
 pub struct Stats {
     workers: HashMap<String, WorkerStats>,
-    session_workers: HashMap<u64, Vec<String>>,
     shares_accepted: u64,
     shares_rejected: u64,
 }
@@ -38,24 +35,18 @@ impl Stats {
     /// Apply one event.
     pub fn apply(&mut self, event: PoolEvent, now: Instant) {
         match event {
-            PoolEvent::Connected { .. } => {}
             PoolEvent::Authorized {
                 session,
                 worker,
                 address,
                 fallback,
             } => {
-                let w = self.workers.entry(worker.clone()).or_default();
+                let w = self.workers.entry(worker).or_default();
                 w.address = address;
                 w.fallback = fallback;
                 w.sessions.insert(session);
-                self.session_workers
-                    .entry(session)
-                    .or_default()
-                    .push(worker);
             }
             PoolEvent::Disconnected { session, workers } => {
-                self.session_workers.remove(&session);
                 for name in workers {
                     if let Some(w) = self.workers.get_mut(&name) {
                         w.sessions.remove(&session);
@@ -86,12 +77,12 @@ impl Stats {
                 session,
                 difficulty,
             } => {
-                if let Some(names) = self.session_workers.get(&session) {
-                    for name in names {
-                        if let Some(w) = self.workers.get_mut(name) {
-                            w.difficulty = difficulty;
-                        }
-                    }
+                for w in self
+                    .workers
+                    .values_mut()
+                    .filter(|w| w.sessions.contains(&session))
+                {
+                    w.difficulty = difficulty;
                 }
             }
         }
@@ -105,14 +96,6 @@ impl Stats {
     /// Rejected shares since start.
     pub fn shares_rejected(&self) -> u64 {
         self.shares_rejected
-    }
-
-    /// Pool hashrate estimate in hashes per second.
-    pub fn pool_hashrate(&self, now: Instant) -> f64 {
-        self.workers
-            .values()
-            .map(|w| hashrate(&w.window, now))
-            .sum()
     }
 
     /// Per-worker status, connected workers first, then by name.
@@ -185,7 +168,7 @@ mod tests {
                 PoolEvent::Share {
                     session: 1,
                     worker: "a".into(),
-                    coin: "LTC".into(),
+                    coin: "LTC",
                     job_difficulty: 1.0,
                     share_difficulty: 2.0,
                     rejected: None,
@@ -193,10 +176,13 @@ mod tests {
                 t0 + Duration::from_secs(i * 10),
             );
         }
-        // 10 shares of difficulty 1 over 90s (floored at 30s) = 10 * 2^32 / 90.
-        let hr = s.pool_hashrate(t0 + Duration::from_secs(90));
-        assert!((hr - 10.0 * HASHES_PER_DIFF1 / 90.0).abs() < 1.0, "{hr}");
+        // 10 shares of difficulty 1 over 90s = 10 * 2^32 / 90.
         let w = &s.workers(t0 + Duration::from_secs(90))[0];
+        assert!(
+            (w.hashrate - 10.0 * HASHES_PER_DIFF1 / 90.0).abs() < 1.0,
+            "{}",
+            w.hashrate
+        );
         assert_eq!(w.shares_accepted, 10);
         assert_eq!(w.best_difficulty, 2.0);
         assert_eq!(w.connections, 1);

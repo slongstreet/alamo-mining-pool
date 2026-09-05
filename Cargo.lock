@@ -94,6 +94,7 @@ name = "alamo-web"
 version = "0.1.0"
 dependencies = [
  "alamo-core",
+ "alamo-store",
  "axum",
  "mime_guess",
  "parking_lot",

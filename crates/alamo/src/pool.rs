@@ -3,20 +3,19 @@
 
 use crate::config::Config;
 use crate::stats::Stats;
-use alamo_coins::{Chain, Coin, CoinPayouts, RpcClient, TemplateSource};
+use alamo_coins::{Chain, Coin, RpcClient, TemplateSource};
 use alamo_core::odds::OddsSummary;
-use alamo_store::{NewBlock, Store};
+use alamo_core::payout::PayoutTable;
+use alamo_core::time::now_unix;
+use alamo_store::{BlockRow, BlockStatus, NewBlock, Store};
 use alamo_stratum::{BlockCandidate, PoolEvent, StratumServer, WorkReceiver};
-use alamo_web::{AppState, BlockStatus, CoinStatus, PoolSnapshot};
+use alamo_web::{AppState, CoinStatus, PoolSnapshot};
 use anyhow::{bail, Context};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-
-/// Confirmations after which a block is considered final (coinbase maturity).
-const CONFIRMATIONS_FINAL: i64 = 100;
 
 /// Result of handing a block to the node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,6 +24,15 @@ pub enum SubmitOutcome {
     Accepted,
     /// The node rejected it with the given reason.
     Rejected(String),
+}
+
+impl SubmitOutcome {
+    fn status(&self) -> BlockStatus {
+        match self {
+            SubmitOutcome::Accepted => BlockStatus::Accepted,
+            SubmitOutcome::Rejected(_) => BlockStatus::Rejected,
+        }
+    }
 }
 
 /// A parent chain the pool mines.
@@ -38,7 +46,7 @@ pub struct ParentChain {
     /// Which network the node is on.
     pub chain: Chain,
     /// Username resolver.
-    pub payouts: Arc<CoinPayouts>,
+    pub payouts: Arc<PayoutTable>,
 }
 
 /// Connect to the configured parent chain and verify it.
@@ -71,13 +79,12 @@ pub async fn connect_parent(config: &Config) -> anyhow::Result<ParentChain> {
         .with_context(|| format!("connecting to {} node at {}", coin.name(), cfg.rpc_url))?;
     let chain =
         Chain::parse(&info.chain).with_context(|| format!("unknown chain '{}'", info.chain))?;
-    tracing::info!(coin = coin.symbol(), chain = %info.chain, height = info.blocks, "node connected");
-    let payouts = CoinPayouts::new(coin.address_params(chain), &cfg.fallback_address)
+    tracing::info!(coin = coin.symbol(), %chain, height = info.blocks, "node connected");
+    let payouts = PayoutTable::new(coin.address_params(chain), &cfg.fallback_address)
         .with_context(|| {
             format!(
-                "coins.{key}.fallback_address is not a valid {} address for {:?}",
-                coin.symbol(),
-                chain
+                "coins.{key}.fallback_address is not a valid {} address for {chain}",
+                coin.symbol()
             )
         })?;
     Ok(ParentChain {
@@ -103,17 +110,17 @@ pub async fn submit_candidate(
     };
     match &outcome {
         SubmitOutcome::Accepted => tracing::info!(
-            coin = %candidate.coin, height = candidate.height, hash = %candidate.block_hash,
+            coin = candidate.coin, height = candidate.height, hash = %candidate.block_hash,
             worker = %candidate.worker, address = %candidate.address, "block accepted by node"
         ),
         SubmitOutcome::Rejected(reason) => tracing::error!(
-            coin = %candidate.coin, height = candidate.height, hash = %candidate.block_hash,
+            coin = candidate.coin, height = candidate.height, hash = %candidate.block_hash,
             %reason, "block REJECTED by node"
         ),
     }
     store
         .insert_block(&NewBlock {
-            coin: candidate.coin.clone(),
+            coin: candidate.coin.to_string(),
             height: candidate.height,
             hash: candidate.block_hash.clone(),
             worker: candidate.worker.clone(),
@@ -121,10 +128,7 @@ pub async fn submit_candidate(
             share_diff: candidate.share_difficulty,
             reward_sats: None,
             found_at: candidate.found_at,
-            status: match &outcome {
-                SubmitOutcome::Accepted => "accepted".into(),
-                SubmitOutcome::Rejected(_) => "rejected".into(),
-            },
+            status: outcome.status(),
         })
         .await
         .context("recording block")?;
@@ -132,39 +136,35 @@ pub async fn submit_candidate(
 }
 
 /// Re-check accepted blocks against the chain and update their status.
-pub async fn track_confirmations(rpc: &RpcClient, store: &Store) -> anyhow::Result<()> {
+pub async fn track_confirmations(
+    rpc: &RpcClient,
+    coin: &dyn Coin,
+    store: &Store,
+) -> anyhow::Result<()> {
     for block in store.unsettled_blocks().await? {
-        match rpc.get_block_info(&block.hash).await {
-            Ok(info) if info.confirmations < 0 => {
-                tracing::warn!(height = block.height, hash = %block.hash, "block orphaned");
-                store
-                    .set_block_status(block.id, "orphaned", info.confirmations)
-                    .await?;
+        let info = match rpc.get_block_info(&block.hash).await {
+            Ok(info) => info,
+            Err(err) => {
+                tracing::warn!(hash = %block.hash, %err, "could not check block");
+                continue;
             }
-            Ok(info) if info.confirmations >= CONFIRMATIONS_FINAL => {
-                store
-                    .set_block_status(block.id, "confirmed", info.confirmations)
-                    .await?;
-            }
-            Ok(info) => {
-                store
-                    .set_block_status(block.id, "accepted", info.confirmations)
-                    .await?
-            }
-            Err(err) => tracing::warn!(hash = %block.hash, %err, "could not check block"),
-        }
+        };
+        let status = if info.confirmations < 0 {
+            tracing::warn!(height = block.height, hash = %block.hash, "block orphaned");
+            BlockStatus::Orphaned
+        } else if info.confirmations >= coin.coinbase_maturity() {
+            BlockStatus::Confirmed
+        } else {
+            BlockStatus::Accepted
+        };
+        store
+            .set_block_status(block.id, status, info.confirmations)
+            .await?;
     }
     Ok(())
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Run the pool until `shutdown` is cancelled or a component fails.
+/// Run the pool until `shutdown` is cancelled or a component stops.
 pub async fn run(
     config: Config,
     store: Store,
@@ -183,20 +183,21 @@ pub async fn run(
     let (events_tx, events_rx) = mpsc::channel::<PoolEvent>(4096);
     let (blocks_tx, blocks_rx) = mpsc::channel::<BlockCandidate>(64);
 
-    let mut tasks = JoinSet::new();
+    // Every task returns its name when it stops; none of them stops on its own.
+    let mut tasks: JoinSet<&'static str> = JoinSet::new();
 
     let source = TemplateSource {
         rpc: parent.rpc.clone(),
         coin: parent.coin.clone(),
         coinbase_tag: tag,
-        poll_interval: Duration::from_millis(500),
-        refresh_interval: Duration::from_secs(30),
+        poll_interval: Duration::from_millis(cfg.poll_interval_ms),
+        refresh_interval: Duration::from_secs(cfg.template_refresh_secs),
     };
-    tasks.spawn(
-        source
-            .run(work_tx, shutdown.child_token())
-            .then_ok("template source"),
-    );
+    let token = shutdown.child_token();
+    tasks.spawn(async move {
+        source.run(work_tx, token).await;
+        "template source"
+    });
 
     let bound = StratumServer {
         config: config.stratum.clone(),
@@ -208,7 +209,11 @@ pub async fn run(
     .bind()
     .await
     .context("binding stratum")?;
-    tasks.spawn(bound.run(shutdown.child_token()).then_ok("stratum"));
+    let token = shutdown.child_token();
+    tasks.spawn(async move {
+        bound.run(token).await;
+        "stratum"
+    });
 
     tasks.spawn(submitter(
         parent.rpc.clone(),
@@ -218,6 +223,7 @@ pub async fn run(
     ));
     tasks.spawn(tracker(
         parent.rpc.clone(),
+        parent.coin.clone(),
         store.clone(),
         shutdown.child_token(),
     ));
@@ -226,7 +232,6 @@ pub async fn run(
         work_rx,
         store.clone(),
         state,
-        parent.coin.symbol().to_string(),
         parent.chain,
         shutdown.child_token(),
     ));
@@ -234,8 +239,7 @@ pub async fn run(
     let result = tokio::select! {
         _ = shutdown.cancelled() => Ok(()),
         finished = tasks.join_next() => match finished {
-            Some(Ok(Ok(name))) => bail!("{name} stopped unexpectedly"),
-            Some(Ok(Err(err))) => Err(err),
+            Some(Ok(name)) => bail!("{name} stopped unexpectedly"),
             Some(Err(join)) => Err(anyhow::Error::new(join).context("pool task panicked")),
             None => Ok(()),
         },
@@ -245,134 +249,113 @@ pub async fn run(
     result
 }
 
-trait ThenOk: Sized {
-    fn then_ok(
-        self,
-        name: &'static str,
-    ) -> impl std::future::Future<Output = anyhow::Result<&'static str>>;
-}
-
-impl<F: std::future::Future<Output = ()>> ThenOk for F {
-    async fn then_ok(self, name: &'static str) -> anyhow::Result<&'static str> {
-        self.await;
-        Ok(name)
-    }
-}
-
 async fn submitter(
     rpc: RpcClient,
     store: Store,
     mut blocks: mpsc::Receiver<BlockCandidate>,
     shutdown: CancellationToken,
-) -> anyhow::Result<&'static str> {
+) -> &'static str {
     loop {
         tokio::select! {
             next = blocks.recv() => {
-                let Some(candidate) = next else { return Ok("submitter") };
+                let Some(candidate) = next else { return "submitter" };
                 if let Err(err) = submit_candidate(&rpc, &store, &candidate).await {
                     tracing::error!(%err, "block submission failed");
                 }
             }
-            _ = shutdown.cancelled() => return Ok("submitter"),
+            _ = shutdown.cancelled() => return "submitter",
         }
     }
 }
 
 async fn tracker(
     rpc: RpcClient,
+    coin: Arc<dyn Coin>,
     store: Store,
     shutdown: CancellationToken,
-) -> anyhow::Result<&'static str> {
+) -> &'static str {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(err) = track_confirmations(&rpc, &store).await {
+                if let Err(err) = track_confirmations(&rpc, coin.as_ref(), &store).await {
                     tracing::warn!(%err, "confirmation tracking failed");
                 }
             }
-            _ = shutdown.cancelled() => return Ok("tracker"),
+            _ = shutdown.cancelled() => return "tracker",
         }
     }
 }
+
+/// How often the snapshot is rebuilt.
+const PUBLISH_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the block list is re-read from the database (it only changes on submit or
+/// on the tracker's 30 s tick).
+const BLOCKS_REFRESH_TICKS: u32 = 5;
 
 async fn publisher(
     mut events: mpsc::Receiver<PoolEvent>,
     work: WorkReceiver,
     store: Store,
     state: AppState,
-    symbol: String,
     chain: Chain,
     shutdown: CancellationToken,
-) -> anyhow::Result<&'static str> {
+) -> &'static str {
     let mut stats = Stats::default();
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    let mut blocks: Vec<BlockRow> = Vec::new();
+    let mut ticks: u32 = 0;
+    let mut interval = tokio::time::interval(PUBLISH_INTERVAL);
     loop {
         tokio::select! {
             next = events.recv() => {
-                let Some(event) = next else { return Ok("publisher") };
+                let Some(event) = next else { return "publisher" };
                 stats.apply(event, Instant::now());
             }
             _ = interval.tick() => {
-                let snapshot = build_snapshot(&stats, &work, &store, &symbol, chain).await;
-                state.publish(snapshot);
+                if ticks % BLOCKS_REFRESH_TICKS == 0 {
+                    match store.recent_blocks(25).await {
+                        Ok(rows) => blocks = rows,
+                        Err(err) => tracing::warn!(%err, "could not load recent blocks"),
+                    }
+                }
+                ticks = ticks.wrapping_add(1);
+                state.publish(build_snapshot(&stats, &work, blocks.clone(), chain));
             }
-            _ = shutdown.cancelled() => return Ok("publisher"),
+            _ = shutdown.cancelled() => return "publisher",
         }
     }
 }
 
-async fn build_snapshot(
+fn build_snapshot(
     stats: &Stats,
     work: &WorkReceiver,
-    store: &Store,
-    symbol: &str,
+    blocks: Vec<BlockRow>,
     chain: Chain,
 ) -> PoolSnapshot {
     let now = Instant::now();
-    let hashrate = stats.pool_hashrate(now);
+    let workers = stats.workers(now);
+    let hashrate = workers.iter().map(|w| w.hashrate).fold(0.0, |a, b| a + b);
     let current = work.borrow().clone();
     let coins = current
-        .as_ref()
-        .map(|w| {
-            vec![CoinStatus {
-                symbol: symbol.to_string(),
-                chain: format!("{chain:?}").to_lowercase(),
-                height: w.height,
-                network_difficulty: w.network_difficulty(),
-                template_age_seconds: now_unix().saturating_sub(w.created_at),
-                coinbase_value: w.coinbase_value,
-            }]
+        .iter()
+        .map(|w| CoinStatus {
+            symbol: w.coin.to_string(),
+            chain: chain.to_string(),
+            height: w.height,
+            network_difficulty: w.network_difficulty(),
+            template_age_seconds: now_unix().saturating_sub(w.created_at),
+            coinbase_value: w.coinbase_value,
         })
-        .unwrap_or_default();
+        .collect();
     let odds = current
         .as_ref()
         .map(|w| OddsSummary::compute(hashrate, w.network_difficulty()));
-    let blocks = match store.recent_blocks(25).await {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|b| BlockStatus {
-                coin: b.coin,
-                height: b.height,
-                hash: b.hash,
-                worker: b.worker,
-                found_at: b.found_at,
-                status: b.status,
-                confirmations: b.confirmations,
-                reward_sats: b.reward_sats,
-            })
-            .collect(),
-        Err(err) => {
-            tracing::warn!(%err, "could not load recent blocks");
-            Vec::new()
-        }
-    };
     PoolSnapshot {
         coins,
         hashrate,
         shares_accepted: stats.shares_accepted(),
         shares_rejected: stats.shares_rejected(),
-        workers: stats.workers(now),
+        workers,
         blocks,
         odds,
         ..Default::default()

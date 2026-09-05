@@ -8,11 +8,12 @@
 //! accepted by the node and pays the address the client authorized with.
 
 use alamo::pool::{submit_candidate, SubmitOutcome};
-use alamo_coins::{Chain, Coin, CoinPayouts, Litecoin, RpcClient, TemplateSource};
+use alamo_coins::{Chain, Coin, Litecoin, RpcClient, TemplateSource};
 use alamo_core::address::{encode_segwit, payout_script};
 use alamo_core::hash::{from_display_hex, sha256d, to_display_hex};
 use alamo_core::header::BlockHeader;
 use alamo_core::merkle::root_from_branch;
+use alamo_core::payout::PayoutTable;
 use alamo_core::target::Target;
 use alamo_core::Algorithm;
 use alamo_store::Store;
@@ -34,8 +35,7 @@ async fn mines_a_block_on_regtest() {
         eprintln!("ALAMO_REGTEST_RPC not set; skipping regtest integration test");
         return;
     };
-    let rpc = RpcClient::from_url_with_userinfo(&url)
-        .expect("ALAMO_REGTEST_RPC must look like http://user:pass@host:port");
+    let rpc = RpcClient::from_url_with_userinfo(&url).expect("ALAMO_REGTEST_RPC must be a URL");
     let info = rpc.get_blockchain_info().await.expect("node reachable");
     assert_eq!(info.chain, "regtest", "this test only runs against regtest");
 
@@ -44,7 +44,7 @@ async fn mines_a_block_on_regtest() {
     let address = encode_segwit("rltc", 0, &[0x11; 20]).unwrap();
     let script = payout_script(&address, &params).unwrap();
     let fallback = encode_segwit("rltc", 0, &[0x22; 20]).unwrap();
-    let payouts = Arc::new(CoinPayouts::new(params, &fallback).unwrap());
+    let payouts = Arc::new(PayoutTable::new(params, &fallback).unwrap());
 
     let shutdown = CancellationToken::new();
     let (work_tx, work_rx) = watch::channel(None);

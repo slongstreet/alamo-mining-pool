@@ -6,13 +6,6 @@ use alamo_core::job::RejectReason;
 /// Something happened on a stratum connection.
 #[derive(Clone, Debug)]
 pub enum PoolEvent {
-    /// A miner connected.
-    Connected {
-        /// Session id.
-        session: u64,
-        /// Peer address.
-        peer: String,
-    },
     /// A worker authorized on a session.
     Authorized {
         /// Session id.
@@ -38,7 +31,7 @@ pub enum PoolEvent {
         /// Worker name.
         worker: String,
         /// Coin ticker of the job.
-        coin: String,
+        coin: &'static str,
         /// Difficulty the job required.
         job_difficulty: f64,
         /// Difficulty the hash actually achieved (0 for rejected shares that never hashed).
@@ -59,7 +52,7 @@ pub enum PoolEvent {
 #[derive(Clone, Debug)]
 pub struct BlockCandidate {
     /// Coin ticker.
-    pub coin: String,
+    pub coin: &'static str,
     /// Block height.
     pub height: u64,
     /// Block hash (sha256d of the header) in display hex.

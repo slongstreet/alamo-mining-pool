@@ -5,13 +5,13 @@ use crate::events::{BlockCandidate, PoolEvent};
 use crate::job::EXTRANONCE1_LEN;
 use crate::protocol::Request;
 use crate::session::{Effects, Outgoing, Session};
-use alamo_core::payout::PayoutResolver;
+use alamo_core::payout::PayoutTable;
+use alamo_core::time::now_unix;
 use alamo_core::work::WorkTemplate;
 use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio_util::codec::{Framed, LinesCodec};
@@ -43,7 +43,7 @@ pub struct StratumServer {
     /// Source of work templates.
     pub work: WorkReceiver,
     /// Maps usernames to payout scripts.
-    pub payouts: Arc<dyn PayoutResolver>,
+    pub payouts: Arc<PayoutTable>,
     /// Where session events go.
     pub events: mpsc::Sender<PoolEvent>,
     /// Where found blocks go.
@@ -80,14 +80,15 @@ impl Bound {
     /// Accept connections until `shutdown` is cancelled.
     pub async fn run(self, shutdown: CancellationToken) {
         tracing::info!(addr = %self.local_addr, "stratum listening");
-        let next_session = Arc::new(AtomicU64::new(1));
+        let mut next_session: u64 = 1;
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => match accepted {
                     Ok((stream, peer)) => {
                         let server = self.server.clone();
                         let child = shutdown.child_token();
-                        let id = next_session.fetch_add(1, Ordering::Relaxed);
+                        let id = next_session;
+                        next_session += 1;
                         tokio::spawn(async move {
                             if let Err(err) = handle_connection(server, id, stream, peer, child).await {
                                 tracing::debug!(%peer, %err, "connection closed with error");
@@ -113,13 +114,6 @@ fn latest(work: &mut WorkReceiver) -> Option<Arc<WorkTemplate>> {
     work.borrow_and_update().clone()
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn extranonce1(session_id: u64) -> [u8; EXTRANONCE1_LEN] {
     // Unique per connection for the life of the process; the high bits are randomized so
     // two pool instances behind one miner never collide.
@@ -137,13 +131,6 @@ async fn handle_connection(
     stream.set_nodelay(true)?;
     let mut framed = Framed::new(stream, LinesCodec::new_with_max_length(MAX_LINE_LEN));
     tracing::info!(session = id, %peer, "miner connected");
-    let _ = server
-        .events
-        .send(PoolEvent::Connected {
-            session: id,
-            peer: peer.to_string(),
-        })
-        .await;
 
     let mut session = Session::new(
         id,
@@ -218,16 +205,18 @@ async fn apply(
     framed: &mut Framed<TcpStream, LinesCodec>,
     fx: Effects,
 ) -> Result<(), std::io::Error> {
+    // Queue every message and flush once so a set_difficulty + notify pair leaves in one write.
     for msg in fx.outgoing {
         let text = match msg {
             Outgoing::Response(r) => serde_json::to_string(&r),
             Outgoing::Notification(n) => serde_json::to_string(&n),
         }
         .expect("stratum messages serialize");
-        if let Err(err) = framed.send(text).await {
-            return Err(std::io::Error::other(err));
-        }
+        framed.feed(text).await.map_err(std::io::Error::other)?;
     }
+    SinkExt::<String>::flush(framed)
+        .await
+        .map_err(std::io::Error::other)?;
     for event in fx.events {
         // Never let a slow consumer stall a miner; drop events under backpressure.
         if let Err(err) = server.events.try_send(event) {
@@ -235,7 +224,7 @@ async fn apply(
         }
     }
     if let Some(block) = fx.block {
-        tracing::info!(coin = %block.coin, height = block.height, hash = %block.block_hash, worker = %block.worker, "BLOCK FOUND");
+        tracing::info!(coin = block.coin, height = block.height, hash = %block.block_hash, worker = %block.worker, "BLOCK FOUND");
         if server.blocks.send(block).await.is_err() {
             tracing::error!("block submitter is gone; block candidate lost");
         }

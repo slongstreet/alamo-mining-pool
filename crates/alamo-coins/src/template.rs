@@ -5,11 +5,11 @@ use crate::Coin;
 use alamo_core::encode::{push_data, push_script_num};
 use alamo_core::hash::from_display_hex;
 use alamo_core::job::JobId;
-use alamo_core::target::Target;
+use alamo_core::time::now_unix;
 use alamo_core::work::{TemplateTx, WorkTemplate};
 use serde::Deserialize;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -56,9 +56,9 @@ pub enum TemplateError {
     /// A hex field was malformed.
     #[error("bad hex in template field {0}")]
     Hex(&'static str),
-    /// The template was missing something or malformed.
-    #[error("template decode: {0}")]
-    Decode(#[from] serde_json::Error),
+    /// The node call failed.
+    #[error(transparent)]
+    Rpc(#[from] RpcError),
 }
 
 /// Convert a raw template to work. `id` and `clean_jobs` are supplied by the source.
@@ -72,6 +72,7 @@ pub fn convert(
     let prev_hash = from_display_hex(&raw.previousblockhash)
         .map_err(|_| TemplateError::Hex("previousblockhash"))?;
     let bits = u32::from_str_radix(&raw.bits, 16).map_err(|_| TemplateError::Hex("bits"))?;
+    let extra_payload = coin.extra_block_payload(&raw)?;
     let mut transactions = Vec::with_capacity(raw.transactions.len());
     for tx in raw.transactions {
         transactions.push(TemplateTx {
@@ -86,19 +87,6 @@ pub fn convert(
         ),
         None => None,
     };
-    // Litecoin serializes the MWEB extension block after the transactions as an optional
-    // pointer: a 0x01 presence byte followed by the block. The node only reads it when the
-    // last transaction is the HogEx, which the template already includes, so nothing is
-    // appended before activation.
-    let extra_payload = match raw.mweb {
-        Some(hex_str) => {
-            let mut payload = vec![0x01];
-            payload.extend(hex::decode(hex_str).map_err(|_| TemplateError::Hex("mweb"))?);
-            payload
-        }
-        None => Vec::new(),
-    };
-
     let mut prefix = Vec::with_capacity(32);
     push_script_num(&mut prefix, raw.height as i64);
     if !coinbase_tag.is_empty() {
@@ -107,13 +95,12 @@ pub fn convert(
 
     let mut work = WorkTemplate {
         id,
-        coin: coin.symbol().to_string(),
+        coin: coin.symbol(),
         algorithm: coin.algorithm(),
         height: raw.height,
         version: raw.version,
         prev_hash,
         bits,
-        target: Target::from_compact(bits),
         cur_time: raw.curtime,
         min_time: raw.mintime,
         coinbase_value: raw.coinbasevalue,
@@ -123,10 +110,7 @@ pub fn convert(
         merkle_branch: Vec::new(),
         extra_payload,
         clean_jobs,
-        created_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+        created_at: now_unix(),
     };
     work.compute_merkle_branch();
     Ok(work)
@@ -153,77 +137,67 @@ impl TemplateSource {
         tx: watch::Sender<Option<Arc<WorkTemplate>>>,
         shutdown: CancellationToken,
     ) {
+        shutdown.run_until_cancelled(self.poll_loop(tx)).await;
+    }
+
+    async fn poll_loop(self, tx: watch::Sender<Option<Arc<WorkTemplate>>>) {
         let mut next_id: u64 = 1;
         let mut last_tip: Option<String> = None;
         let mut last_refresh = Instant::now() - self.refresh_interval;
         let mut failures: u32 = 0;
         loop {
-            let fetch = async {
-                let tip = self.rpc.get_best_block_hash().await?;
-                let tip_changed = last_tip.as_deref() != Some(tip.as_str());
-                if !tip_changed && last_refresh.elapsed() < self.refresh_interval {
-                    return Ok::<_, FetchError>(None);
+            match self.fetch(&last_tip, last_refresh, JobId(next_id)).await {
+                Ok(Some((tip, work))) => {
+                    failures = 0;
+                    next_id += 1;
+                    last_refresh = Instant::now();
+                    tracing::info!(
+                        coin = work.coin,
+                        height = work.height,
+                        txs = work.transactions.len(),
+                        clean = work.clean_jobs,
+                        difficulty = work.network_difficulty(),
+                        "new work"
+                    );
+                    last_tip = Some(tip);
+                    tx.send_replace(Some(Arc::new(work)));
                 }
-                let raw = self
-                    .rpc
-                    .get_block_template(self.coin.template_rules())
-                    .await?;
-                let raw: RawTemplate = serde_json::from_value(raw).map_err(TemplateError::from)?;
-                let work = convert(
-                    raw,
-                    self.coin.as_ref(),
-                    &self.coinbase_tag,
-                    JobId(next_id),
-                    tip_changed,
-                )?;
-                Ok(Some((tip, work)))
-            };
-            tokio::select! {
-                result = fetch => match result {
-                    Ok(Some((tip, work))) => {
-                        failures = 0;
-                        next_id += 1;
-                        last_refresh = Instant::now();
-                        tracing::info!(
-                            coin = %work.coin,
-                            height = work.height,
-                            txs = work.transactions.len(),
-                            clean = work.clean_jobs,
-                            difficulty = work.network_difficulty(),
-                            "new work"
-                        );
-                        last_tip = Some(tip);
-                        tx.send_replace(Some(Arc::new(work)));
+                Ok(None) => {}
+                Err(err) => {
+                    failures += 1;
+                    if failures == 1 || failures % 30 == 0 {
+                        tracing::warn!(coin = self.coin.symbol(), %err, failures, "template fetch failed");
                     }
-                    Ok(None) => {}
-                    Err(err) => {
-                        failures += 1;
-                        if failures == 1 || failures % 30 == 0 {
-                            tracing::warn!(coin = self.coin.symbol(), %err, failures, "template fetch failed");
-                        }
-                    }
-                },
-                _ = shutdown.cancelled() => return,
+                }
             }
             let delay = if failures > 0 {
                 self.poll_interval.max(Duration::from_secs(2))
             } else {
                 self.poll_interval
             };
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                _ = shutdown.cancelled() => return,
-            }
+            tokio::time::sleep(delay).await;
         }
     }
-}
 
-#[derive(Debug, thiserror::Error)]
-enum FetchError {
-    #[error(transparent)]
-    Rpc(#[from] RpcError),
-    #[error(transparent)]
-    Template(#[from] TemplateError),
+    /// Fetch a template if the tip moved or the refresh interval elapsed.
+    async fn fetch(
+        &self,
+        last_tip: &Option<String>,
+        last_refresh: Instant,
+        id: JobId,
+    ) -> Result<Option<(String, WorkTemplate)>, TemplateError> {
+        let tip = self.rpc.get_best_block_hash().await?;
+        let tip_changed = last_tip.as_deref() != Some(tip.as_str());
+        if !tip_changed && last_refresh.elapsed() < self.refresh_interval {
+            return Ok(None);
+        }
+        let raw = self
+            .rpc
+            .get_block_template(self.coin.template_rules())
+            .await?;
+        let work = convert(raw, self.coin.as_ref(), &self.coinbase_tag, id, tip_changed)?;
+        Ok(Some((tip, work)))
+    }
 }
 
 #[cfg(test)]

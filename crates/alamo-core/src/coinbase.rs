@@ -1,8 +1,9 @@
 //! Coinbase transaction construction, split around the extranonce for stratum.
 
 use crate::encode::{push_data, write_varint};
-use crate::hash::{sha256d, Hash256};
+use crate::hash::Hash256;
 use crate::work::WorkTemplate;
+use sha2::{Digest, Sha256};
 
 /// Bitcoin consensus limit on the coinbase scriptSig length.
 pub const MAX_COINBASE_SCRIPT_LEN: usize = 100;
@@ -92,7 +93,14 @@ impl CoinbaseParts {
 
     /// Transaction id (internal byte order) for a given extranonce.
     pub fn txid(&self, extranonce: &[u8]) -> Hash256 {
-        sha256d(&self.serialize(extranonce))
+        let first = Sha256::new()
+            .chain_update(&self.coinb1)
+            .chain_update(extranonce)
+            .chain_update(&self.coinb2)
+            .finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&Sha256::digest(first));
+        out
     }
 
     /// Serialization to place in the block. Adds the segwit marker, flag, and the
@@ -119,42 +127,18 @@ impl CoinbaseParts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::push_script_num;
-    use crate::job::JobId;
-    use crate::target::Target;
-    use crate::Algorithm;
+    use crate::hash::sha256d;
 
-    pub(crate) fn sample_work(witness: bool) -> WorkTemplate {
-        let mut prefix = Vec::new();
-        push_script_num(&mut prefix, 1_000);
-        push_data(&mut prefix, b"/alamo/");
-        let mut w = WorkTemplate {
-            id: JobId(1),
-            coin: "LTC".into(),
-            algorithm: Algorithm::Scrypt,
-            height: 1_000,
-            version: 0x2000_0000,
-            prev_hash: [0x11; 32],
-            bits: 0x207f_ffff,
-            target: Target::from_compact(0x207f_ffff),
-            cur_time: 1_700_000_000,
-            min_time: 1_699_999_000,
-            coinbase_value: 5_000_000_000,
-            coinbase_script_prefix: prefix,
-            witness_commitment: witness.then(|| {
+    fn sample_work(witness: bool) -> WorkTemplate {
+        WorkTemplate::regtest_sample(
+            1_000,
+            witness.then(|| {
                 hex::decode(
                     "6a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9",
                 )
                 .unwrap()
             }),
-            transactions: vec![],
-            merkle_branch: vec![],
-            extra_payload: vec![],
-            clean_jobs: true,
-            created_at: 0,
-        };
-        w.compute_merkle_branch();
-        w
+        )
     }
 
     #[test]

@@ -23,6 +23,21 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
 }
 
+/// Lifecycle of a block the pool found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, sqlx::Type)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(rename_all = "lowercase")]
+pub enum BlockStatus {
+    /// The node accepted the block; waiting for maturity.
+    Accepted,
+    /// The node rejected the block.
+    Rejected,
+    /// Matured on the active chain.
+    Confirmed,
+    /// Fell off the active chain.
+    Orphaned,
+}
+
 /// A block the pool found, as stored.
 #[derive(Clone, Debug, Serialize, sqlx::FromRow)]
 pub struct BlockRow {
@@ -44,8 +59,8 @@ pub struct BlockRow {
     pub reward_sats: Option<i64>,
     /// Unix time found.
     pub found_at: i64,
-    /// `accepted`, `rejected`, `confirmed`, or `orphaned`.
-    pub status: String,
+    /// Lifecycle status.
+    pub status: BlockStatus,
     /// Confirmations at last check.
     pub confirmations: i64,
 }
@@ -69,8 +84,8 @@ pub struct NewBlock {
     pub reward_sats: Option<i64>,
     /// Unix time found.
     pub found_at: u64,
-    /// Initial status (`accepted` or `rejected`).
-    pub status: String,
+    /// Initial status (`Accepted` or `Rejected`).
+    pub status: BlockStatus,
 }
 
 /// Handle to the pool database.
@@ -128,7 +143,7 @@ impl Store {
         .bind(block.share_diff)
         .bind(block.reward_sats)
         .bind(block.found_at as i64)
-        .bind(&block.status)
+        .bind(block.status)
         .execute(&self.pool)
         .await?;
         Ok(result.last_insert_rowid())
@@ -157,7 +172,7 @@ impl Store {
     pub async fn set_block_status(
         &self,
         id: i64,
-        status: &str,
+        status: BlockStatus,
         confirmations: i64,
     ) -> Result<(), StoreError> {
         sqlx::query("UPDATE blocks SET status = ?, confirmations = ? WHERE id = ?")
@@ -205,15 +220,18 @@ mod tests {
                 share_diff: 2.5,
                 reward_sats: Some(1),
                 found_at: 100,
-                status: "accepted".into(),
+                status: BlockStatus::Accepted,
             })
             .await
             .unwrap();
         assert_eq!(store.unsettled_blocks().await.unwrap().len(), 1);
-        store.set_block_status(id, "confirmed", 120).await.unwrap();
+        store
+            .set_block_status(id, BlockStatus::Confirmed, 120)
+            .await
+            .unwrap();
         assert!(store.unsettled_blocks().await.unwrap().is_empty());
         let recent = store.recent_blocks(5).await.unwrap();
-        assert_eq!(recent[0].status, "confirmed");
+        assert_eq!(recent[0].status, BlockStatus::Confirmed);
         assert_eq!(recent[0].confirmations, 120);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

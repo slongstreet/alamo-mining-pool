@@ -29,10 +29,12 @@ CREATE TABLE blocks (
     share_diff     REAL    NOT NULL,
     reward_sats    INTEGER,
     found_at       INTEGER NOT NULL,
-    status         TEXT    NOT NULL DEFAULT 'pending',
+    status         TEXT    NOT NULL,
     confirmations  INTEGER NOT NULL DEFAULT 0,
     UNIQUE (coin, hash)
 );
+CREATE INDEX blocks_found_at ON blocks (found_at DESC);
+CREATE INDEX blocks_status ON blocks (status);
 
 -- Recent shares for the dashboard's live log. Trimmed by retention.
 CREATE TABLE shares (

@@ -50,4 +50,8 @@ impl Coin for Dogecoin {
     fn template_rules(&self) -> &'static [&'static str] {
         &[]
     }
+
+    fn coinbase_maturity(&self) -> i64 {
+        240
+    }
 }

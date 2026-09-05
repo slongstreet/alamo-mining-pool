@@ -23,7 +23,7 @@ pub struct WorkTemplate {
     /// Monotonic id assigned by the template source.
     pub id: JobId,
     /// Ticker of the chain this template is for.
-    pub coin: String,
+    pub coin: &'static str,
     /// Proof-of-work algorithm.
     pub algorithm: Algorithm,
     /// Height of the block being mined.
@@ -34,8 +34,6 @@ pub struct WorkTemplate {
     pub prev_hash: Hash256,
     /// Compact target.
     pub bits: u32,
-    /// Network target.
-    pub target: Target,
     /// Node's current time for the header.
     pub cur_time: u32,
     /// Earliest acceptable header time.
@@ -71,9 +69,14 @@ impl WorkTemplate {
         merkle::root_from_branch(coinbase_txid, &self.merkle_branch)
     }
 
+    /// Network target decoded from `bits`.
+    pub fn target(&self) -> Target {
+        Target::from_compact(self.bits)
+    }
+
     /// Network difficulty relative to pool difficulty 1.
     pub fn network_difficulty(&self) -> f64 {
-        self.target.difficulty()
+        self.target().difficulty()
     }
 
     /// Serialize a full block: header, transaction count, coinbase, transactions, payload.
@@ -89,5 +92,37 @@ impl WorkTemplate {
         }
         out.extend_from_slice(&self.extra_payload);
         out
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl WorkTemplate {
+    /// A regtest-shaped template for tests: no transactions, any hash meets the network
+    /// target, coinbase prefix already holds the BIP34 height.
+    pub fn regtest_sample(height: u64, witness_commitment: Option<Vec<u8>>) -> Self {
+        let mut prefix = Vec::new();
+        crate::encode::push_script_num(&mut prefix, height as i64);
+        crate::encode::push_data(&mut prefix, b"/alamo/");
+        let mut w = Self {
+            id: JobId(1),
+            coin: "LTC",
+            algorithm: Algorithm::Scrypt,
+            height,
+            version: 0x2000_0000,
+            prev_hash: [0x11; 32],
+            bits: 0x207f_ffff,
+            cur_time: 1_700_000_000,
+            min_time: 1_699_990_000,
+            coinbase_value: 5_000_000_000,
+            coinbase_script_prefix: prefix,
+            witness_commitment,
+            transactions: vec![],
+            merkle_branch: vec![],
+            extra_payload: vec![],
+            clean_jobs: true,
+            created_at: 0,
+        };
+        w.compute_merkle_branch();
+        w
     }
 }

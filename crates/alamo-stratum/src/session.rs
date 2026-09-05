@@ -7,8 +7,8 @@ use crate::protocol::{Notification, Request, Response, StratumError};
 use crate::validate::{self, Submit};
 use crate::vardiff::Vardiff;
 use alamo_core::coinbase::CoinbaseParts;
-use alamo_core::job::{JobId, ShareOutcome};
-use alamo_core::payout::{Payout, PayoutResolver};
+use alamo_core::job::{JobId, RejectReason, ShareOutcome};
+use alamo_core::payout::{Payout, PayoutTable};
 use alamo_core::target::Target;
 use alamo_core::work::WorkTemplate;
 use serde_json::{json, Value};
@@ -37,7 +37,7 @@ pub struct Effects {
     pub events: Vec<PoolEvent>,
     /// A block to submit.
     pub block: Option<BlockCandidate>,
-    /// The miner asked us to close the connection or misbehaved.
+    /// The session cannot continue (for example, no coinbase fits the template).
     pub close: bool,
 }
 
@@ -54,8 +54,6 @@ impl Effects {
 pub struct Session {
     id: u64,
     extranonce1: [u8; EXTRANONCE1_LEN],
-    subscribed: bool,
-    user_agent: Option<String>,
     payout: Option<Payout>,
     workers: Vec<String>,
     difficulty: f64,
@@ -63,7 +61,7 @@ pub struct Session {
     jobs: VecDeque<SessionJob>,
     work: Option<Arc<WorkTemplate>>,
     vardiff: Vardiff,
-    resolver: Arc<dyn PayoutResolver>,
+    payouts: Arc<PayoutTable>,
 }
 
 impl Session {
@@ -72,14 +70,12 @@ impl Session {
         id: u64,
         extranonce1: [u8; EXTRANONCE1_LEN],
         vardiff_cfg: VardiffConfig,
-        resolver: Arc<dyn PayoutResolver>,
+        payouts: Arc<PayoutTable>,
         now: Instant,
     ) -> Self {
         Self {
             id,
             extranonce1,
-            subscribed: false,
-            user_agent: None,
             payout: None,
             workers: Vec::new(),
             difficulty: vardiff_cfg.initial_difficulty,
@@ -87,13 +83,8 @@ impl Session {
             jobs: VecDeque::new(),
             work: None,
             vardiff: Vardiff::new(vardiff_cfg, now),
-            resolver,
+            payouts,
         }
-    }
-
-    /// Session id.
-    pub fn id(&self) -> u64 {
-        self.id
     }
 
     /// Authorized worker names.
@@ -101,38 +92,26 @@ impl Session {
         &self.workers
     }
 
-    /// Reported miner software, if any.
-    pub fn user_agent(&self) -> Option<&str> {
-        self.user_agent.as_deref()
-    }
-
-    /// Current share difficulty.
-    pub fn difficulty(&self) -> f64 {
-        self.difficulty
-    }
-
     /// Handle one request from the miner.
     pub fn handle(&mut self, req: Request, now: Instant, now_unix: u64) -> Effects {
         let mut fx = Effects::default();
-        let id = req.id.clone();
-        let params = req.params.as_array().cloned().unwrap_or_default();
-        match req.method.as_str() {
-            "mining.subscribe" => self.subscribe(id, &params, &mut fx),
-            "mining.authorize" => self.authorize(id, &params, &mut fx),
-            "mining.submit" => self.submit(id, &params, now, now_unix, &mut fx),
+        let Request { id, method, params } = req;
+        let params = params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+        match method.as_str() {
+            "mining.subscribe" => self.subscribe(id, params, &mut fx),
+            "mining.authorize" => self.authorize(id, params, &mut fx),
+            "mining.submit" => self.submit(id, params, now, now_unix, &mut fx),
             "mining.configure" => {
                 // No extensions (version rolling is not used by scrypt miners).
                 fx.respond(Response::ok(id, json!({ "version-rolling": false })));
             }
             "mining.extranonce.subscribe" => fx.respond(Response::ok(id, json!(true))),
             "mining.suggest_difficulty" => {
-                if let Some(d) = params.first().and_then(Value::as_f64) {
-                    if d > 0.0 {
-                        let d = self.vardiff.clamp(d);
-                        if (d - self.difficulty).abs() > f64::EPSILON {
-                            self.set_difficulty(d, &mut fx);
-                            self.resend_current_job(&mut fx);
-                        }
+                if let Some(d) = params.first().and_then(Value::as_f64).filter(|d| *d > 0.0) {
+                    let d = self.vardiff.clamp(d);
+                    if (d - self.difficulty).abs() > f64::EPSILON {
+                        self.set_difficulty(d, &mut fx);
+                        self.resend_current_job(&mut fx);
                     }
                 }
                 fx.respond(Response::ok(id, json!(true)));
@@ -149,8 +128,9 @@ impl Session {
     }
 
     fn subscribe(&mut self, id: Value, params: &[Value], fx: &mut Effects) {
-        self.user_agent = params.first().and_then(Value::as_str).map(str::to_owned);
-        self.subscribed = true;
+        if let Some(agent) = params.first().and_then(Value::as_str) {
+            tracing::debug!(session = self.id, agent, "subscribed");
+        }
         let sub_id = format!("{:x}", self.id);
         let result = json!([
             [["mining.set_difficulty", sub_id], ["mining.notify", sub_id]],
@@ -161,15 +141,16 @@ impl Session {
     }
 
     fn authorize(&mut self, id: Value, params: &[Value], fx: &mut Effects) {
-        let Some(username) = params.first().and_then(Value::as_str).map(str::trim) else {
+        let username = params
+            .first()
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if username.is_empty() {
             fx.respond(Response::err(id, StratumError::other("Missing username")));
             return;
-        };
-        if username.is_empty() {
-            fx.respond(Response::err(id, StratumError::other("Empty username")));
-            return;
         }
-        let payout = self.resolver.resolve(username);
+        let payout = self.payouts.resolve(username);
         if let Some(existing) = &self.payout {
             if existing.script != payout.script {
                 fx.respond(Response::err(
@@ -178,6 +159,9 @@ impl Session {
                 ));
                 return;
             }
+        }
+        if payout.fallback {
+            tracing::warn!(session = self.id, username, fallback = %payout.address, "username is not a valid address; paying fallback");
         }
         let first = self.payout.is_none();
         if !self.workers.iter().any(|w| w == username) {
@@ -193,9 +177,7 @@ impl Session {
         fx.respond(Response::ok(id, json!(true)));
         if first {
             self.set_difficulty(self.difficulty, fx);
-            if self.work.is_some() {
-                self.send_job(true, fx);
-            }
+            self.resend_current_job(fx);
         }
     }
 
@@ -207,14 +189,8 @@ impl Session {
         now_unix: u64,
         fx: &mut Effects,
     ) {
-        let Some(payout) = self.payout.clone() else {
-            fx.respond(Response::err(
-                id,
-                StratumError {
-                    code: 24,
-                    message: "Unauthorized worker".into(),
-                },
-            ));
+        let Some(payout) = self.payout.as_ref() else {
+            fx.respond(Response::err(id, RejectReason::Unauthorized.into()));
             return;
         };
         let str_param = |i: usize| params.get(i).and_then(Value::as_str);
@@ -229,77 +205,53 @@ impl Session {
             return;
         };
         if !self.workers.iter().any(|w| w == worker) {
-            fx.respond(Response::err(
-                id,
-                StratumError {
-                    code: 24,
-                    message: "Unauthorized worker".into(),
-                },
-            ));
+            fx.respond(Response::err(id, RejectReason::Unauthorized.into()));
             return;
         }
-        let parsed = (|| {
-            Some(Submit {
-                worker: worker.to_owned(),
-                extranonce2: hex::decode(en2).ok()?,
-                ntime: u32::from_str_radix(ntime, 16).ok()?,
-                nonce: u32::from_str_radix(nonce, 16).ok()?,
-            })
-        })();
-        let Some(submit) = parsed else {
+        let (Ok(extranonce2), Ok(ntime), Ok(nonce)) = (
+            hex::decode(en2),
+            u32::from_str_radix(ntime, 16),
+            u32::from_str_radix(nonce, 16),
+        ) else {
             fx.respond(Response::err(id, StratumError::other("Malformed submit")));
             return;
         };
-        let Ok(job_id) = job_id.parse::<JobId>() else {
-            fx.respond(Response::err(
-                id,
-                StratumError {
-                    code: 21,
-                    message: "Job not found".into(),
-                },
-            ));
-            return;
-        };
-        let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) else {
-            fx.respond(Response::err(
-                id,
-                StratumError {
-                    code: 21,
-                    message: "Job not found".into(),
-                },
-            ));
+        let job = job_id
+            .parse::<JobId>()
+            .ok()
+            .and_then(|job_id| self.jobs.iter_mut().find(|j| j.id == job_id));
+        let Some(job) = job else {
+            fx.respond(Response::err(id, RejectReason::UnknownJob.into()));
             return;
         };
 
+        let submit = Submit {
+            worker,
+            extranonce2,
+            ntime,
+            nonce,
+        };
         let job_difficulty = job.difficulty;
-        let coin = job.work.coin.clone();
+        let coin = job.work.coin;
         let (outcome, block) =
             validate::validate(job, &self.extranonce1, &submit, &payout.address, now_unix);
         let (share_difficulty, rejected) = match &outcome {
-            ShareOutcome::Accepted { difficulty } | ShareOutcome::Block { difficulty, .. } => {
+            ShareOutcome::Accepted { difficulty } | ShareOutcome::Block { difficulty } => {
                 (*difficulty, None)
             }
             ShareOutcome::Rejected(reason) => (0.0, Some(*reason)),
         };
         fx.events.push(PoolEvent::Share {
             session: self.id,
-            worker: submit.worker.clone(),
+            worker: worker.to_owned(),
             coin,
             job_difficulty,
             share_difficulty,
             rejected,
         });
-        match outcome {
-            ShareOutcome::Rejected(reason) => {
-                fx.respond(Response::err(
-                    id,
-                    StratumError {
-                        code: reason.stratum_code(),
-                        message: reason.message().into(),
-                    },
-                ));
-            }
-            _ => {
+        match rejected {
+            Some(reason) => fx.respond(Response::err(id, reason.into())),
+            None => {
                 fx.respond(Response::ok(id, json!(true)));
                 self.vardiff.on_share();
                 fx.block = block;
@@ -346,18 +298,15 @@ impl Session {
                 job.stale = true;
             }
         }
-        if self.payout.is_some() {
-            self.send_job(clean, &mut fx);
-        }
+        self.send_job(clean, &mut fx);
         fx
     }
 
     fn resend_current_job(&mut self, fx: &mut Effects) {
-        if self.work.is_some() && self.payout.is_some() {
-            self.send_job(false, fx);
-        }
+        self.send_job(false, fx);
     }
 
+    /// Send the current template as a new job, if there is a template and a payout.
     fn send_job(&mut self, clean: bool, fx: &mut Effects) {
         let (Some(work), Some(payout)) = (self.work.clone(), self.payout.as_ref()) else {
             return;
@@ -392,53 +341,31 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alamo_core::job::JobId;
-    use alamo_core::Algorithm;
+    use alamo_core::address::{encode_segwit, AddressParams};
 
-    struct FixedResolver;
-    impl PayoutResolver for FixedResolver {
-        fn resolve(&self, username: &str) -> Payout {
-            let (address, worker) = alamo_core::payout::split_username(username);
-            Payout {
-                address: address.into(),
-                script: address.as_bytes().to_vec(),
-                worker: worker.into(),
-                fallback: false,
-            }
-        }
+    const PARAMS: AddressParams = AddressParams {
+        p2pkh_prefix: 111,
+        p2sh_prefixes: &[58, 196],
+        bech32_hrp: Some("rltc"),
+    };
+
+    fn addr(byte: u8) -> String {
+        encode_segwit("rltc", 0, &[byte; 20]).unwrap()
     }
 
     fn work(clean: bool) -> Arc<WorkTemplate> {
-        let mut w = WorkTemplate {
-            id: JobId(1),
-            coin: "LTC".into(),
-            algorithm: Algorithm::Scrypt,
-            height: 5,
-            version: 0x2000_0000,
-            prev_hash: [0; 32],
-            bits: 0x207f_ffff,
-            target: Target::from_compact(0x207f_ffff),
-            cur_time: 1_700_000_000,
-            min_time: 1_699_990_000,
-            coinbase_value: 1,
-            coinbase_script_prefix: vec![0x55],
-            witness_commitment: None,
-            transactions: vec![],
-            merkle_branch: vec![],
-            extra_payload: vec![],
-            clean_jobs: clean,
-            created_at: 0,
-        };
-        w.compute_merkle_branch();
+        let mut w = WorkTemplate::regtest_sample(5, None);
+        w.clean_jobs = clean;
         Arc::new(w)
     }
 
     fn session() -> Session {
+        let payouts = Arc::new(PayoutTable::new(PARAMS, &addr(9)).unwrap());
         Session::new(
             9,
             [1, 2, 3, 4],
             VardiffConfig::default(),
-            Arc::new(FixedResolver),
+            payouts,
             Instant::now(),
         )
     }
@@ -467,7 +394,7 @@ mod tests {
 
         // Authorizing before any template: set_difficulty is sent, no job yet.
         let fx = s.handle(
-            req("mining.authorize", json!(["addr.rig", "x"])),
+            req("mining.authorize", json!([format!("{}.rig", addr(1)), "x"])),
             Instant::now(),
             0,
         );
@@ -492,16 +419,29 @@ mod tests {
     fn second_address_on_same_connection_is_refused() {
         let mut s = session();
         s.handle(
-            req("mining.authorize", json!(["addr1", "x"])),
+            req("mining.authorize", json!([addr(1), "x"])),
             Instant::now(),
             0,
         );
         let fx = s.handle(
-            req("mining.authorize", json!(["addr2", "x"])),
+            req("mining.authorize", json!([addr(2), "x"])),
             Instant::now(),
             0,
         );
         assert!(matches!(&fx.outgoing[0], Outgoing::Response(r) if r.error.is_some()));
+    }
+
+    #[test]
+    fn invalid_username_pays_fallback_and_is_reported() {
+        let mut s = session();
+        let fx = s.handle(
+            req("mining.authorize", json!(["bogus.rig", "x"])),
+            Instant::now(),
+            0,
+        );
+        assert!(
+            matches!(&fx.events[0], PoolEvent::Authorized { fallback: true, address, .. } if *address == addr(9))
+        );
     }
 
     #[test]
@@ -524,16 +464,13 @@ mod tests {
     #[test]
     fn unknown_job_is_reported() {
         let mut s = session();
-        s.handle(
-            req("mining.authorize", json!(["addr", "x"])),
-            Instant::now(),
-            0,
-        );
+        let a = addr(1);
+        s.handle(req("mining.authorize", json!([a, "x"])), Instant::now(), 0);
         s.on_work(work(true));
         let fx = s.handle(
             req(
                 "mining.submit",
-                json!(["addr", "ff", "00000001", "65500000", "00000000"]),
+                json!([a, "ff", "00000001", "65500000", "00000000"]),
             ),
             Instant::now(),
             1_700_000_000,

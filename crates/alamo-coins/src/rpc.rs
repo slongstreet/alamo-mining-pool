@@ -1,7 +1,9 @@
 //! Minimal JSON-RPC 1.0 client for Bitcoin-derived nodes.
 
+use crate::template::RawTemplate;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -23,9 +25,9 @@ pub enum RpcError {
     /// The response could not be decoded into the expected type.
     #[error("decode error: {0}")]
     Decode(#[from] serde_json::Error),
-    /// The node answered with neither a result nor an error.
-    #[error("empty response")]
-    Empty,
+    /// The URL could not be parsed.
+    #[error("bad url: {0}")]
+    Url(String),
 }
 
 /// A JSON-RPC client bound to one node.
@@ -46,9 +48,12 @@ struct Request<'a> {
     params: &'a [Value],
 }
 
+/// The result is kept as raw JSON so large payloads (block templates) are parsed once,
+/// straight into the caller's type.
 #[derive(Deserialize)]
-struct Response {
-    result: Option<Value>,
+struct Response<'a> {
+    #[serde(borrow)]
+    result: Option<&'a RawValue>,
     error: Option<NodeError>,
 }
 
@@ -103,14 +108,19 @@ impl RpcClient {
     }
 
     /// Parse a URL of the form `http://user:pass@host:port` into a client.
-    pub fn from_url_with_userinfo(url: &str) -> Option<Self> {
-        let (scheme, rest) = url.split_once("://")?;
-        let (userinfo, host) = rest.split_once('@')?;
-        let (user, pass) = userinfo.split_once(':')?;
-        Some(Self::new(format!("{scheme}://{host}"), user, pass))
+    pub fn from_url_with_userinfo(url: &str) -> Result<Self, RpcError> {
+        let mut parsed = reqwest::Url::parse(url).map_err(|e| RpcError::Url(e.to_string()))?;
+        let user = parsed.username().to_string();
+        let password = parsed.password().unwrap_or_default().to_string();
+        parsed
+            .set_username("")
+            .and_then(|_| parsed.set_password(None))
+            .map_err(|_| RpcError::Url(url.into()))?;
+        Ok(Self::new(parsed.as_str(), user, password))
     }
 
-    /// Call an arbitrary method and decode the result.
+    /// Call a method and decode its result. A `null` result decodes like the JSON value
+    /// `null`, so methods that return nothing on success take `T = Option<_>`.
     pub async fn call<T: DeserializeOwned>(
         &self,
         method: &str,
@@ -123,23 +133,24 @@ impl RpcClient {
             method,
             params,
         };
-        let response: Response = self
+        let bytes = self
             .http
             .post(&self.url)
             .basic_auth(&self.user, Some(&self.password))
             .json(&body)
             .send()
             .await?
-            .json()
+            .bytes()
             .await?;
+        let response: Response = serde_json::from_slice(&bytes)?;
         if let Some(err) = response.error {
             return Err(RpcError::Node {
                 code: err.code,
                 message: err.message,
             });
         }
-        let result = response.result.ok_or(RpcError::Empty)?;
-        Ok(serde_json::from_value(result)?)
+        let raw = response.result.map(RawValue::get).unwrap_or("null");
+        Ok(serde_json::from_str(raw)?)
     }
 
     /// `getblockchaininfo`.
@@ -157,23 +168,15 @@ impl RpcClient {
         self.call("getblockcount", &[]).await
     }
 
-    /// `getblocktemplate` with the given rules; returns the raw template object.
-    pub async fn get_block_template(&self, rules: &[&str]) -> Result<Value, RpcError> {
+    /// `getblocktemplate` with the given rules.
+    pub async fn get_block_template(&self, rules: &[&str]) -> Result<RawTemplate, RpcError> {
         self.call("getblocktemplate", &[json!({ "rules": rules })])
             .await
     }
 
     /// `submitblock`. `Ok(None)` means accepted; `Ok(Some(reason))` means rejected.
     pub async fn submit_block(&self, block_hex: &str) -> Result<Option<String>, RpcError> {
-        let result: Value = self
-            .call("submitblock", &[json!(block_hex)])
-            .await
-            .or_else(|err| match err {
-                // submitblock returns JSON null on success, which `call` reports as Empty.
-                RpcError::Empty => Ok(Value::Null),
-                other => Err(other),
-            })?;
-        Ok(result.as_str().map(str::to_owned))
+        self.call("submitblock", &[json!(block_hex)]).await
     }
 
     /// Verbose `getblock` for confirmation tracking.

@@ -9,9 +9,9 @@ use alamo_core::target::hash_difficulty;
 
 /// The fields of a `mining.submit`, already parsed from hex.
 #[derive(Clone, Debug)]
-pub struct Submit {
+pub struct Submit<'a> {
     /// Worker name.
-    pub worker: String,
+    pub worker: &'a str,
     /// extranonce2 bytes.
     pub extranonce2: Vec<u8>,
     /// Header time.
@@ -25,18 +25,18 @@ const MAX_FUTURE_NTIME: u64 = 7_200;
 
 /// Validate a submit against a session job and its extranonce1.
 ///
-/// Returns the outcome and, when a network target was met, the block to submit.
+/// Returns the outcome and, when the network target was met, the block to submit.
 pub fn validate(
     job: &mut SessionJob,
     extranonce1: &[u8; EXTRANONCE1_LEN],
-    submit: &Submit,
+    submit: &Submit<'_>,
     payout_address: &str,
     now_unix: u64,
 ) -> (ShareOutcome, Option<BlockCandidate>) {
     if job.stale {
         return (ShareOutcome::Rejected(RejectReason::StaleJob), None);
     }
-    if submit.extranonce2.len() != EXTRANONCE2_LEN {
+    if submit.extranonce2.len() + EXTRANONCE1_LEN != job.coinbase.extranonce_len {
         return (
             ShareOutcome::Rejected(RejectReason::InvalidExtranonce2),
             None,
@@ -72,27 +72,22 @@ pub fn validate(
         return (ShareOutcome::Rejected(RejectReason::LowDifficulty), None);
     }
 
-    if job.work.target.is_met_by(&pow_hash) {
+    if job.work.target().is_met_by(&pow_hash) {
         let coinbase = job.coinbase.serialize_for_block(&extranonce);
         let block = job.work.assemble_block(&header, &coinbase);
         let candidate = BlockCandidate {
-            coin: job.work.coin.clone(),
+            coin: job.work.coin,
             height: job.work.height,
             block_hash: to_display_hex(&header.block_hash()),
             pow_hash,
-            worker: submit.worker.clone(),
+            worker: submit.worker.to_string(),
             address: payout_address.to_string(),
             block,
             network_difficulty: job.work.network_difficulty(),
             share_difficulty: difficulty,
             found_at: now_unix,
         };
-        let outcome = ShareOutcome::Block {
-            difficulty,
-            pow_hash,
-            chains: vec![],
-        };
-        return (outcome, Some(candidate));
+        return (ShareOutcome::Block { difficulty }, Some(candidate));
     }
 
     (ShareOutcome::Accepted { difficulty }, None)
@@ -106,39 +101,11 @@ mod tests {
     use alamo_core::job::JobId;
     use alamo_core::target::Target;
     use alamo_core::work::WorkTemplate;
-    use alamo_core::Algorithm;
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    fn regtest_work() -> Arc<WorkTemplate> {
-        let mut prefix = Vec::new();
-        alamo_core::encode::push_script_num(&mut prefix, 1);
-        let mut w = WorkTemplate {
-            id: JobId(1),
-            coin: "LTC".into(),
-            algorithm: Algorithm::Scrypt,
-            height: 1,
-            version: 0x2000_0000,
-            prev_hash: [0x11; 32],
-            bits: 0x207f_ffff,
-            target: Target::from_compact(0x207f_ffff),
-            cur_time: 1_700_000_000,
-            min_time: 1_699_990_000,
-            coinbase_value: 5_000_000_000,
-            coinbase_script_prefix: prefix,
-            witness_commitment: None,
-            transactions: vec![],
-            merkle_branch: vec![],
-            extra_payload: vec![],
-            clean_jobs: true,
-            created_at: 0,
-        };
-        w.compute_merkle_branch();
-        Arc::new(w)
-    }
-
     fn job(difficulty: f64) -> SessionJob {
-        let work = regtest_work();
+        let work = Arc::new(WorkTemplate::regtest_sample(1, None));
         let coinbase = CoinbaseParts::build(&work, &[0x51], 8).unwrap();
         SessionJob {
             id: JobId(7),
@@ -151,9 +118,9 @@ mod tests {
         }
     }
 
-    fn submit(nonce: u32) -> Submit {
+    fn submit(nonce: u32) -> Submit<'static> {
         Submit {
-            worker: "w".into(),
+            worker: "w",
             extranonce2: vec![0, 0, 0, 1],
             ntime: 1_700_000_000,
             nonce,
@@ -161,40 +128,23 @@ mod tests {
     }
 
     /// Find a nonce whose scrypt hash satisfies the (tiny) regtest share target.
-    fn mine(job: &SessionJob) -> u32 {
-        (0u32..)
+    fn mine(job: &mut SessionJob) -> u32 {
+        let nonce = (0u32..)
             .find(|&nonce| {
-                let mut probe = job.seen.clone();
-                probe.clear();
-                let mut j = SessionJob {
-                    seen: probe,
-                    ..clone_job(job)
-                };
-                matches!(
-                    validate(&mut j, &[1, 2, 3, 4], &submit(nonce), "addr", 1_700_000_100).0,
-                    ShareOutcome::Accepted { .. } | ShareOutcome::Block { .. }
-                )
+                let (outcome, _) =
+                    validate(job, &[1, 2, 3, 4], &submit(nonce), "addr", 1_700_000_100);
+                !matches!(outcome, ShareOutcome::Rejected(RejectReason::LowDifficulty))
             })
-            .unwrap()
-    }
-
-    fn clone_job(j: &SessionJob) -> SessionJob {
-        SessionJob {
-            id: j.id,
-            work: j.work.clone(),
-            coinbase: j.coinbase.clone(),
-            difficulty: j.difficulty,
-            target: j.target,
-            stale: j.stale,
-            seen: HashSet::new(),
-        }
+            .unwrap();
+        job.seen.clear();
+        nonce
     }
 
     #[test]
     fn regtest_share_is_a_block_and_duplicates_are_rejected() {
         // Share difficulty far below the regtest network target: any accepted share is a block.
         let mut j = job(1e-7);
-        let nonce = mine(&j);
+        let nonce = mine(&mut j);
         let (outcome, block) =
             validate(&mut j, &[1, 2, 3, 4], &submit(nonce), "addr", 1_700_000_100);
         assert!(matches!(outcome, ShareOutcome::Block { .. }), "{outcome:?}");
@@ -204,11 +154,10 @@ mod tests {
         assert_eq!(block.block[80], 1); // one transaction
                                         // Header prev hash and the coinbase's extranonce are embedded.
         assert_eq!(&block.block[4..36], &[0x11; 32]);
-        let en_pos = block
+        assert!(block
             .block
             .windows(8)
-            .position(|w| w == [1, 2, 3, 4, 0, 0, 0, 1]);
-        assert!(en_pos.is_some());
+            .any(|w| w == [1, 2, 3, 4, 0, 0, 0, 1]));
 
         let (dup, _) = validate(&mut j, &[1, 2, 3, 4], &submit(nonce), "addr", 1_700_000_100);
         assert_eq!(dup, ShareOutcome::Rejected(RejectReason::Duplicate));

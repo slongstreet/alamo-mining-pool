@@ -10,6 +10,7 @@ build = "build.rs"
 
 [dependencies]
 alamo-core.workspace = true
+alamo-store.workspace = true
 axum.workspace = true
 mime_guess.workspace = true
 parking_lot.workspace = true

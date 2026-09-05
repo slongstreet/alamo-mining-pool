@@ -26,10 +26,24 @@ pub struct CoinConfig {
     /// Text placed in the coinbase scriptSig. Parent chains only.
     #[serde(default)]
     pub coinbase_tag: Option<String>,
+    /// How often to check the node for a new chain tip, in milliseconds.
+    #[serde(default = "default_poll_ms")]
+    pub poll_interval_ms: u64,
+    /// How often to refresh the template without a new tip, in seconds.
+    #[serde(default = "default_refresh_secs")]
+    pub template_refresh_secs: u64,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_poll_ms() -> u64 {
+    500
+}
+
+fn default_refresh_secs() -> u64 {
+    30
 }
 
 impl std::fmt::Display for CoinConfig {

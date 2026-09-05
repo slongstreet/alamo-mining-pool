@@ -18,6 +18,7 @@ pub mod merkle;
 pub mod odds;
 pub mod payout;
 pub mod target;
+pub mod time;
 pub mod work;
 
 pub use address::AddressParams;
@@ -25,7 +26,7 @@ pub use algo::Algorithm;
 pub use coinbase::CoinbaseParts;
 pub use hash::Hash256;
 pub use header::BlockHeader;
-pub use job::{JobId, RejectReason, Share, ShareOutcome};
-pub use payout::{Payout, PayoutResolver};
+pub use job::{JobId, RejectReason, ShareOutcome};
+pub use payout::{Payout, PayoutTable};
 pub use target::Target;
 pub use work::{TemplateTx, WorkTemplate};

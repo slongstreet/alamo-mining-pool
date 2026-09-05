@@ -1,5 +1,6 @@
 //! Stratum v1 wire types (line-delimited JSON-RPC).
 
+use alamo_core::job::RejectReason;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -60,6 +61,15 @@ impl StratumError {
     /// The method is not supported.
     pub fn unknown_method(method: &str) -> Self {
         Self::other(format!("Unknown method: {method}"))
+    }
+}
+
+impl From<RejectReason> for StratumError {
+    fn from(reason: RejectReason) -> Self {
+        Self {
+            code: reason.stratum_code(),
+            message: reason.message().into(),
+        }
     }
 }
 
