@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
 pub use config::WebConfig;
-pub use snapshot::{CoinStatus, PoolSnapshot, WorkerStatus};
+pub use snapshot::{AuxPayoutStatus, CoinStatus, PoolSnapshot, WorkerStatus};
 
 /// State shared with request handlers.
 #[derive(Clone)]

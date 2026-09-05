@@ -1,7 +1,13 @@
 # Regtest nodes for local development and the integration tests.
 #
 #   docker compose -f deploy/regtest/docker-compose.yml up -d
-#   ALAMO_REGTEST_RPC=http://alamo:alamo@127.0.0.1:19443 cargo test -p alamo --test regtest -- --nocapture
+#   ./deploy/regtest/prepare-dogecoin.sh
+#   ALAMO_REGTEST_RPC=http://alamo:alamo@127.0.0.1:19443 \
+#   ALAMO_REGTEST_DOGE_RPC=http://alamo:alamo@127.0.0.1:18332 \
+#     cargo test -p alamo --test regtest -- --nocapture
+#
+# Dogecoin Core refuses `getblocktemplate` without at least one peer, even on regtest,
+# so a second dogecoind runs purely as a peer of the first.
 services:
   litecoind:
     build:
@@ -25,5 +31,45 @@ services:
     volumes:
       - litecoind-regtest:/home/litecoin/.litecoin
 
+  dogecoind:
+    build:
+      context: .
+      dockerfile: dogecoind.Dockerfile
+    image: alamo-dogecoind-regtest:local
+    command:
+      - -regtest
+      - -server=1
+      - -printtoconsole
+      - -rpcuser=alamo
+      - -rpcpassword=alamo
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -txindex=1
+      - -connect=dogecoind-peer:18444
+      - -zmqpubhashblock=tcp://0.0.0.0:28333
+    ports:
+      - "127.0.0.1:18332:18332"
+      - "127.0.0.1:28333:28333"
+    volumes:
+      - dogecoind-regtest:/home/dogecoin/.dogecoin
+    depends_on:
+      - dogecoind-peer
+
+  dogecoind-peer:
+    image: alamo-dogecoind-regtest:local
+    build:
+      context: .
+      dockerfile: dogecoind.Dockerfile
+    command:
+      - -regtest
+      - -server=0
+      - -printtoconsole
+      - -listen=1
+      - -bind=0.0.0.0:18444
+    volumes:
+      - dogecoind-peer-regtest:/home/dogecoin/.dogecoin
+
 volumes:
   litecoind-regtest:
+  dogecoind-regtest:
+  dogecoind-peer-regtest:

@@ -19,6 +19,33 @@ pub fn write_varint(out: &mut Vec<u8>, n: u64) {
     }
 }
 
+/// Number of bytes the CompactSize encoding of `n` occupies.
+pub fn varint_len(n: u64) -> usize {
+    match n {
+        0..=0xfc => 1,
+        0xfd..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
+    }
+}
+
+/// Decode a CompactSize integer from the front of `bytes`, returning the value and the
+/// number of bytes it occupied.
+///
+/// # Panics
+/// If `bytes` is too short.
+pub fn read_varint(bytes: &[u8]) -> (u64, usize) {
+    match bytes[0] {
+        n @ 0..=0xfc => (u64::from(n), 1),
+        0xfd => (u64::from(u16::from_le_bytes([bytes[1], bytes[2]])), 3),
+        0xfe => (
+            u64::from(u32::from_le_bytes(bytes[1..5].try_into().unwrap())),
+            5,
+        ),
+        _ => (u64::from_le_bytes(bytes[1..9].try_into().unwrap()), 9),
+    }
+}
+
 /// Append a script data push of `data` using the minimal push opcode.
 pub fn push_data(out: &mut Vec<u8>, data: &[u8]) {
     let len = data.len();
@@ -83,6 +110,24 @@ mod tests {
         let mut v = Vec::new();
         write_varint(&mut v, n);
         v
+    }
+
+    #[test]
+    fn varint_round_trips() {
+        for n in [
+            0u64,
+            1,
+            0xfc,
+            0xfd,
+            0xffff,
+            0x1_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+        ] {
+            let bytes = varint(n);
+            assert_eq!(read_varint(&bytes), (n, bytes.len()), "{n}");
+            assert_eq!(varint_len(n), bytes.len());
+        }
     }
 
     #[test]

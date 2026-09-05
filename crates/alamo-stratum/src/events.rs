@@ -16,6 +16,8 @@ pub enum PoolEvent {
         address: String,
         /// Whether the fallback address was substituted.
         fallback: bool,
+        /// Aux chain payouts resolved from the password.
+        aux: Vec<AuxPayoutInfo>,
     },
     /// A session ended.
     Disconnected {
@@ -46,6 +48,17 @@ pub enum PoolEvent {
         /// New difficulty.
         difficulty: f64,
     },
+}
+
+/// An aux chain payout as reported with [`PoolEvent::Authorized`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuxPayoutInfo {
+    /// Ticker.
+    pub coin: &'static str,
+    /// Address that will be paid.
+    pub address: String,
+    /// Whether the fallback address was substituted.
+    pub fallback: bool,
 }
 
 /// A share that met a network target: a block ready for submission.

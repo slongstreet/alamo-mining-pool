@@ -5,10 +5,10 @@
 
 #![forbid(unsafe_code)]
 
-pub mod auxpow;
 pub mod config;
 pub mod doge;
 pub mod ltc;
+pub mod merged;
 pub mod rpc;
 pub mod template;
 
@@ -18,6 +18,7 @@ use std::sync::Arc;
 pub use config::CoinConfig;
 pub use doge::Dogecoin;
 pub use ltc::Litecoin;
+pub use merged::merge;
 pub use rpc::{RpcClient, RpcError};
 pub use template::{RawTemplate, TemplateError, TemplateSource};
 
@@ -68,8 +69,13 @@ pub trait Coin: Send + Sync + 'static {
     fn address_params(&self, chain: Chain) -> AddressParams;
     /// Rules to pass to `getblocktemplate`.
     fn template_rules(&self) -> &'static [&'static str];
+    /// The block version to mine given the template's version. Aux chains add their
+    /// chain id and the auxpow flag.
+    fn block_version(&self, template_version: i32) -> i32 {
+        template_version
+    }
     /// Confirmations before a coinbase can be spent; a block is final after this many.
-    fn coinbase_maturity(&self) -> i64;
+    fn coinbase_maturity(&self, chain: Chain) -> i64;
     /// Coin-specific bytes appended after the transactions in a serialized block.
     fn extra_block_payload(&self, _raw: &RawTemplate) -> Result<Vec<u8>, TemplateError> {
         Ok(Vec::new())

@@ -38,6 +38,7 @@ version = "0.1.0"
 dependencies = [
  "alamo-core",
  "bitcoin",
+ "futures",
  "hex",
  "reqwest",
  "serde",

@@ -98,7 +98,7 @@ pub fn convert(
         coin: coin.symbol(),
         algorithm: coin.algorithm(),
         height: raw.height,
-        version: raw.version,
+        version: coin.block_version(raw.version),
         prev_hash,
         bits,
         cur_time: raw.curtime,
@@ -203,7 +203,7 @@ impl TemplateSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Litecoin;
+    use crate::{Dogecoin, Litecoin};
     use serde_json::json;
 
     #[test]
@@ -234,6 +234,27 @@ mod tests {
         assert!(work.clean_jobs);
         assert!(work.network_difficulty() < 1e-9);
         assert!(work.extra_payload.is_empty());
+    }
+
+    #[test]
+    fn dogecoin_template_gets_the_auxpow_version() {
+        // From a Dogecoin 1.14.9 regtest node at height 31.
+        let raw: RawTemplate = serde_json::from_value(json!({
+            "version": 6422532,
+            "previousblockhash": "dce5787e8f1146cdfb2335a116ac70451a5fe21b5f8a93dd849feb64c9777ab1",
+            "transactions": [],
+            "coinbasevalue": 50000000000000u64,
+            "mintime": 1788621996,
+            "curtime": 1788621996,
+            "bits": "207fffff",
+            "height": 31
+        }))
+        .unwrap();
+        let work = convert(raw, &Dogecoin, b"/alamo/", JobId(1), true).unwrap();
+        assert_eq!(work.version, 0x0062_0104);
+        assert_eq!(work.coin, "DOGE");
+        assert!(work.witness_commitment.is_none());
+        assert_eq!(work.coinbase_script_prefix[..2], [0x01, 31]);
     }
 
     #[test]

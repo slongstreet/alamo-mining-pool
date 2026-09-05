@@ -49,7 +49,7 @@ impl Coin for Litecoin {
         &["segwit", "mweb"]
     }
 
-    fn coinbase_maturity(&self) -> i64 {
+    fn coinbase_maturity(&self, _chain: Chain) -> i64 {
         100
     }
 

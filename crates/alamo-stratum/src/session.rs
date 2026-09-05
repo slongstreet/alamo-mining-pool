@@ -1,16 +1,19 @@
 //! Protocol state for one miner connection.
 
 use crate::config::VardiffConfig;
-use crate::events::{BlockCandidate, PoolEvent};
-use crate::job::{SessionJob, EXTRANONCE1_LEN, EXTRANONCE2_LEN};
+use crate::events::{AuxPayoutInfo, BlockCandidate, PoolEvent};
+use crate::job::{AuxJob, SessionJob, EXTRANONCE1_LEN, EXTRANONCE2_LEN};
 use crate::protocol::{Notification, Request, Response, StratumError};
 use crate::validate::{self, Submit};
 use crate::vardiff::Vardiff;
+use alamo_core::auxpow::{chain_id_of, AuxTree};
 use alamo_core::coinbase::CoinbaseParts;
+use alamo_core::hash::sha256d;
+use alamo_core::header::BlockHeader;
 use alamo_core::job::{JobId, RejectReason, ShareOutcome};
-use alamo_core::payout::{Payout, PayoutTable};
+use alamo_core::payout::{PayoutSet, Payouts};
 use alamo_core::target::Target;
-use alamo_core::work::WorkTemplate;
+use alamo_core::work::MergedWork;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -35,8 +38,8 @@ pub struct Effects {
     pub outgoing: Vec<Outgoing>,
     /// Events to report.
     pub events: Vec<PoolEvent>,
-    /// A block to submit.
-    pub block: Option<BlockCandidate>,
+    /// Blocks to submit, one per chain whose target was met.
+    pub blocks: Vec<BlockCandidate>,
     /// The session cannot continue (for example, no coinbase fits the template).
     pub close: bool,
 }
@@ -54,14 +57,14 @@ impl Effects {
 pub struct Session {
     id: u64,
     extranonce1: [u8; EXTRANONCE1_LEN],
-    payout: Option<Payout>,
+    payout: Option<Payouts>,
     workers: Vec<String>,
     difficulty: f64,
     next_job: u64,
     jobs: VecDeque<SessionJob>,
-    work: Option<Arc<WorkTemplate>>,
+    work: Option<Arc<MergedWork>>,
     vardiff: Vardiff,
-    payouts: Arc<PayoutTable>,
+    payouts: Arc<PayoutSet>,
 }
 
 impl Session {
@@ -70,7 +73,7 @@ impl Session {
         id: u64,
         extranonce1: [u8; EXTRANONCE1_LEN],
         vardiff_cfg: VardiffConfig,
-        payouts: Arc<PayoutTable>,
+        payouts: Arc<PayoutSet>,
         now: Instant,
     ) -> Self {
         Self {
@@ -150,9 +153,17 @@ impl Session {
             fx.respond(Response::err(id, StratumError::other("Missing username")));
             return;
         }
-        let payout = self.payouts.resolve(username);
+        let password = params.get(1).and_then(Value::as_str).unwrap_or_default();
+        let payout = self.payouts.resolve(username, password);
         if let Some(existing) = &self.payout {
-            if existing.script != payout.script {
+            if existing.parent.script != payout.parent.script
+                || existing.aux.len() != payout.aux.len()
+                || existing
+                    .aux
+                    .iter()
+                    .zip(&payout.aux)
+                    .any(|(a, b)| a.payout.script != b.payout.script)
+            {
                 fx.respond(Response::err(
                     id,
                     StratumError::other("This connection already pays a different address"),
@@ -160,8 +171,11 @@ impl Session {
                 return;
             }
         }
-        if payout.fallback {
-            tracing::warn!(session = self.id, username, fallback = %payout.address, "username is not a valid address; paying fallback");
+        if payout.parent.fallback {
+            tracing::warn!(session = self.id, username, fallback = %payout.parent.address, "username is not a valid address; paying fallback");
+        }
+        for aux in payout.aux.iter().filter(|a| a.payout.fallback) {
+            tracing::warn!(session = self.id, username, coin = aux.coin, fallback = %aux.payout.address, "password holds no valid address; paying fallback");
         }
         let first = self.payout.is_none();
         if !self.workers.iter().any(|w| w == username) {
@@ -170,8 +184,17 @@ impl Session {
         fx.events.push(PoolEvent::Authorized {
             session: self.id,
             worker: username.to_owned(),
-            address: payout.address.clone(),
-            fallback: payout.fallback,
+            address: payout.parent.address.clone(),
+            fallback: payout.parent.fallback,
+            aux: payout
+                .aux
+                .iter()
+                .map(|a| AuxPayoutInfo {
+                    coin: a.coin,
+                    address: a.payout.address.clone(),
+                    fallback: a.payout.fallback,
+                })
+                .collect(),
         });
         self.payout = Some(payout);
         fx.respond(Response::ok(id, json!(true)));
@@ -233,8 +256,13 @@ impl Session {
         };
         let job_difficulty = job.difficulty;
         let coin = job.work.coin;
-        let (outcome, block) =
-            validate::validate(job, &self.extranonce1, &submit, &payout.address, now_unix);
+        let (outcome, blocks) = validate::validate(
+            job,
+            &self.extranonce1,
+            &submit,
+            &payout.parent.address,
+            now_unix,
+        );
         let (share_difficulty, rejected) = match &outcome {
             ShareOutcome::Accepted { difficulty } | ShareOutcome::Block { difficulty } => {
                 (*difficulty, None)
@@ -254,7 +282,7 @@ impl Session {
             None => {
                 fx.respond(Response::ok(id, json!(true)));
                 self.vardiff.on_share();
-                fx.block = block;
+                fx.blocks = blocks;
             }
         }
         self.maybe_retarget(now, fx);
@@ -288,16 +316,24 @@ impl Session {
         });
     }
 
-    /// A new template arrived.
-    pub fn on_work(&mut self, work: Arc<WorkTemplate>) -> Effects {
+    /// New work arrived: a parent template, aux templates, or both.
+    pub fn on_work(&mut self, work: Arc<MergedWork>) -> Effects {
         let mut fx = Effects::default();
         let clean = work.clean_jobs;
-        self.work = Some(work);
-        if clean {
-            for job in &mut self.jobs {
+        for job in &mut self.jobs {
+            if clean {
                 job.stale = true;
             }
+            // An aux block built on a previous aux tip can no longer be accepted.
+            for aux in &mut job.aux {
+                let current = work
+                    .aux
+                    .iter()
+                    .any(|w| w.coin == aux.work.coin && w.prev_hash == aux.work.prev_hash);
+                aux.stale |= !current;
+            }
         }
+        self.work = Some(work);
         self.send_job(clean, &mut fx);
         fx
     }
@@ -306,24 +342,37 @@ impl Session {
         self.send_job(false, fx);
     }
 
-    /// Send the current template as a new job, if there is a template and a payout.
+    /// Send the current work as a new job, if there is work and a payout.
     fn send_job(&mut self, clean: bool, fx: &mut Effects) {
         let (Some(work), Some(payout)) = (self.work.clone(), self.payout.as_ref()) else {
             return;
         };
-        let coinbase =
-            match CoinbaseParts::build(&work, &payout.script, EXTRANONCE1_LEN + EXTRANONCE2_LEN) {
-                Ok(c) => c,
-                Err(err) => {
-                    tracing::error!(session = self.id, %err, "cannot build coinbase");
-                    fx.close = true;
-                    return;
-                }
-            };
+        let (aux, commitment) = match build_aux_jobs(&work, payout) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(session = self.id, %err, "cannot build aux blocks");
+                fx.close = true;
+                return;
+            }
+        };
+        let coinbase = match CoinbaseParts::build(
+            &work.parent,
+            &payout.parent.script,
+            &commitment,
+            EXTRANONCE1_LEN + EXTRANONCE2_LEN,
+        ) {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::error!(session = self.id, %err, "cannot build coinbase");
+                fx.close = true;
+                return;
+            }
+        };
         let job = SessionJob {
             id: JobId(self.next_job),
-            work,
+            work: work.parent.clone(),
             coinbase,
+            aux,
             difficulty: self.difficulty,
             target: Target::from_difficulty(self.difficulty),
             stale: false,
@@ -338,29 +387,105 @@ impl Session {
     }
 }
 
+/// Build one aux block per aux template the session has a payout for, and the commitment
+/// to place in the parent coinbase (empty when there are no aux blocks).
+fn build_aux_jobs(
+    work: &MergedWork,
+    payout: &Payouts,
+) -> Result<(Vec<AuxJob>, Vec<u8>), alamo_core::coinbase::CoinbaseError> {
+    let mut aux = Vec::with_capacity(work.aux.len());
+    for template in &work.aux {
+        let Some(p) = payout.aux.iter().find(|a| a.coin == template.coin) else {
+            continue;
+        };
+        let coinbase = CoinbaseParts::build(template, &p.payout.script, &[], 0)?.serialize(&[]);
+        let header = BlockHeader {
+            version: template.version,
+            prev_hash: template.prev_hash,
+            merkle_root: template.merkle_root(&sha256d(&coinbase)),
+            time: template.cur_time,
+            bits: template.bits,
+            nonce: 0,
+        };
+        aux.push(AuxJob {
+            work: template.clone(),
+            address: p.payout.address.clone(),
+            coinbase,
+            hash: header.block_hash(),
+            header,
+            chain_index: 0,
+            chain_branch: Vec::new(),
+            stale: false,
+        });
+    }
+    if aux.is_empty() {
+        return Ok((aux, Vec::new()));
+    }
+    let leaves: Vec<(u32, _)> = aux
+        .iter()
+        .map(|a| (chain_id_of(a.work.version), a.hash))
+        .collect();
+    let tree = AuxTree::build(&leaves).expect("non-empty, distinct chain ids");
+    let commitment = tree.commitment().to_vec();
+    for (job, proof) in aux.iter_mut().zip(tree.proofs) {
+        job.chain_index = proof.index;
+        job.chain_branch = proof.branch;
+    }
+    Ok((aux, commitment))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alamo_core::address::{encode_segwit, AddressParams};
+    use alamo_core::address::{encode_base58, encode_segwit, AddressParams};
+    use alamo_core::payout::{AuxPayoutTable, PayoutTable};
+    use alamo_core::work::WorkTemplate;
 
     const PARAMS: AddressParams = AddressParams {
         p2pkh_prefix: 111,
         p2sh_prefixes: &[58, 196],
         bech32_hrp: Some("rltc"),
     };
+    const DOGE_PARAMS: AddressParams = AddressParams {
+        p2pkh_prefix: 111,
+        p2sh_prefixes: &[196],
+        bech32_hrp: None,
+    };
 
     fn addr(byte: u8) -> String {
         encode_segwit("rltc", 0, &[byte; 20]).unwrap()
     }
 
-    fn work(clean: bool) -> Arc<WorkTemplate> {
+    fn doge_addr(byte: u8) -> String {
+        encode_base58(111, &[byte; 20])
+    }
+
+    fn work(clean: bool) -> Arc<MergedWork> {
         let mut w = WorkTemplate::regtest_sample(5, None);
         w.clean_jobs = clean;
-        Arc::new(w)
+        Arc::new(MergedWork::solo(Arc::new(w)))
+    }
+
+    fn merged(parent_id: u64, doge_prev: u8) -> Arc<MergedWork> {
+        let mut parent = WorkTemplate::regtest_sample(5, None);
+        parent.id = JobId(parent_id);
+        let mut doge = WorkTemplate::regtest_aux_sample(31);
+        doge.prev_hash = [doge_prev; 32];
+        Arc::new(MergedWork {
+            parent: Arc::new(parent),
+            aux: vec![Arc::new(doge)],
+            clean_jobs: false,
+        })
     }
 
     fn session() -> Session {
-        let payouts = Arc::new(PayoutTable::new(PARAMS, &addr(9)).unwrap());
+        let payouts = Arc::new(PayoutSet {
+            parent: PayoutTable::new(PARAMS, &addr(9)).unwrap(),
+            aux: vec![AuxPayoutTable {
+                coin: "DOGE",
+                table: PayoutTable::new(DOGE_PARAMS, &doge_addr(9)).unwrap(),
+            }],
+        });
         Session::new(
             9,
             [1, 2, 3, 4],
@@ -416,6 +541,47 @@ mod tests {
     }
 
     #[test]
+    fn password_sets_the_doge_payout_and_the_coinbase_commits_to_it() {
+        let mut s = session();
+        let fx = s.handle(
+            req("mining.authorize", json!([addr(1), doge_addr(3)])),
+            Instant::now(),
+            0,
+        );
+        let PoolEvent::Authorized { aux, .. } = &fx.events[0] else {
+            panic!()
+        };
+        assert_eq!(aux[0].coin, "DOGE");
+        assert_eq!(aux[0].address, doge_addr(3));
+        assert!(!aux[0].fallback);
+
+        let fx = s.on_work(merged(1, 0x22));
+        let Outgoing::Notification(n) = &fx.outgoing[0] else {
+            panic!()
+        };
+        let coinb1 = hex::decode(n.params[2].as_str().unwrap()).unwrap();
+        let job = s.jobs.back().unwrap();
+        assert_eq!(job.aux.len(), 1);
+        assert_eq!(job.aux[0].address, doge_addr(3));
+        let mut committed = job.aux[0].hash;
+        committed.reverse();
+        assert!(coinb1
+            .windows(36)
+            .any(|w| w[..4] == [0xfa, 0xbe, 0x6d, 0x6d] && w[4..] == committed));
+
+        // A DOGE tip change: non-clean job, and the old job's aux block goes stale
+        // while its parent share stays valid.
+        let fx = s.on_work(merged(1, 0x33));
+        let Outgoing::Notification(n) = &fx.outgoing[0] else {
+            panic!()
+        };
+        assert_eq!(n.params[8], false);
+        assert!(s.jobs[0].aux[0].stale);
+        assert!(!s.jobs[0].stale);
+        assert!(!s.jobs[1].aux[0].stale);
+    }
+
+    #[test]
     fn second_address_on_same_connection_is_refused() {
         let mut s = session();
         s.handle(
@@ -425,6 +591,12 @@ mod tests {
         );
         let fx = s.handle(
             req("mining.authorize", json!([addr(2), "x"])),
+            Instant::now(),
+            0,
+        );
+        assert!(matches!(&fx.outgoing[0], Outgoing::Response(r) if r.error.is_some()));
+        let fx = s.handle(
+            req("mining.authorize", json!([addr(1), doge_addr(2)])),
             Instant::now(),
             0,
         );
@@ -440,7 +612,7 @@ mod tests {
             0,
         );
         assert!(
-            matches!(&fx.events[0], PoolEvent::Authorized { fallback: true, address, .. } if *address == addr(9))
+            matches!(&fx.events[0], PoolEvent::Authorized { fallback: true, address, aux, .. } if *address == addr(9) && aux[0].fallback && aux[0].address == doge_addr(9))
         );
     }
 

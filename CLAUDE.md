@@ -25,14 +25,24 @@ coinbase to the address the miner used as its stratum username.
   `cargo test --workspace` before declaring anything done.
 
 ## Regtest and verification
-- `deploy/regtest/docker-compose.yml` runs litecoind on regtest (rpc alamo/alamo, port 19443).
+- `deploy/regtest/docker-compose.yml` runs litecoind (rpc alamo/alamo, port 19443) and
+  dogecoind (rpc alamo/alamo, port 18332) plus a second dogecoind that exists only as a
+  peer: Dogecoin Core refuses `getblocktemplate` with zero peers, even on regtest.
+- `deploy/regtest/prepare-dogecoin.sh` mines 30 Dogecoin blocks. Dogecoin regtest rejects
+  auxpow blocks below height 20 and legacy blocks from 20 on; coinbase maturity is 60.
 - `deploy/regtest/activate-mweb.sh` mines to 432 with a peg-in so MWEB activates; the first
   MWEB block needs a peg-in or the node cannot build it.
-- `ALAMO_REGTEST_RPC=http://alamo:alamo@127.0.0.1:19443 cargo test -p alamo --test regtest`
+- `ALAMO_REGTEST_RPC=http://alamo:alamo@127.0.0.1:19443
+  ALAMO_REGTEST_DOGE_RPC=http://alamo:alamo@127.0.0.1:18332 cargo test -p alamo --test regtest`
   is the proof that block construction is right. Run it before and after MWEB activation when
-  touching coinbase, merkle, template, or block assembly code.
+  touching coinbase, merkle, auxpow, template, or block assembly code.
 - Litecoin block serialization after MWEB: header, txs (HogEx last, as given by the
   template), then `0x01` + the template's `mweb` hex. Nothing is appended before activation.
+- Dogecoin templates report version `0x00620004` (chain id 98 already in place); mined blocks
+  are `0x00620104` (auxpow flag). Block = header, auxpow, varint(ntx), txs. The auxpow's
+  coinbase is the non-witness Litecoin coinbase; its `hashBlock` field is not verified.
+- `crates/alamo-core/testdata/doge-371337.hex` is a real mainnet auxpow block; the KAT in
+  `auxpow.rs` must keep passing.
 
 ## Frontend
 - `web/` is Svelte 5 + TypeScript + Vite. `npm run build` writes `web/dist`, which

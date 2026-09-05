@@ -23,7 +23,7 @@ pub struct CoinConfig {
     pub zmq_hashblock: Option<String>,
     /// Address paid when a worker does not supply a valid one.
     pub fallback_address: String,
-    /// Text placed in the coinbase scriptSig. Parent chains only.
+    /// Text placed in this coin's coinbase scriptSig.
     #[serde(default)]
     pub coinbase_tag: Option<String>,
     /// How often to check the node for a new chain tip, in milliseconds.

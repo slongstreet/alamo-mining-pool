@@ -41,17 +41,100 @@ impl PayoutTable {
     /// Resolve a username.
     pub fn resolve(&self, username: &str) -> Payout {
         let (address, _worker) = split_username(username);
-        match payout_script(address, &self.params) {
-            Ok(script) => Payout {
-                address: address.to_string(),
-                script,
-                fallback: false,
-            },
-            Err(_) => Payout {
-                address: self.fallback_address.clone(),
-                script: self.fallback_script.clone(),
-                fallback: true,
-            },
+        self.parse(address).unwrap_or_else(|| self.fallback())
+    }
+
+    /// The payout for `address`, if it is valid for this coin.
+    pub fn parse(&self, address: &str) -> Option<Payout> {
+        let script = payout_script(address, &self.params).ok()?;
+        Some(Payout {
+            address: address.to_string(),
+            script,
+            fallback: false,
+        })
+    }
+
+    /// The fallback payout.
+    pub fn fallback(&self) -> Payout {
+        Payout {
+            address: self.fallback_address.clone(),
+            script: self.fallback_script.clone(),
+            fallback: true,
+        }
+    }
+}
+
+/// Payout tables for the parent chain and every aux chain.
+///
+/// The parent address is the stratum username. Aux addresses come from the password field,
+/// either bare (`DAddress`) or tagged (`doge=DAddress`), separated by commas or spaces;
+/// anything else in the password (`x`, `d=1024`) is ignored.
+#[derive(Clone, Debug)]
+pub struct PayoutSet {
+    /// The parent chain.
+    pub parent: PayoutTable,
+    /// Aux chains, in the order they are mined.
+    pub aux: Vec<AuxPayoutTable>,
+}
+
+/// One aux chain's payout table.
+#[derive(Clone, Debug)]
+pub struct AuxPayoutTable {
+    /// Ticker (`"DOGE"`).
+    pub coin: &'static str,
+    /// Address resolver.
+    pub table: PayoutTable,
+}
+
+/// Where one worker's rewards go on every chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Payouts {
+    /// Parent chain payout.
+    pub parent: Payout,
+    /// Aux chain payouts, in the same order as [`PayoutSet::aux`].
+    pub aux: Vec<AuxPayout>,
+}
+
+/// An aux chain payout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuxPayout {
+    /// Ticker.
+    pub coin: &'static str,
+    /// The payout.
+    pub payout: Payout,
+}
+
+impl PayoutSet {
+    /// Resolve a username and password to payouts on every chain.
+    pub fn resolve(&self, username: &str, password: &str) -> Payouts {
+        let tokens: Vec<&str> = password
+            .split([',', ' ', '\t'])
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        let aux = self
+            .aux
+            .iter()
+            .map(|aux| {
+                let payout = tokens
+                    .iter()
+                    .find_map(|token| match token.split_once('=') {
+                        Some((key, value)) if key.eq_ignore_ascii_case(aux.coin) => {
+                            aux.table.parse(value.trim())
+                        }
+                        Some(_) => None,
+                        None => aux.table.parse(token),
+                    })
+                    .unwrap_or_else(|| aux.table.fallback());
+                AuxPayout {
+                    coin: aux.coin,
+                    payout,
+                }
+            })
+            .collect();
+        Payouts {
+            parent: self.parent.resolve(username),
+            aux,
         }
     }
 }
@@ -92,6 +175,51 @@ mod tests {
         let p = table.resolve("bogus.rig2");
         assert_eq!(p.address, fallback);
         assert!(p.fallback);
+    }
+
+    #[test]
+    fn aux_address_comes_from_the_password() {
+        let ltc = PayoutTable::new(
+            AddressParams {
+                p2pkh_prefix: 111,
+                p2sh_prefixes: &[58, 196],
+                bech32_hrp: Some("rltc"),
+            },
+            &encode_segwit("rltc", 0, &[9; 20]).unwrap(),
+        )
+        .unwrap();
+        let doge_params = AddressParams {
+            p2pkh_prefix: 111,
+            p2sh_prefixes: &[196],
+            bech32_hrp: None,
+        };
+        let doge_fallback = crate::address::encode_base58(111, &[7; 20]);
+        let doge = PayoutTable::new(doge_params, &doge_fallback).unwrap();
+        let set = PayoutSet {
+            parent: ltc,
+            aux: vec![AuxPayoutTable {
+                coin: "DOGE",
+                table: doge,
+            }],
+        };
+        let mine = encode_segwit("rltc", 0, &[1; 20]).unwrap();
+        let doge_mine = crate::address::encode_base58(111, &[2; 20]);
+
+        let p = set.resolve(&format!("{mine}.rig"), &doge_mine);
+        assert_eq!(p.parent.address, mine);
+        assert_eq!(p.aux[0].payout.address, doge_mine);
+        assert!(!p.aux[0].payout.fallback);
+
+        let p = set.resolve(&mine, &format!("d=512, DOGE={doge_mine}"));
+        assert_eq!(p.aux[0].payout.address, doge_mine);
+
+        let p = set.resolve(&mine, "x");
+        assert_eq!(p.aux[0].payout.address, doge_fallback);
+        assert!(p.aux[0].payout.fallback);
+
+        // A parent-chain address in the password is not a Dogecoin address.
+        let p = set.resolve(&mine, &mine);
+        assert!(p.aux[0].payout.fallback);
     }
 
     #[test]

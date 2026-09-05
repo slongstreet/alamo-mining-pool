@@ -1,6 +1,7 @@
 //! Dogecoin: merge-mined against Litecoin.
 
 use crate::{Chain, Coin};
+use alamo_core::auxpow::aux_block_version;
 use alamo_core::{AddressParams, Algorithm};
 
 /// Dogecoin's merged-mining chain id (`0x0062`).
@@ -51,7 +52,26 @@ impl Coin for Dogecoin {
         &[]
     }
 
-    fn coinbase_maturity(&self) -> i64 {
-        240
+    fn block_version(&self, template_version: i32) -> i32 {
+        aux_block_version(template_version, CHAIN_ID)
+    }
+
+    fn coinbase_maturity(&self, chain: Chain) -> i64 {
+        match chain {
+            Chain::Regtest => 60,
+            _ => 240,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dogecoin_auxpow_version() {
+        // Dogecoin templates carry 0x00620004; mined blocks carry the auxpow flag too.
+        assert_eq!(Dogecoin.block_version(0x0062_0004), 0x0062_0104);
+        assert_eq!(Dogecoin.block_version(4), 0x0062_0104);
     }
 }

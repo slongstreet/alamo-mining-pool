@@ -7,6 +7,7 @@ use crate::job::JobId;
 use crate::merkle;
 use crate::target::Target;
 use crate::Algorithm;
+use std::sync::Arc;
 
 /// A non-coinbase transaction from the template.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,12 +80,15 @@ impl WorkTemplate {
         self.target().difficulty()
     }
 
-    /// Serialize a full block: header, transaction count, coinbase, transactions, payload.
-    pub fn assemble_block(&self, header: &BlockHeader, coinbase: &[u8]) -> Vec<u8> {
+    /// Serialize a full block: header, auxpow (empty for a parent chain), transaction
+    /// count, coinbase, transactions, payload.
+    pub fn assemble_block(&self, header: &BlockHeader, auxpow: &[u8], coinbase: &[u8]) -> Vec<u8> {
         let tx_bytes: usize = self.transactions.iter().map(|t| t.data.len()).sum();
-        let mut out =
-            Vec::with_capacity(80 + 9 + coinbase.len() + tx_bytes + self.extra_payload.len());
+        let mut out = Vec::with_capacity(
+            80 + auxpow.len() + 9 + coinbase.len() + tx_bytes + self.extra_payload.len(),
+        );
         out.extend_from_slice(&header.serialize());
+        out.extend_from_slice(auxpow);
         write_varint(&mut out, 1 + self.transactions.len() as u64);
         out.extend_from_slice(coinbase);
         for tx in &self.transactions {
@@ -92,6 +96,33 @@ impl WorkTemplate {
         }
         out.extend_from_slice(&self.extra_payload);
         out
+    }
+}
+
+/// The parent chain's template together with the aux chain templates mined alongside it.
+///
+/// Sessions derive one job from this: the aux coinbases are built first, their block
+/// hashes are committed in the parent coinbase, and a share that meets any chain's target
+/// yields a block for that chain.
+#[derive(Clone, Debug)]
+pub struct MergedWork {
+    /// The chain whose header is actually hashed.
+    pub parent: Arc<WorkTemplate>,
+    /// Aux chains, each with its chain id already in its block version.
+    pub aux: Vec<Arc<WorkTemplate>>,
+    /// Whether miners must drop earlier jobs. Only a parent tip change sets this; an aux
+    /// tip change is delivered as a non-clean job so parent shares stay valid.
+    pub clean_jobs: bool,
+}
+
+impl MergedWork {
+    /// Work for a parent chain with no aux chains.
+    pub fn solo(parent: Arc<WorkTemplate>) -> Self {
+        Self {
+            clean_jobs: parent.clean_jobs,
+            parent,
+            aux: Vec::new(),
+        }
     }
 }
 
@@ -123,6 +154,17 @@ impl WorkTemplate {
             created_at: 0,
         };
         w.compute_merkle_branch();
+        w
+    }
+
+    /// A regtest-shaped Dogecoin template for tests: chain id 98 and the auxpow flag in
+    /// the version, no witness commitment, no transactions.
+    pub fn regtest_aux_sample(height: u64) -> Self {
+        let mut w = Self::regtest_sample(height, None);
+        w.coin = "DOGE";
+        w.version = 0x0062_0104;
+        w.prev_hash = [0x22; 32];
+        w.coinbase_value = 50_000_000_000_000;
         w
     }
 }

@@ -55,6 +55,8 @@ pub struct WorkerStatus {
     pub address: String,
     /// Whether the fallback address is being paid.
     pub fallback: bool,
+    /// Aux chain payouts (from the stratum password).
+    pub aux_payouts: Vec<AuxPayoutStatus>,
     /// Number of live sessions.
     pub connections: usize,
     /// Current share difficulty.
@@ -69,4 +71,15 @@ pub struct WorkerStatus {
     pub best_difficulty: f64,
     /// Seconds since the last accepted share, if any.
     pub last_share_seconds: Option<u64>,
+}
+
+/// One aux chain payout of a worker.
+#[derive(Clone, Debug, Serialize)]
+pub struct AuxPayoutStatus {
+    /// Ticker.
+    pub coin: String,
+    /// Payout address.
+    pub address: String,
+    /// Whether the fallback address is being paid.
+    pub fallback: bool,
 }

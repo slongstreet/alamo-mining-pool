@@ -1,16 +1,18 @@
-//! The pool runtime: node connections, template source, stratum server, block submission,
+//! The pool runtime: node connections, template sources, stratum server, block submission,
 //! confirmation tracking, and the status snapshot for the dashboard.
 
 use crate::config::Config;
 use crate::stats::Stats;
-use alamo_coins::{Chain, Coin, RpcClient, TemplateSource};
+use alamo_coins::{merge, Chain, Coin, CoinConfig, RpcClient, TemplateSource};
 use alamo_core::odds::OddsSummary;
-use alamo_core::payout::PayoutTable;
+use alamo_core::payout::{AuxPayoutTable, PayoutSet, PayoutTable};
 use alamo_core::time::now_unix;
+use alamo_core::work::WorkTemplate;
 use alamo_store::{BlockRow, BlockStatus, NewBlock, Store};
 use alamo_stratum::{BlockCandidate, PoolEvent, StratumServer, WorkReceiver};
 use alamo_web::{AppState, CoinStatus, PoolSnapshot};
 use anyhow::{bail, Context};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
@@ -35,9 +37,9 @@ impl SubmitOutcome {
     }
 }
 
-/// A parent chain the pool mines.
-pub struct ParentChain {
-    /// Config key (`ltc`).
+/// A connected node for one coin.
+pub struct ChainNode {
+    /// Config key (`ltc`, `doge`).
     pub key: String,
     /// Coin definition.
     pub coin: Arc<dyn Coin>,
@@ -45,33 +47,43 @@ pub struct ParentChain {
     pub rpc: RpcClient,
     /// Which network the node is on.
     pub chain: Chain,
-    /// Username resolver.
-    pub payouts: Arc<PayoutTable>,
+    /// Username resolver for this coin.
+    pub payouts: PayoutTable,
+    /// The coin's configuration.
+    pub config: CoinConfig,
 }
 
-/// Connect to the configured parent chain and verify it.
-pub async fn connect_parent(config: &Config) -> anyhow::Result<ParentChain> {
-    let parents: Vec<(&String, &alamo_coins::CoinConfig)> = config
-        .coins
-        .iter()
-        .filter(|(_, c)| c.enabled && c.merge_mined_with.is_none())
-        .collect();
-    let (key, cfg) = match parents.as_slice() {
-        [one] => *one,
-        [] => bail!("no enabled parent coin configured"),
-        many => bail!(
-            "only one parent chain is supported for now; found {}",
-            many.len()
-        ),
-    };
-    for (aux, c) in config
-        .coins
-        .iter()
-        .filter(|(_, c)| c.enabled && c.merge_mined_with.is_some())
-    {
-        tracing::warn!(coin = %aux, parent = ?c.merge_mined_with, "merge mining arrives in Wave 2; skipping");
+/// The parent chain and the aux chains merge-mined with it.
+pub struct Chains {
+    /// The chain whose header is hashed.
+    pub parent: ChainNode,
+    /// Chains committed to in the parent coinbase.
+    pub aux: Vec<ChainNode>,
+}
+
+impl Chains {
+    /// Payout tables for every chain, for the stratum server.
+    pub fn payout_set(&self) -> PayoutSet {
+        PayoutSet {
+            parent: self.parent.payouts.clone(),
+            aux: self
+                .aux
+                .iter()
+                .map(|node| AuxPayoutTable {
+                    coin: node.coin.symbol(),
+                    table: node.payouts.clone(),
+                })
+                .collect(),
+        }
     }
-    let coin = alamo_coins::builtin(key).context("unknown coin")?;
+
+    fn nodes(&self) -> impl Iterator<Item = &ChainNode> {
+        std::iter::once(&self.parent).chain(self.aux.iter())
+    }
+}
+
+async fn connect_node(key: &str, cfg: &CoinConfig) -> anyhow::Result<ChainNode> {
+    let coin = alamo_coins::builtin(key).with_context(|| format!("unknown coin '{key}'"))?;
     let rpc = RpcClient::new(&cfg.rpc_url, &cfg.rpc_user, &cfg.rpc_password);
     let info = rpc
         .get_blockchain_info()
@@ -87,13 +99,58 @@ pub async fn connect_parent(config: &Config) -> anyhow::Result<ParentChain> {
                 coin.symbol()
             )
         })?;
-    Ok(ParentChain {
-        key: key.clone(),
+    Ok(ChainNode {
+        key: key.to_string(),
         coin,
         rpc,
         chain,
-        payouts: Arc::new(payouts),
+        payouts,
+        config: cfg.clone(),
     })
+}
+
+/// Connect to the configured parent chain and every aux chain merge-mined with it.
+pub async fn connect_chains(config: &Config) -> anyhow::Result<Chains> {
+    let parents: Vec<(&String, &CoinConfig)> = config
+        .coins
+        .iter()
+        .filter(|(_, c)| c.enabled && c.merge_mined_with.is_none())
+        .collect();
+    let (key, cfg) = match parents.as_slice() {
+        [one] => *one,
+        [] => bail!("no enabled parent coin configured"),
+        many => bail!(
+            "only one parent chain is supported for now; found {}",
+            many.len()
+        ),
+    };
+    let parent = connect_node(key, cfg).await?;
+
+    let mut aux = Vec::new();
+    for (aux_key, aux_cfg) in config
+        .coins
+        .iter()
+        .filter(|(_, c)| c.enabled && c.merge_mined_with.as_deref() == Some(key.as_str()))
+    {
+        let node = connect_node(aux_key, aux_cfg).await?;
+        if node.coin.aux_chain_id().is_none() {
+            bail!("coin '{aux_key}' cannot be merge-mined");
+        }
+        if node.chain != parent.chain {
+            bail!(
+                "coin '{aux_key}' node is on {} but parent '{key}' is on {}",
+                node.chain,
+                parent.chain
+            );
+        }
+        tracing::info!(
+            coin = node.coin.symbol(),
+            parent = parent.coin.symbol(),
+            "merge mining"
+        );
+        aux.push(node);
+    }
+    Ok(Chains { parent, aux })
 }
 
 /// Submit a block candidate to the node and record the result.
@@ -135,24 +192,25 @@ pub async fn submit_candidate(
     Ok(outcome)
 }
 
-/// Re-check accepted blocks against the chain and update their status.
+/// Re-check one coin's accepted blocks against its chain and update their status.
 pub async fn track_confirmations(
     rpc: &RpcClient,
     coin: &dyn Coin,
+    chain: Chain,
     store: &Store,
 ) -> anyhow::Result<()> {
-    for block in store.unsettled_blocks().await? {
+    for block in store.unsettled_blocks(coin.symbol()).await? {
         let info = match rpc.get_block_info(&block.hash).await {
             Ok(info) => info,
             Err(err) => {
-                tracing::warn!(hash = %block.hash, %err, "could not check block");
+                tracing::warn!(coin = coin.symbol(), hash = %block.hash, %err, "could not check block");
                 continue;
             }
         };
         let status = if info.confirmations < 0 {
-            tracing::warn!(height = block.height, hash = %block.hash, "block orphaned");
+            tracing::warn!(coin = coin.symbol(), height = block.height, hash = %block.hash, "block orphaned");
             BlockStatus::Orphaned
-        } else if info.confirmations >= coin.coinbase_maturity() {
+        } else if info.confirmations >= coin.coinbase_maturity(chain) {
             BlockStatus::Confirmed
         } else {
             BlockStatus::Accepted
@@ -164,6 +222,22 @@ pub async fn track_confirmations(
     Ok(())
 }
 
+fn template_source(node: &ChainNode) -> TemplateSource {
+    let tag = node
+        .config
+        .coinbase_tag
+        .clone()
+        .unwrap_or_else(|| "/alamo/".into())
+        .into_bytes();
+    TemplateSource {
+        rpc: node.rpc.clone(),
+        coin: node.coin.clone(),
+        coinbase_tag: tag,
+        poll_interval: Duration::from_millis(node.config.poll_interval_ms),
+        refresh_interval: Duration::from_secs(node.config.template_refresh_secs),
+    }
+}
+
 /// Run the pool until `shutdown` is cancelled or a component stops.
 pub async fn run(
     config: Config,
@@ -171,13 +245,7 @@ pub async fn run(
     state: AppState,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let parent = connect_parent(&config).await?;
-    let cfg = &config.coins[&parent.key];
-    let tag = cfg
-        .coinbase_tag
-        .clone()
-        .unwrap_or_else(|| "/alamo/".into())
-        .into_bytes();
+    let chains = connect_chains(&config).await?;
 
     let (work_tx, work_rx) = watch::channel(None);
     let (events_tx, events_rx) = mpsc::channel::<PoolEvent>(4096);
@@ -186,23 +254,34 @@ pub async fn run(
     // Every task returns its name when it stops; none of them stops on its own.
     let mut tasks: JoinSet<&'static str> = JoinSet::new();
 
-    let source = TemplateSource {
-        rpc: parent.rpc.clone(),
-        coin: parent.coin.clone(),
-        coinbase_tag: tag,
-        poll_interval: Duration::from_millis(cfg.poll_interval_ms),
-        refresh_interval: Duration::from_secs(cfg.template_refresh_secs),
-    };
+    let (parent_tx, parent_rx) = watch::channel::<Option<Arc<WorkTemplate>>>(None);
+    let source = template_source(&chains.parent);
     let token = shutdown.child_token();
     tasks.spawn(async move {
-        source.run(work_tx, token).await;
+        source.run(parent_tx, token).await;
         "template source"
+    });
+    let mut aux_rxs = Vec::with_capacity(chains.aux.len());
+    for node in &chains.aux {
+        let (aux_tx, aux_rx) = watch::channel::<Option<Arc<WorkTemplate>>>(None);
+        let source = template_source(node);
+        let token = shutdown.child_token();
+        tasks.spawn(async move {
+            source.run(aux_tx, token).await;
+            "aux template source"
+        });
+        aux_rxs.push(aux_rx);
+    }
+    let token = shutdown.child_token();
+    tasks.spawn(async move {
+        merge(parent_rx, aux_rxs, work_tx, token).await;
+        "work merger"
     });
 
     let bound = StratumServer {
         config: config.stratum.clone(),
         work: work_rx.clone(),
-        payouts: parent.payouts.clone(),
+        payouts: Arc::new(chains.payout_set()),
         events: events_tx,
         blocks: blocks_tx,
     }
@@ -215,24 +294,31 @@ pub async fn run(
         "stratum"
     });
 
+    let rpcs: HashMap<&'static str, RpcClient> = chains
+        .nodes()
+        .map(|node| (node.coin.symbol(), node.rpc.clone()))
+        .collect();
     tasks.spawn(submitter(
-        parent.rpc.clone(),
+        rpcs,
         store.clone(),
         blocks_rx,
         shutdown.child_token(),
     ));
-    tasks.spawn(tracker(
-        parent.rpc.clone(),
-        parent.coin.clone(),
-        store.clone(),
-        shutdown.child_token(),
-    ));
+    for node in chains.nodes() {
+        tasks.spawn(tracker(
+            node.rpc.clone(),
+            node.coin.clone(),
+            node.chain,
+            store.clone(),
+            shutdown.child_token(),
+        ));
+    }
     tasks.spawn(publisher(
         events_rx,
         work_rx,
         store.clone(),
         state,
-        parent.chain,
+        chains.parent.chain,
         shutdown.child_token(),
     ));
 
@@ -250,7 +336,7 @@ pub async fn run(
 }
 
 async fn submitter(
-    rpc: RpcClient,
+    rpcs: HashMap<&'static str, RpcClient>,
     store: Store,
     mut blocks: mpsc::Receiver<BlockCandidate>,
     shutdown: CancellationToken,
@@ -259,8 +345,12 @@ async fn submitter(
         tokio::select! {
             next = blocks.recv() => {
                 let Some(candidate) = next else { return "submitter" };
-                if let Err(err) = submit_candidate(&rpc, &store, &candidate).await {
-                    tracing::error!(%err, "block submission failed");
+                let Some(rpc) = rpcs.get(candidate.coin) else {
+                    tracing::error!(coin = candidate.coin, "no node for block candidate");
+                    continue;
+                };
+                if let Err(err) = submit_candidate(rpc, &store, &candidate).await {
+                    tracing::error!(coin = candidate.coin, %err, "block submission failed");
                 }
             }
             _ = shutdown.cancelled() => return "submitter",
@@ -271,6 +361,7 @@ async fn submitter(
 async fn tracker(
     rpc: RpcClient,
     coin: Arc<dyn Coin>,
+    chain: Chain,
     store: Store,
     shutdown: CancellationToken,
 ) -> &'static str {
@@ -278,8 +369,8 @@ async fn tracker(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(err) = track_confirmations(&rpc, coin.as_ref(), &store).await {
-                    tracing::warn!(%err, "confirmation tracking failed");
+                if let Err(err) = track_confirmations(&rpc, coin.as_ref(), chain, &store).await {
+                    tracing::warn!(coin = coin.symbol(), %err, "confirmation tracking failed");
                 }
             }
             _ = shutdown.cancelled() => return "tracker",
@@ -326,6 +417,17 @@ async fn publisher(
     }
 }
 
+fn coin_status(w: &WorkTemplate, chain: Chain) -> CoinStatus {
+    CoinStatus {
+        symbol: w.coin.to_string(),
+        chain: chain.to_string(),
+        height: w.height,
+        network_difficulty: w.network_difficulty(),
+        template_age_seconds: now_unix().saturating_sub(w.created_at),
+        coinbase_value: w.coinbase_value,
+    }
+}
+
 fn build_snapshot(
     stats: &Stats,
     work: &WorkReceiver,
@@ -338,18 +440,12 @@ fn build_snapshot(
     let current = work.borrow().clone();
     let coins = current
         .iter()
-        .map(|w| CoinStatus {
-            symbol: w.coin.to_string(),
-            chain: chain.to_string(),
-            height: w.height,
-            network_difficulty: w.network_difficulty(),
-            template_age_seconds: now_unix().saturating_sub(w.created_at),
-            coinbase_value: w.coinbase_value,
-        })
+        .flat_map(|m| std::iter::once(&m.parent).chain(m.aux.iter()))
+        .map(|w| coin_status(w, chain))
         .collect();
     let odds = current
         .as_ref()
-        .map(|w| OddsSummary::compute(hashrate, w.network_difficulty()));
+        .map(|m| OddsSummary::compute(hashrate, m.parent.network_difficulty()));
     PoolSnapshot {
         coins,
         hashrate,

@@ -12,8 +12,9 @@ next to your own full nodes, and watch your odds of hitting the next block in re
 - **Odds visualizer.** Probability of a block in the next hour, day, week, and year, expected
   time to block, and luck versus expectation, all live.
 
-> Status: Litecoin solo mining works end to end on regtest, including MWEB blocks.
-> Dogecoin merge mining is next. See [docs/ROADMAP.md](docs/ROADMAP.md) for the waves.
+> Status: Litecoin solo mining and Dogecoin merge mining work end to end on regtest,
+> including Litecoin MWEB blocks. Persistence, stats, and the dashboard are next. See
+> [docs/ROADMAP.md](docs/ROADMAP.md) for the waves.
 
 ## Layout
 
@@ -55,28 +56,36 @@ cargo test --workspace
 
 ## Regtest
 
-A throwaway Litecoin regtest node lives in `deploy/regtest`:
+Throwaway Litecoin and Dogecoin regtest nodes live in `deploy/regtest` (Dogecoin runs as a
+pair, because `dogecoind` refuses to hand out block templates without a peer):
 
 ```bash
 docker compose -f deploy/regtest/docker-compose.yml up -d --build
-./deploy/regtest/activate-mweb.sh          # optional: mine past MWEB activation
+./deploy/regtest/prepare-dogecoin.sh       # mine the 20 blocks Dogecoin needs before auxpow
+./deploy/regtest/activate-mweb.sh          # optional: mine Litecoin past MWEB activation
 cargo run -p alamo -- --config config/alamo.regtest.toml
 ```
 
-The end-to-end test mines a real block through the stratum path and verifies the node
-accepted it and that the coinbase paid the worker's address:
+The end-to-end test mines a real share through the stratum path and verifies that both
+nodes accepted the resulting blocks and that each coinbase paid the worker's address:
 
 ```bash
-ALAMO_REGTEST_RPC=http://alamo:alamo@127.0.0.1:19443 cargo test -p alamo --test regtest -- --nocapture
+ALAMO_REGTEST_RPC=http://alamo:alamo@127.0.0.1:19443 \
+ALAMO_REGTEST_DOGE_RPC=http://alamo:alamo@127.0.0.1:18332 \
+  cargo test -p alamo --test regtest -- --nocapture
 ```
+
+Leave `ALAMO_REGTEST_DOGE_RPC` unset to test Litecoin alone.
 
 ## Configuration
 
 Copy `config/alamo.example.toml` to `alamo.toml` and edit it. Miners connect with their
 payout address as the stratum username (ckpool style), for example
 `ltc1q...` for Litecoin. A worker name can be appended after a dot: `ltc1q....rig1`.
-For merge mining, DOGE payout addresses are provided per worker via the password field or
-a configured fallback. Details are in the example config.
+
+The Dogecoin payout address goes in the stratum password, either bare (`D...`) or tagged
+(`doge=D...`, alongside anything else the miner sends there such as `d=1024`). Workers that
+do not supply one are paid at the configured fallback address, and the dashboard says so.
 
 ## License
 

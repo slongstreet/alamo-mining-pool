@@ -9,6 +9,7 @@
 
 pub mod address;
 pub mod algo;
+pub mod auxpow;
 pub mod coinbase;
 pub mod encode;
 pub mod hash;
@@ -27,6 +28,6 @@ pub use coinbase::CoinbaseParts;
 pub use hash::Hash256;
 pub use header::BlockHeader;
 pub use job::{JobId, RejectReason, ShareOutcome};
-pub use payout::{Payout, PayoutTable};
+pub use payout::{AuxPayout, AuxPayoutTable, Payout, PayoutSet, PayoutTable, Payouts};
 pub use target::Target;
-pub use work::{TemplateTx, WorkTemplate};
+pub use work::{MergedWork, TemplateTx, WorkTemplate};

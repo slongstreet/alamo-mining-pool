@@ -2,7 +2,7 @@
 
 use alamo_core::odds::HASHES_PER_DIFF1;
 use alamo_stratum::PoolEvent;
-use alamo_web::WorkerStatus;
+use alamo_web::{AuxPayoutStatus, WorkerStatus};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,7 @@ const HASHRATE_WINDOW: Duration = Duration::from_secs(600);
 struct WorkerStats {
     address: String,
     fallback: bool,
+    aux: Vec<AuxPayoutStatus>,
     sessions: HashSet<u64>,
     difficulty: f64,
     accepted: u64,
@@ -40,10 +41,19 @@ impl Stats {
                 worker,
                 address,
                 fallback,
+                aux,
             } => {
                 let w = self.workers.entry(worker).or_default();
                 w.address = address;
                 w.fallback = fallback;
+                w.aux = aux
+                    .into_iter()
+                    .map(|a| AuxPayoutStatus {
+                        coin: a.coin.to_string(),
+                        address: a.address,
+                        fallback: a.fallback,
+                    })
+                    .collect();
                 w.sessions.insert(session);
             }
             PoolEvent::Disconnected { session, workers } => {
@@ -107,6 +117,7 @@ impl Stats {
                 name: name.clone(),
                 address: w.address.clone(),
                 fallback: w.fallback,
+                aux_payouts: w.aux.clone(),
                 connections: w.sessions.len(),
                 difficulty: w.difficulty,
                 hashrate: hashrate(&w.window, now),
@@ -160,6 +171,7 @@ mod tests {
                 worker: "a".into(),
                 address: "x".into(),
                 fallback: false,
+                aux: Vec::new(),
             },
             t0,
         );

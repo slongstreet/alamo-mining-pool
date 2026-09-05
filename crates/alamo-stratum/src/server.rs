@@ -5,9 +5,9 @@ use crate::events::{BlockCandidate, PoolEvent};
 use crate::job::EXTRANONCE1_LEN;
 use crate::protocol::Request;
 use crate::session::{Effects, Outgoing, Session};
-use alamo_core::payout::PayoutTable;
+use alamo_core::payout::PayoutSet;
 use alamo_core::time::now_unix;
-use alamo_core::work::WorkTemplate;
+use alamo_core::work::MergedWork;
 use futures::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 /// Maximum accepted line length. Miners send small messages; anything larger is abuse.
 const MAX_LINE_LEN: usize = 16 * 1024;
 
-/// Receives the latest work template; `None` until the first template arrives.
-pub type WorkReceiver = watch::Receiver<Option<Arc<WorkTemplate>>>;
+/// Receives the latest work; `None` until the first parent template arrives.
+pub type WorkReceiver = watch::Receiver<Option<Arc<MergedWork>>>;
 
 /// Errors from the listener.
 #[derive(Debug, thiserror::Error)]
@@ -42,8 +42,8 @@ pub struct StratumServer {
     pub config: StratumConfig,
     /// Source of work templates.
     pub work: WorkReceiver,
-    /// Maps usernames to payout scripts.
-    pub payouts: Arc<PayoutTable>,
+    /// Maps usernames and passwords to payout scripts on every chain.
+    pub payouts: Arc<PayoutSet>,
     /// Where session events go.
     pub events: mpsc::Sender<PoolEvent>,
     /// Where found blocks go.
@@ -109,8 +109,8 @@ impl Bound {
     }
 }
 
-/// Read the current template, dropping the watch guard before any await.
-fn latest(work: &mut WorkReceiver) -> Option<Arc<WorkTemplate>> {
+/// Read the current work, dropping the watch guard before any await.
+fn latest(work: &mut WorkReceiver) -> Option<Arc<MergedWork>> {
     work.borrow_and_update().clone()
 }
 
@@ -223,7 +223,7 @@ async fn apply(
             tracing::warn!(%err, "dropping pool event");
         }
     }
-    if let Some(block) = fx.block {
+    for block in fx.blocks {
         tracing::info!(coin = block.coin, height = block.height, hash = %block.block_hash, worker = %block.worker, "BLOCK FOUND");
         if server.blocks.send(block).await.is_err() {
             tracing::error!("block submitter is gone; block candidate lost");

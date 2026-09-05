@@ -1,24 +1,27 @@
-//! End-to-end test against a Litecoin regtest node.
+//! End-to-end test against Litecoin (and optionally Dogecoin) regtest nodes.
 //!
 //! Skipped unless `ALAMO_REGTEST_RPC` is set, e.g.
-//! `ALAMO_REGTEST_RPC=http://alamo:alamo@127.0.0.1:19443`.
+//! `ALAMO_REGTEST_RPC=http://alamo:alamo@127.0.0.1:19443`. When `ALAMO_REGTEST_DOGE_RPC`
+//! is also set, Dogecoin is merge-mined and the test checks that the same share yields an
+//! accepted Dogecoin block paying the address given in the stratum password.
 //!
-//! Starts the template source and stratum server in-process, connects a miniature stratum
-//! client that mines a share with scrypt on the CPU, and checks that the resulting block is
-//! accepted by the node and pays the address the client authorized with.
+//! Starts the template sources and stratum server in-process, connects a miniature stratum
+//! client that mines a share with scrypt on the CPU, and checks that the resulting blocks
+//! are accepted by the nodes and pay the addresses the client authorized with.
 
 use alamo::pool::{submit_candidate, SubmitOutcome};
-use alamo_coins::{Chain, Coin, Litecoin, RpcClient, TemplateSource};
-use alamo_core::address::{encode_segwit, payout_script};
+use alamo_coins::{merge, Chain, Coin, Dogecoin, Litecoin, RpcClient, TemplateSource};
+use alamo_core::address::{encode_base58, encode_segwit, payout_script};
+use alamo_core::auxpow::MERGED_MINING_MAGIC;
 use alamo_core::hash::{from_display_hex, sha256d, to_display_hex};
 use alamo_core::header::BlockHeader;
 use alamo_core::merkle::root_from_branch;
-use alamo_core::payout::PayoutTable;
+use alamo_core::payout::{AuxPayoutTable, PayoutSet, PayoutTable};
 use alamo_core::target::Target;
 use alamo_core::Algorithm;
 use alamo_store::Store;
 use alamo_stratum::job::prevhash_from_stratum;
-use alamo_stratum::{PoolEvent, StratumConfig, StratumServer, VardiffConfig};
+use alamo_stratum::{BlockCandidate, PoolEvent, StratumConfig, StratumServer, VardiffConfig};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +31,9 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 const SHARE_DIFFICULTY: f64 = 0.0000005;
+
+/// Dogecoin regtest rejects auxpow blocks before this height.
+const DOGE_AUXPOW_START: u64 = 20;
 
 #[tokio::test]
 async fn mines_a_block_on_regtest() {
@@ -39,15 +45,43 @@ async fn mines_a_block_on_regtest() {
     let info = rpc.get_blockchain_info().await.expect("node reachable");
     assert_eq!(info.chain, "regtest", "this test only runs against regtest");
 
+    let doge_rpc = std::env::var("ALAMO_REGTEST_DOGE_RPC").ok().map(|url| {
+        RpcClient::from_url_with_userinfo(&url).expect("ALAMO_REGTEST_DOGE_RPC must be a URL")
+    });
+    if let Some(doge_rpc) = &doge_rpc {
+        let doge_info = doge_rpc
+            .get_blockchain_info()
+            .await
+            .expect("dogecoin node reachable");
+        assert_eq!(doge_info.chain, "regtest");
+        assert!(
+            doge_info.blocks >= DOGE_AUXPOW_START,
+            "dogecoin regtest needs {DOGE_AUXPOW_START}+ blocks before auxpow is allowed; run deploy/regtest/prepare-dogecoin.sh"
+        );
+    }
+
     let coin: Arc<dyn Coin> = Arc::new(Litecoin);
     let params = coin.address_params(Chain::Regtest);
     let address = encode_segwit("rltc", 0, &[0x11; 20]).unwrap();
     let script = payout_script(&address, &params).unwrap();
     let fallback = encode_segwit("rltc", 0, &[0x22; 20]).unwrap();
-    let payouts = Arc::new(PayoutTable::new(params, &fallback).unwrap());
+    let doge_params = Dogecoin.address_params(Chain::Regtest);
+    let doge_address = encode_base58(111, &[0x33; 20]);
+    let doge_script = payout_script(&doge_address, &doge_params).unwrap();
+    let doge_fallback = encode_base58(111, &[0x44; 20]);
+    let payouts = Arc::new(PayoutSet {
+        parent: PayoutTable::new(params, &fallback).unwrap(),
+        aux: doge_rpc
+            .iter()
+            .map(|_| AuxPayoutTable {
+                coin: "DOGE",
+                table: PayoutTable::new(doge_params.clone(), &doge_fallback).unwrap(),
+            })
+            .collect(),
+    });
 
     let shutdown = CancellationToken::new();
-    let (work_tx, work_rx) = watch::channel(None);
+    let (parent_tx, parent_rx) = watch::channel(None);
     tokio::spawn(
         TemplateSource {
             rpc: rpc.clone(),
@@ -56,8 +90,25 @@ async fn mines_a_block_on_regtest() {
             poll_interval: Duration::from_millis(200),
             refresh_interval: Duration::from_secs(30),
         }
-        .run(work_tx, shutdown.child_token()),
+        .run(parent_tx, shutdown.child_token()),
     );
+    let mut aux_rxs = Vec::new();
+    if let Some(doge_rpc) = &doge_rpc {
+        let (aux_tx, aux_rx) = watch::channel(None);
+        tokio::spawn(
+            TemplateSource {
+                rpc: doge_rpc.clone(),
+                coin: Arc::new(Dogecoin),
+                coinbase_tag: b"/alamo-test/".to_vec(),
+                poll_interval: Duration::from_millis(200),
+                refresh_interval: Duration::from_secs(30),
+            }
+            .run(aux_tx, shutdown.child_token()),
+        );
+        aux_rxs.push(aux_rx);
+    }
+    let (work_tx, work_rx) = watch::channel(None);
+    tokio::spawn(merge(parent_rx, aux_rxs, work_tx, shutdown.child_token()));
 
     let (events_tx, mut events_rx) = mpsc::channel::<PoolEvent>(256);
     let (blocks_tx, mut blocks_rx) = mpsc::channel(4);
@@ -98,9 +149,14 @@ async fn mines_a_block_on_regtest() {
     assert_eq!(en2_size, 4);
 
     let worker = format!("{address}.rig1");
+    let password = if doge_rpc.is_some() {
+        doge_address.clone()
+    } else {
+        "x".to_string()
+    };
     send(
         &mut writer,
-        json!({"id": 2, "method": "mining.authorize", "params": [worker, "x"]}),
+        json!({"id": 2, "method": "mining.authorize", "params": [worker, password]}),
     )
     .await;
     let auth = read_until(&mut lines, |m| m["id"] == 2).await;
@@ -108,7 +164,18 @@ async fn mines_a_block_on_regtest() {
     let diff_msg = read_until(&mut lines, |m| m["method"] == "mining.set_difficulty").await;
     let difficulty = diff_msg["params"][0].as_f64().unwrap();
     assert!((difficulty - SHARE_DIFFICULTY).abs() < 1e-12);
-    let notify = read_until(&mut lines, |m| m["method"] == "mining.notify").await;
+
+    // With merge mining, wait for a job whose coinbase carries the aux commitment; the
+    // Litecoin-only job may arrive first if dogecoind answered later.
+    let notify = read_until(&mut lines, |m| {
+        m["method"] == "mining.notify"
+            && (doge_rpc.is_none()
+                || hex::decode(m["params"][2].as_str().unwrap_or_default())
+                    .unwrap_or_default()
+                    .windows(4)
+                    .any(|w| w == MERGED_MINING_MAGIC))
+    })
+    .await;
     let p = &notify["params"];
     let job_id = p[0].as_str().unwrap().to_string();
     let prev_hash = prevhash_from_stratum(p[1].as_str().unwrap()).unwrap();
@@ -129,8 +196,10 @@ async fn mines_a_block_on_regtest() {
     let bits = u32::from_str_radix(p[6].as_str().unwrap(), 16).unwrap();
     let ntime = u32::from_str_radix(p[7].as_str().unwrap(), 16).unwrap();
     assert_eq!(prev_hash, from_display_hex(&info.bestblockhash).unwrap());
-    let template = work_rx.borrow().clone().expect("template published");
+    let merged = work_rx.borrow().clone().expect("work published");
+    let template = merged.parent.clone();
     assert_eq!(template.height, info.blocks + 1);
+    assert_eq!(merged.aux.len(), usize::from(doge_rpc.is_some()));
 
     // Mine like an ASIC would, on the CPU.
     let extranonce2 = [0u8, 0, 0, 7];
@@ -176,10 +245,17 @@ async fn mines_a_block_on_regtest() {
     .expect("share event");
     assert_eq!(share_event, None);
 
-    let candidate = tokio::time::timeout(Duration::from_secs(5), blocks_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    // Regtest targets are equal on both chains, so one share is a block on each.
+    let mut candidates: Vec<BlockCandidate> = Vec::new();
+    for _ in 0..1 + merged.aux.len() {
+        candidates.push(
+            tokio::time::timeout(Duration::from_secs(5), blocks_rx.recv())
+                .await
+                .expect("block candidate")
+                .unwrap(),
+        );
+    }
+    let candidate = candidates.iter().find(|c| c.coin == "LTC").unwrap();
     assert_eq!(candidate.height, template.height);
     assert_eq!(candidate.address, address);
     header.nonce = nonce;
@@ -192,7 +268,7 @@ async fn mines_a_block_on_regtest() {
     )
     .await
     .unwrap();
-    let outcome = submit_candidate(&rpc, &store, &candidate).await.unwrap();
+    let outcome = submit_candidate(&rpc, &store, candidate).await.unwrap();
     assert_eq!(outcome, SubmitOutcome::Accepted, "node rejected our block");
 
     assert_eq!(rpc.get_block_count().await.unwrap(), template.height);
@@ -203,15 +279,40 @@ async fn mines_a_block_on_regtest() {
         coinbase_out["scriptPubKey"]["hex"].as_str().unwrap(),
         hex::encode(&script)
     );
-    let addresses = coinbase_out["scriptPubKey"]["address"]
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| {
-            coinbase_out["scriptPubKey"]["addresses"][0]
-                .as_str()
-                .map(str::to_string)
-        });
-    assert_eq!(addresses.as_deref(), Some(address.as_str()));
+    assert_eq!(
+        script_address(coinbase_out).as_deref(),
+        Some(address.as_str())
+    );
+
+    if let Some(doge_rpc) = &doge_rpc {
+        let doge_template = merged.aux[0].clone();
+        let doge = candidates.iter().find(|c| c.coin == "DOGE").unwrap();
+        assert_eq!(doge.height, doge_template.height);
+        assert_eq!(doge.address, doge_address);
+        let outcome = submit_candidate(doge_rpc, &store, doge).await.unwrap();
+        assert_eq!(
+            outcome,
+            SubmitOutcome::Accepted,
+            "dogecoin node rejected our merge-mined block"
+        );
+        assert_eq!(doge_rpc.get_block_count().await.unwrap(), doge.height);
+        let block = doge_rpc.get_block_verbose(&doge.block_hash).await.unwrap();
+        assert_eq!(block["height"].as_u64().unwrap(), doge.height);
+        assert_eq!(block["versionHex"].as_str().unwrap(), "00620104");
+        let coinbase_out = &block["tx"][0]["vout"][0];
+        assert_eq!(
+            coinbase_out["scriptPubKey"]["hex"].as_str().unwrap(),
+            hex::encode(&doge_script)
+        );
+        assert_eq!(
+            script_address(coinbase_out).as_deref(),
+            Some(doge_address.as_str())
+        );
+        eprintln!(
+            "merge-mined DOGE block {} at height {} (parent LTC {})",
+            doge.block_hash, doge.height, candidate.block_hash
+        );
+    }
 
     // The pool sees the new tip and hands out clean work for the next height.
     let next = tokio::time::timeout(Duration::from_secs(5), async {
@@ -231,6 +332,18 @@ async fn mines_a_block_on_regtest() {
     );
 
     shutdown.cancel();
+}
+
+/// The address a decoded scriptPubKey pays, across node versions.
+fn script_address(vout: &Value) -> Option<String> {
+    vout["scriptPubKey"]["address"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            vout["scriptPubKey"]["addresses"][0]
+                .as_str()
+                .map(str::to_string)
+        })
 }
 
 async fn send(writer: &mut tokio::net::tcp::OwnedWriteHalf, v: Value) {

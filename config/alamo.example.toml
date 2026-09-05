@@ -45,5 +45,6 @@ rpc_url = "http://127.0.0.1:22555"
 rpc_user = "alamo"
 rpc_password = "change-me"
 # zmq_hashblock = "tcp://127.0.0.1:28333"
-# Paid when a worker does not supply a DOGE address in the stratum password field.
+# Miners put their DOGE address in the stratum password field, bare ("D...") or tagged
+# ("doge=D..."). This address is paid when a worker does not supply one.
 fallback_address = "DExampleExampleExampleExampleExampl"

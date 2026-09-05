@@ -32,12 +32,25 @@ Work proceeds in waves. Each wave ends with something runnable and tested.
   the stratum path and checks the coinbase pays the worker's address. CI runs it.
 - Status API (`/api/status`) with workers, hashrate, blocks, and block odds.
 
-## Wave 2 — DOGE merge mining
-- `dogecoind` template fetching and auxpow block submission.
-- Aux merkle tree commitment in the LTC coinbase (`fabe6d6d` magic, chain id slot).
-- AuxPow serialization: coinbase tx, coinbase branch, blockchain branch, parent header.
-- Per-worker DOGE payout address (password field or fallback).
-- Regtest verification of a merge-mined DOGE block.
+## Wave 2 — DOGE merge mining (done)
+- `dogecoind` template source (same poller as Litecoin) and `submitblock` of auxpow blocks.
+  Dogecoin's template version already carries chain id 98; the auxpow flag is added.
+- Aux merkle tree (`alamo-core::auxpow`): `fabe6d6d` magic, root in display order, size
+  and nonce, chain slots from `getExpectedIndex`. One aux chain today, but the tree builder
+  handles several.
+- AuxPow serialization: parent coinbase (non-witness), parent hash, coinbase branch, chain
+  branch, chain index, parent header. Known-answer test round-trips Dogecoin mainnet block
+  371,337 byte for byte and re-verifies every check `CAuxPow::check` performs.
+- Merged work: parent and aux templates combine into one `MergedWork`; an aux tip change
+  produces a non-clean job so parent shares stay valid, and the old job's aux block is
+  marked stale. Sessions build the aux coinbase and header first, commit the aux block
+  hash in the parent coinbase, and a share that meets any chain's target yields a block
+  candidate for that chain.
+- Per-worker DOGE payout address from the stratum password (`D...` or `doge=D...`), with
+  the configured fallback otherwise; reported on the status API.
+- Regtest harness runs `dogecoind` plus a peer (Dogecoin requires one for templates),
+  `prepare-dogecoin.sh` mines past the auxpow start height, and the end-to-end test submits
+  the same share as a Litecoin block and a merge-mined Dogecoin block. CI runs it.
 
 ## Wave 3 — Persistence and stats
 - Share accounting, hashrate samples (per worker, per pool), blocks found, worker last-seen.

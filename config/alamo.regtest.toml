@@ -27,3 +27,12 @@ rpc_password = "alamo"
 # Any regtest bech32 address; miners normally supply their own as the username.
 fallback_address = "rltc1qyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zwc5c93"
 coinbase_tag = "/alamo/"
+
+[coins.doge]
+enabled = true
+merge_mined_with = "ltc"
+rpc_url = "http://127.0.0.1:18332"
+rpc_user = "alamo"
+rpc_password = "alamo"
+# Any regtest Dogecoin address; miners supply their own in the stratum password field.
+fallback_address = "midSACfDe3qAxJZZXA9gkwBZgPqJJUpy1w"

@@ -159,13 +159,14 @@ impl Store {
         )
     }
 
-    /// Blocks whose final status is not yet known.
-    pub async fn unsettled_blocks(&self) -> Result<Vec<BlockRow>, StoreError> {
-        Ok(
-            sqlx::query_as("SELECT * FROM blocks WHERE status = 'accepted' ORDER BY height")
-                .fetch_all(&self.pool)
-                .await?,
+    /// Blocks of one coin whose final status is not yet known.
+    pub async fn unsettled_blocks(&self, coin: &str) -> Result<Vec<BlockRow>, StoreError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM blocks WHERE coin = ? AND status = 'accepted' ORDER BY height",
         )
+        .bind(coin)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// Update a block's status and confirmation count.
@@ -224,12 +225,13 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(store.unsettled_blocks().await.unwrap().len(), 1);
+        assert_eq!(store.unsettled_blocks("LTC").await.unwrap().len(), 1);
+        assert!(store.unsettled_blocks("DOGE").await.unwrap().is_empty());
         store
             .set_block_status(id, BlockStatus::Confirmed, 120)
             .await
             .unwrap();
-        assert!(store.unsettled_blocks().await.unwrap().is_empty());
+        assert!(store.unsettled_blocks("LTC").await.unwrap().is_empty());
         let recent = store.recent_blocks(5).await.unwrap();
         assert_eq!(recent[0].status, BlockStatus::Confirmed);
         assert_eq!(recent[0].confirmations, 120);

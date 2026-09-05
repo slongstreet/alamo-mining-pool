@@ -2,6 +2,7 @@
 
 use alamo_core::coinbase::CoinbaseParts;
 use alamo_core::hash::Hash256;
+use alamo_core::header::BlockHeader;
 use alamo_core::job::JobId;
 use alamo_core::target::Target;
 use alamo_core::work::WorkTemplate;
@@ -19,10 +20,13 @@ pub const EXTRANONCE2_LEN: usize = 4;
 pub struct SessionJob {
     /// Session-local job id.
     pub id: JobId,
-    /// The template this job was derived from.
+    /// The parent template this job was derived from.
     pub work: Arc<WorkTemplate>,
-    /// Coinbase split around the extranonce, paying this session's address.
+    /// Parent coinbase split around the extranonce, paying this session's address and
+    /// committing to the aux blocks below.
     pub coinbase: CoinbaseParts,
+    /// Aux chain blocks committed to in the parent coinbase.
+    pub aux: Vec<AuxJob>,
     /// Share difficulty in force for this job.
     pub difficulty: f64,
     /// Share target derived from `difficulty`.
@@ -31,6 +35,28 @@ pub struct SessionJob {
     pub stale: bool,
     /// Shares already accepted, keyed by (extranonce2, ntime, nonce).
     pub seen: HashSet<(u32, u32, u32)>,
+}
+
+/// An aux chain block ready to be proven by this job's parent header.
+#[derive(Debug)]
+pub struct AuxJob {
+    /// The aux template.
+    pub work: Arc<WorkTemplate>,
+    /// Address the aux coinbase pays.
+    pub address: String,
+    /// Complete aux coinbase transaction.
+    pub coinbase: Vec<u8>,
+    /// Aux block header; its hash is what the parent coinbase commits to.
+    pub header: BlockHeader,
+    /// `header.block_hash()`.
+    pub hash: Hash256,
+    /// Slot of this chain in the aux merkle tree.
+    pub chain_index: u32,
+    /// Branch from `hash` to the aux merkle root.
+    pub chain_branch: Vec<Hash256>,
+    /// Set once the aux chain's tip moved past this block's parent; parent shares on the
+    /// job stay valid but the aux block would be an orphan.
+    pub stale: bool,
 }
 
 impl SessionJob {
