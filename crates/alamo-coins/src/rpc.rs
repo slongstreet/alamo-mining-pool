@@ -94,6 +94,9 @@ impl RpcClient {
         user: impl Into<String>,
         password: impl Into<String>,
     ) -> Self {
+        // reqwest is built without a TLS provider so the release binaries stay free of
+        // aws-lc; pick ring once for the whole process. Installing twice is harmless.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()

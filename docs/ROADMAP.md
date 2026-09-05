@@ -81,8 +81,10 @@ Work proceeds in waves. Each wave ends with something runnable and tested.
   node health on the dashboard and in metrics, withdraw templates from nodes that stay
   unreachable past `template_stale_secs`, refetch when they return.
 - [x] Prometheus metrics at `/metrics`.
-- Release builds for x86-64 and arm64 Linux, multi-arch Docker image.
-- Operator docs.
+- [x] Release builds: static musl binaries for x86-64 and arm64 Linux built natively per
+  architecture, a GitHub release per `vX.Y.Z` tag, and a multi-arch distroless image on
+  GHCR assembled from those binaries.
+- [x] Operator docs in `docs/OPERATING.md`.
 
 ## Later
 - Additional coins via the `Coin` abstraction (BTC/BCH sha256d solo are cheap).
