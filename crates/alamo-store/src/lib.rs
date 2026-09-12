@@ -1,17 +1,19 @@
 //! SQLite persistence.
 //!
 //! One database file, WAL mode, migrations embedded at compile time. Workers, shares,
-//! hashrate samples, and blocks survive a restart; jobs and sessions do not.
+//! hashrate samples, rounds, and blocks survive a restart; jobs and sessions do not.
 
 #![forbid(unsafe_code)]
 
 mod accounting;
 mod blocks;
 mod retention;
+mod rounds;
 
 pub use accounting::{AuxPayoutRecord, HashrateSample, NewShare, ShareRow, WorkerRow, WorkerWrite};
 pub use blocks::{BlockRow, BlockStatus, NewBlock};
 pub use retention::{RetentionPolicy, RetentionReport};
+pub use rounds::RoundRow;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;

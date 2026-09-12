@@ -70,7 +70,7 @@ pub struct NewShare {
 }
 
 /// A stored share.
-#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+#[derive(Clone, Debug, PartialEq, Serialize, sqlx::FromRow)]
 pub struct ShareRow {
     /// Row id.
     pub id: i64,
@@ -89,7 +89,7 @@ pub struct ShareRow {
 }
 
 /// One hashrate sample.
-#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+#[derive(Clone, Debug, PartialEq, Serialize, sqlx::FromRow)]
 pub struct HashrateSample {
     /// Unix time of the sample, aligned to the sample interval.
     pub ts: i64,
@@ -214,6 +214,19 @@ impl Store {
             .bind(rejected)
             .bind(best)
             .bind(&s.worker)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let accepted: Vec<&NewShare> = shares.iter().filter(|s| s.accepted).collect();
+        if !accepted.is_empty() {
+            let work: f64 = accepted.iter().map(|s| s.difficulty).sum();
+            let best = accepted.iter().map(|s| s.share_diff).fold(0.0, f64::max);
+            sqlx::query(
+                "UPDATE rounds SET work = work + ?, shares = shares + ?, best_share = MAX(best_share, ?)",
+            )
+            .bind(work)
+            .bind(accepted.len() as i64)
+            .bind(best)
             .execute(&mut *tx)
             .await?;
         }

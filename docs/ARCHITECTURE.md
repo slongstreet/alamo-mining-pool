@@ -52,8 +52,12 @@ startup the publisher restores worker counters and the hashrate window; jobs and
 are rebuilt from the current template when miners reconnect.
 
 ### alamo-web
-Axum router. `/api/*` JSON endpoints, `/api/ws` for live updates, and everything else served
-from the embedded `web/dist`. The dashboard is a Svelte SPA.
+Axum router. `/api/status` is the status document the daemon publishes every two seconds;
+`/api/ws` pushes the same document on every publish plus each share as it is processed
+(`{"type": "status" | "share", "data": ...}`, slow clients skip ahead). `/api/hashrate`,
+`/api/shares`, and `/api/blocks` read history from the store. Everything else is served
+from the embedded `web/dist`. The dashboard is a Svelte SPA that drives itself from the
+socket and falls back to polling.
 
 ### alamo
 Config loading and validation, tracing setup, task supervision, graceful shutdown.

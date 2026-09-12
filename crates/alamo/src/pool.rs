@@ -5,13 +5,13 @@ use crate::config::Config;
 use crate::persist::Persistence;
 use crate::stats::Stats;
 use alamo_coins::{merge, Chain, Coin, CoinConfig, RpcClient, TemplateSource};
-use alamo_core::odds::OddsSummary;
+use alamo_core::odds::{luck_percent, OddsSummary};
 use alamo_core::payout::{AuxPayoutTable, PayoutSet, PayoutTable};
 use alamo_core::time::now_unix;
 use alamo_core::work::WorkTemplate;
-use alamo_store::{BlockRow, BlockStatus, NewBlock, Store};
+use alamo_store::{BlockRow, BlockStatus, NewBlock, RoundRow, Store};
 use alamo_stratum::{BlockCandidate, PoolEvent, StratumServer, WorkReceiver};
-use alamo_web::{AppState, CoinStatus, PoolSnapshot};
+use alamo_web::{AppState, CoinStatus, PoolSnapshot, RoundStatus, ShareEvent};
 use anyhow::{bail, Context};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -190,6 +190,12 @@ pub async fn submit_candidate(
         })
         .await
         .context("recording block")?;
+    if outcome == SubmitOutcome::Accepted {
+        store
+            .reset_round(candidate.coin, candidate.found_at as i64)
+            .await
+            .context("starting new round")?;
+    }
     Ok(outcome)
 }
 
@@ -247,6 +253,13 @@ pub async fn run(
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let chains = connect_chains(&config).await?;
+    let started = now_unix() as i64;
+    for node in chains.nodes() {
+        store
+            .ensure_round(node.coin.symbol(), started)
+            .await
+            .context("initializing round")?;
+    }
 
     let (work_tx, work_rx) = watch::channel(None);
     let (events_tx, events_rx) = mpsc::channel::<PoolEvent>(4096);
@@ -314,12 +327,21 @@ pub async fn run(
             shutdown.child_token(),
         ));
     }
+    let coin_infos = chains
+        .nodes()
+        .map(|node| CoinInfo {
+            symbol: node.coin.symbol(),
+            name: node.coin.name(),
+            chain: node.chain,
+            coinbase_maturity: node.coin.coinbase_maturity(node.chain),
+        })
+        .collect();
     tasks.spawn(publisher(
         events_rx,
         work_rx,
         store.clone(),
         state,
-        chains.parent.chain,
+        coin_infos,
         shutdown.child_token(),
     ));
 
@@ -381,16 +403,49 @@ async fn tracker(
 
 /// How often the snapshot is rebuilt.
 const PUBLISH_INTERVAL: Duration = Duration::from_secs(2);
-/// How often the block list is re-read from the database (it only changes on submit or
-/// on the tracker's 30 s tick).
-const BLOCKS_REFRESH_TICKS: u32 = 5;
+/// How often blocks and rounds are re-read from the database (blocks only change on
+/// submit or on the tracker's 30 s tick; rounds advance with each accounting flush).
+const DB_REFRESH_TICKS: u32 = 5;
+
+/// Static facts about a mined coin, for the status document.
+#[derive(Clone, Debug)]
+pub struct CoinInfo {
+    /// Ticker.
+    pub symbol: &'static str,
+    /// Full name.
+    pub name: &'static str,
+    /// Network the node is on.
+    pub chain: Chain,
+    /// Confirmations before a block's reward can be spent.
+    pub coinbase_maturity: i64,
+}
+
+/// Everything the snapshot is built from besides live stats.
+#[derive(Debug, Default)]
+struct Persisted {
+    blocks: Vec<BlockRow>,
+    rounds: Vec<RoundRow>,
+}
+
+impl Persisted {
+    async fn refresh(&mut self, store: &Store) {
+        match store.recent_blocks(25).await {
+            Ok(rows) => self.blocks = rows,
+            Err(err) => tracing::warn!(%err, "could not load recent blocks"),
+        }
+        match store.rounds().await {
+            Ok(rows) => self.rounds = rows,
+            Err(err) => tracing::warn!(%err, "could not load rounds"),
+        }
+    }
+}
 
 async fn publisher(
     mut events: mpsc::Receiver<PoolEvent>,
     work: WorkReceiver,
     store: Store,
     state: AppState,
-    chain: Chain,
+    coins: Vec<CoinInfo>,
     shutdown: CancellationToken,
 ) -> &'static str {
     let now = now_unix();
@@ -409,7 +464,7 @@ async fn publisher(
         }
     };
     let mut persist = Persistence::new(store.clone(), now);
-    let mut blocks: Vec<BlockRow> = Vec::new();
+    let mut persisted = Persisted::default();
     let mut ticks: u32 = 0;
     let mut interval = tokio::time::interval(PUBLISH_INTERVAL);
     loop {
@@ -422,6 +477,9 @@ async fn publisher(
                 let ts = now_unix();
                 persist.observe(&event, ts);
                 stats.apply(&event, ts);
+                if let Some(share) = share_event(&event, ts) {
+                    state.push_share(&share);
+                }
                 if persist.should_flush() {
                     flush_persist(&mut persist).await;
                 }
@@ -430,14 +488,11 @@ async fn publisher(
                 if let Err(err) = persist.on_tick(&stats, now_unix()).await {
                     tracing::warn!(%err, "could not persist accounting");
                 }
-                if ticks % BLOCKS_REFRESH_TICKS == 0 {
-                    match store.recent_blocks(25).await {
-                        Ok(rows) => blocks = rows,
-                        Err(err) => tracing::warn!(%err, "could not load recent blocks"),
-                    }
+                if ticks % DB_REFRESH_TICKS == 0 {
+                    persisted.refresh(&store).await;
                 }
                 ticks = ticks.wrapping_add(1);
-                state.publish(build_snapshot(&stats, &work, blocks.clone(), chain));
+                state.publish(build_snapshot(&stats, &work, &persisted, &coins));
             }
             _ = shutdown.cancelled() => {
                 flush_persist(&mut persist).await;
@@ -453,42 +508,96 @@ async fn flush_persist(persist: &mut Persistence) {
     }
 }
 
-fn coin_status(w: &WorkTemplate, chain: Chain) -> CoinStatus {
+fn share_event(event: &PoolEvent, ts: u64) -> Option<ShareEvent> {
+    match event {
+        PoolEvent::Share {
+            worker,
+            coin,
+            job_difficulty,
+            share_difficulty,
+            rejected,
+            ..
+        } => Some(ShareEvent {
+            ts,
+            worker: worker.clone(),
+            coin: coin.to_string(),
+            difficulty: *job_difficulty,
+            share_diff: *share_difficulty,
+            accepted: rejected.is_none(),
+            reject_reason: rejected.map(|r| r.as_str().to_string()),
+        }),
+        _ => None,
+    }
+}
+
+fn round_status(row: &RoundRow, network_difficulty: f64) -> RoundStatus {
+    RoundStatus {
+        started_at: row.started_at.max(0) as u64,
+        work: row.work,
+        shares: row.shares.max(0) as u64,
+        best_share: row.best_share,
+        expected_work: network_difficulty,
+        luck_percent: luck_percent(network_difficulty, row.work),
+    }
+}
+
+fn coin_status(
+    w: &WorkTemplate,
+    info: &CoinInfo,
+    hashrate: f64,
+    rounds: &[RoundRow],
+    now: u64,
+) -> CoinStatus {
+    let network_difficulty = w.network_difficulty();
     CoinStatus {
         symbol: w.coin.to_string(),
-        chain: chain.to_string(),
+        name: info.name.to_string(),
+        chain: info.chain.to_string(),
         height: w.height,
-        network_difficulty: w.network_difficulty(),
-        template_age_seconds: now_unix().saturating_sub(w.created_at),
+        network_difficulty,
+        template_age_seconds: now.saturating_sub(w.created_at),
         coinbase_value: w.coinbase_value,
+        coinbase_maturity: info.coinbase_maturity,
+        odds: Some(OddsSummary::compute(hashrate, network_difficulty)),
+        round: rounds
+            .iter()
+            .find(|r| r.coin == w.coin)
+            .map(|r| round_status(r, network_difficulty)),
     }
 }
 
 fn build_snapshot(
     stats: &Stats,
     work: &WorkReceiver,
-    blocks: Vec<BlockRow>,
-    chain: Chain,
+    persisted: &Persisted,
+    coins: &[CoinInfo],
 ) -> PoolSnapshot {
     let now = now_unix();
     let workers = stats.workers(now);
     let hashrate = workers.iter().map(|w| w.hashrate).fold(0.0, |a, b| a + b);
+    let best_share_difficulty = workers
+        .iter()
+        .map(|w| w.best_difficulty)
+        .fold(0.0, f64::max);
     let current = work.borrow().clone();
-    let coins = current
+    let coins: Vec<CoinStatus> = current
         .iter()
         .flat_map(|m| std::iter::once(&m.parent).chain(m.aux.iter()))
-        .map(|w| coin_status(w, chain))
+        .filter_map(|w| {
+            let info = coins.iter().find(|c| c.symbol == w.coin)?;
+            Some(coin_status(w, info, hashrate, &persisted.rounds, now))
+        })
         .collect();
-    let odds = current
-        .as_ref()
-        .map(|m| OddsSummary::compute(hashrate, m.parent.network_difficulty()));
+    let odds = coins.first().and_then(|c| c.odds);
     PoolSnapshot {
+        now,
         coins,
         hashrate,
         shares_accepted: stats.shares_accepted(),
         shares_rejected: stats.shares_rejected(),
+        best_share_difficulty,
         workers,
-        blocks,
+        blocks: persisted.blocks.clone(),
         odds,
         ..Default::default()
     }

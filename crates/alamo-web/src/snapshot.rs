@@ -13,7 +13,9 @@ pub struct PoolSnapshot {
     pub version: String,
     /// Seconds since start.
     pub uptime_seconds: u64,
-    /// Chains being mined.
+    /// Unix time the snapshot was built, so clients can render ages without clock skew.
+    pub now: u64,
+    /// Chains being mined, parent first.
     pub coins: Vec<CoinStatus>,
     /// Pool hashrate estimate over the recent window, hashes per second.
     pub hashrate: f64,
@@ -21,6 +23,8 @@ pub struct PoolSnapshot {
     pub shares_accepted: u64,
     /// Rejected shares recorded (lifetime).
     pub shares_rejected: u64,
+    /// Best share difficulty any worker has ever submitted.
+    pub best_share_difficulty: f64,
     /// Workers seen, connected first.
     pub workers: Vec<WorkerStatus>,
     /// Recent blocks, newest first.
@@ -34,6 +38,8 @@ pub struct PoolSnapshot {
 pub struct CoinStatus {
     /// Ticker.
     pub symbol: String,
+    /// Full coin name.
+    pub name: String,
     /// `main`, `test`, or `regtest`.
     pub chain: String,
     /// Height of the block being mined.
@@ -44,6 +50,29 @@ pub struct CoinStatus {
     pub template_age_seconds: u64,
     /// Coinbase value of the current template, in base units.
     pub coinbase_value: u64,
+    /// Confirmations before a found block's reward can be spent.
+    pub coinbase_maturity: i64,
+    /// Block odds for this chain at the current pool hashrate.
+    pub odds: Option<OddsSummary>,
+    /// Work submitted since the last block found on this chain.
+    pub round: Option<RoundStatus>,
+}
+
+/// Progress of the current round on one chain.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct RoundStatus {
+    /// Unix time the round started.
+    pub started_at: u64,
+    /// Accepted work this round, in difficulty-1 shares.
+    pub work: f64,
+    /// Accepted shares this round.
+    pub shares: u64,
+    /// Best share difficulty this round.
+    pub best_share: f64,
+    /// Work expected per block at the current network difficulty, in difficulty-1 shares.
+    pub expected_work: f64,
+    /// Luck: expected work over actual work, as a percentage. 100 is average.
+    pub luck_percent: f64,
 }
 
 /// Status of one worker.
@@ -82,4 +111,23 @@ pub struct AuxPayoutStatus {
     pub address: String,
     /// Whether the fallback address is being paid.
     pub fallback: bool,
+}
+
+/// A share as pushed to the dashboard's live log.
+#[derive(Clone, Debug, Serialize)]
+pub struct ShareEvent {
+    /// Unix time received.
+    pub ts: u64,
+    /// Worker name.
+    pub worker: String,
+    /// Coin ticker of the job.
+    pub coin: String,
+    /// Difficulty the job required.
+    pub difficulty: f64,
+    /// Difficulty the hash achieved.
+    pub share_diff: f64,
+    /// Whether it was accepted.
+    pub accepted: bool,
+    /// Rejection slug, if rejected.
+    pub reject_reason: Option<String>,
 }
