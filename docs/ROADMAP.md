@@ -85,6 +85,9 @@ Work proceeds in waves. Each wave ends with something runnable and tested.
   architecture, a GitHub release per `vX.Y.Z` tag, and a multi-arch distroless image on
   GHCR assembled from those binaries.
 - [x] Operator docs in `docs/OPERATING.md`.
+- [x] `${NAME}` environment variable expansion in the config file, and an Umbrel community
+  store app under `deploy/umbrel/` that takes node endpoints and credentials from the
+  Litecoin and Dogecoin node apps' exports.
 
 ## Later
 - Additional coins via the `Coin` abstraction (BTC/BCH sha256d solo are cheap).

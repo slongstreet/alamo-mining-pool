@@ -1,0 +1,44 @@
+# Alamo Mining Pool on Umbrel. Node endpoints and credentials come from the Litecoin and
+# Dogecoin node apps through environment variables; the daemon substitutes ${NAME} when it
+# reads this file. Edit only the two fallback_address values.
+
+[pool]
+name = "Alamo Solo Pool"
+data_dir = "/var/lib/alamo"
+
+[stratum]
+listen = "0.0.0.0:3333"
+
+[stratum.vardiff]
+initial_difficulty = 65536
+min_difficulty = 1024
+max_difficulty = 16777216
+target_share_seconds = 10
+retarget_seconds = 60
+variance_percent = 30
+
+[web]
+# Reached only through Umbrel's app proxy.
+listen = "0.0.0.0:8080"
+
+[coins.ltc]
+enabled = true
+rpc_url = "http://${APP_LONGSTREET_LITECOIN_NODE_IP}:${APP_LONGSTREET_LITECOIN_RPC_PORT}"
+rpc_user = "${APP_LONGSTREET_LITECOIN_RPC_USER}"
+rpc_password = "${APP_LONGSTREET_LITECOIN_RPC_PASS}"
+zmq_hashblock = "tcp://${APP_LONGSTREET_LITECOIN_NODE_IP}:${APP_LONGSTREET_LITECOIN_ZMQ_HASHBLOCK_PORT}"
+# CHANGE ME: a Litecoin address you control. Paid when a miner's username is not a valid
+# Litecoin address.
+fallback_address = "ltc1qexampleexampleexampleexampleexampleexamp"
+coinbase_tag = "/alamo/"
+
+[coins.doge]
+enabled = true
+merge_mined_with = "ltc"
+rpc_url = "http://${APP_LONGSTREET_DOGECOIN_NODE_IP}:${APP_LONGSTREET_DOGECOIN_RPC_PORT}"
+rpc_user = "${APP_LONGSTREET_DOGECOIN_RPC_USER}"
+rpc_password = "${APP_LONGSTREET_DOGECOIN_RPC_PASS}"
+zmq_hashblock = "tcp://${APP_LONGSTREET_DOGECOIN_NODE_IP}:${APP_LONGSTREET_DOGECOIN_ZMQ_HASHBLOCK_PORT}"
+# CHANGE ME: a Dogecoin address you control. Paid when a miner gives no Dogecoin address in
+# the stratum password field.
+fallback_address = "DExampleExampleExampleExampleExampl"

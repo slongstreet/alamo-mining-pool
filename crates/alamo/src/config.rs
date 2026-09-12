@@ -34,10 +34,15 @@ pub struct PoolConfig {
 }
 
 impl Config {
-    /// Read and validate a config file.
+    /// Read and validate a config file. `${NAME}` anywhere in the file is replaced with
+    /// the environment variable `NAME` before parsing, so secrets such as RPC passwords
+    /// can stay out of the file. An unset variable is an error that names the variable,
+    /// never its value.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
+        let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
+        let text = expand_env(&raw, |name| std::env::var(name).ok())
+            .with_context(|| format!("expanding config {}", path.display()))?;
         let config: Config =
             toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
         config.validate()?;
@@ -87,9 +92,74 @@ impl Config {
     }
 }
 
+/// Replace every `${NAME}` with `lookup(NAME)`. Names are `[A-Za-z0-9_]+`; anything else
+/// after `${` is left untouched so TOML that happens to contain `${` still parses.
+/// Comment lines are copied through unchanged so they can document the syntax.
+fn expand_env(text: &str, lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<String> {
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        if line.trim_start().starts_with('#') {
+            out.push_str(line);
+        } else {
+            expand_line(line, &lookup, &mut out)
+                .with_context(|| format!("config line {}", i + 1))?;
+        }
+    }
+    Ok(out)
+}
+
+fn expand_line(
+    line: &str,
+    lookup: &impl Fn(&str) -> Option<String>,
+    out: &mut String,
+) -> anyhow::Result<()> {
+    let mut rest = line;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let name_len = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let name = &after[..name_len];
+        if name.is_empty() || !after[name_len..].starts_with('}') {
+            out.push_str("${");
+            rest = after;
+            continue;
+        }
+        let value =
+            lookup(name).with_context(|| format!("environment variable {name} is not set"))?;
+        out.push_str(&value);
+        rest = &after[name_len + 1..];
+    }
+    out.push_str(rest);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expands_env_references() {
+        let env = |name: &str| match name {
+            "HOST" => Some("10.21.42.10".to_string()),
+            "PASS" => Some("s3cret".to_string()),
+            _ => None,
+        };
+        let text = "url = \"http://${HOST}:9332\"\npass = \"${PASS}\"\nplain = \"$notavar ${ x}\"";
+        let out = expand_env(text, env).unwrap();
+        assert_eq!(
+            out,
+            "url = \"http://10.21.42.10:9332\"\npass = \"s3cret\"\nplain = \"$notavar ${ x}\""
+        );
+        let err = expand_env("x = \"${MISSING_VAR}\"", env).unwrap_err();
+        assert!(format!("{err:#}").contains("MISSING_VAR"), "{err:#}");
+        assert_eq!(expand_env("no refs", env).unwrap(), "no refs");
+        assert_eq!(
+            expand_env("# use ${MISSING_VAR}\nx = 1\n", env).unwrap(),
+            "# use ${MISSING_VAR}\nx = 1\n"
+        );
+    }
 
     #[test]
     fn example_config_parses_and_validates() {
