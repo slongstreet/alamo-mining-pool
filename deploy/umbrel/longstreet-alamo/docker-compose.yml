@@ -1,0 +1,36 @@
+# Alamo Mining Pool as an Umbrel app. The node apps' exports.sh files provide the
+# APP_LONGSTREET_LITECOIN_* and APP_LONGSTREET_DOGECOIN_* variables; the daemon expands
+# the ${...} references in alamo.toml at startup, so no secret lives in this store.
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: longstreet-alamo_pool_1
+      APP_PORT: 8080
+
+  pool:
+    # Pin by digest; update the tag and digest together on each release.
+    image: ghcr.io/slongstreet/alamo-mining-pool:0.1.0@sha256:73dc320cf0b380c134765999668f8e8741c5adda3dc6a026f17ac5b0175fa872
+    restart: on-failure
+    stop_grace_period: 15s
+    # The image is distroless; run as the umbrel user so the bind-mounted data dir is writable.
+    user: "1000:1000"
+    ports:
+      # Stratum for miners on the LAN. The dashboard goes through app_proxy.
+      - "3333:3333"
+    volumes:
+      - ${APP_DATA_DIR}/alamo.toml:/etc/alamo/alamo.toml:ro
+      - ${APP_DATA_DIR}/data:/var/lib/alamo
+    environment:
+      RUST_LOG: info
+      APP_LONGSTREET_LITECOIN_NODE_IP: ${APP_LONGSTREET_LITECOIN_NODE_IP}
+      APP_LONGSTREET_LITECOIN_RPC_PORT: ${APP_LONGSTREET_LITECOIN_RPC_PORT}
+      APP_LONGSTREET_LITECOIN_RPC_USER: ${APP_LONGSTREET_LITECOIN_RPC_USER}
+      APP_LONGSTREET_LITECOIN_RPC_PASS: ${APP_LONGSTREET_LITECOIN_RPC_PASS}
+      APP_LONGSTREET_LITECOIN_ZMQ_HASHBLOCK_PORT: ${APP_LONGSTREET_LITECOIN_ZMQ_HASHBLOCK_PORT}
+      APP_LONGSTREET_DOGECOIN_NODE_IP: ${APP_LONGSTREET_DOGECOIN_NODE_IP}
+      APP_LONGSTREET_DOGECOIN_RPC_PORT: ${APP_LONGSTREET_DOGECOIN_RPC_PORT}
+      APP_LONGSTREET_DOGECOIN_RPC_USER: ${APP_LONGSTREET_DOGECOIN_RPC_USER}
+      APP_LONGSTREET_DOGECOIN_RPC_PASS: ${APP_LONGSTREET_DOGECOIN_RPC_PASS}
+      APP_LONGSTREET_DOGECOIN_ZMQ_HASHBLOCK_PORT: ${APP_LONGSTREET_DOGECOIN_ZMQ_HASHBLOCK_PORT}

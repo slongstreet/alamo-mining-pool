@@ -29,6 +29,9 @@ listen = "0.0.0.0:8080"
 enabled = true
 rpc_url = "http://127.0.0.1:9332"
 rpc_user = "alamo"
+# Any value may reference an environment variable as "${NAME}"; the daemon substitutes it
+# when the file is read and refuses to start if the variable is unset. Keeps secrets out
+# of the file, e.g. rpc_password = "${LTC_RPC_PASSWORD}".
 rpc_password = "change-me"
 # Optional: instant block notifications from the node's `-zmqpubhashblock` socket.
 # Polling continues as a fallback (every 10 s while ZMQ is up).

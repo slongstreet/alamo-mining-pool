@@ -94,6 +94,25 @@ The compose file uses host networking so the container can reach nodes on
 `127.0.0.1`. Without it, point `rpc_url` and `zmq_hashblock` at an address the container
 can reach (`host.docker.internal` on Docker Desktop) and publish ports 3333 and 8080.
 
+### On Umbrel
+
+`deploy/umbrel/longstreet-alamo/` is a ready-made app for a community app store. It
+depends on the `longstreet-litecoin` and `longstreet-dogecoin` node apps and reads their
+RPC and ZMQ endpoints from the variables those apps export, so no credential is ever
+written into the store. Copy the directory into the store repository, then:
+
+1. Update the image tag and digest in `docker-compose.yml` to the release you want.
+   Environment variable expansion in the config file arrived after 0.1.0, so the app
+   needs a release that includes it.
+2. Install the app from the Umbrel UI. Umbrel copies the directory to the app's data
+   directory and sources the node apps' exports before starting the container.
+3. Edit the two `fallback_address` values in `alamo.toml` under the app's data directory
+   and restart the app.
+4. Point miners at the Umbrel's LAN address on port 3333. The dashboard opens from the
+   Umbrel home screen.
+
+The container runs as the `umbrel` user so it can write the bind-mounted data directory.
+
 ### From source
 
 ```bash
@@ -115,6 +134,7 @@ The dashboard is embedded at build time, so build `web/dist` first.
 | `stratum.vardiff.*` | Share difficulty range and target share interval. |
 | `web.listen` | Dashboard and API. Bind to `127.0.0.1` and put a reverse proxy in front if the box is reachable from the internet; the API has no authentication. |
 | `coins.<coin>.rpc_url`, `rpc_user`, `rpc_password` | Node RPC. The password is never logged. |
+| `${NAME}` in any value | Replaced with the environment variable `NAME` when the file is read; startup fails naming the variable if it is unset. Comment lines are not expanded. |
 | `coins.<coin>.zmq_hashblock` | The node's `zmqpubhashblock` endpoint, `tcp://host:port`. |
 | `coins.<coin>.fallback_address` | Paid when a miner's username is not a valid address. |
 | `coins.<coin>.template_stale_secs` | How long a node may be unreachable before its template is withdrawn (default 120). |
