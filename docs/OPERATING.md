@@ -101,9 +101,8 @@ depends on the `longstreet-litecoin` and `longstreet-dogecoin` node apps and rea
 RPC and ZMQ endpoints from the variables those apps export, so no credential is ever
 written into the store. Copy the directory into the store repository, then:
 
-1. Update the image tag and digest in `docker-compose.yml` to the release you want.
-   Environment variable expansion in the config file arrived after 0.1.0, so the app
-   needs a release that includes it.
+1. Check that the image tag and digest in `docker-compose.yml` are the release you want.
+   The pin is updated with each release.
 2. Install the app from the Umbrel UI. Umbrel copies the directory to the app's data
    directory and sources the node apps' exports before starting the container.
 3. Edit the two `fallback_address` values in `alamo.toml` under the app's data directory
