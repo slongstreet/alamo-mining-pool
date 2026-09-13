@@ -31,6 +31,7 @@ pub struct AppState {
 
 struct Inner {
     pool_name: String,
+    stratum_port: u16,
     started_at: Instant,
     /// The latest status document. WebSocket clients subscribe to it.
     snapshot: watch::Sender<PoolSnapshot>,
@@ -40,10 +41,11 @@ struct Inner {
 
 impl AppState {
     /// Create the application state.
-    pub fn new(pool_name: impl Into<String>, store: Store) -> Self {
+    pub fn new(pool_name: impl Into<String>, stratum_port: u16, store: Store) -> Self {
         Self {
             inner: Arc::new(Inner {
                 pool_name: pool_name.into(),
+                stratum_port,
                 started_at: Instant::now(),
                 snapshot: watch::Sender::new(PoolSnapshot::default()),
                 store,
@@ -74,6 +76,7 @@ impl AppState {
     /// Replace the published status document and wake WebSocket clients.
     pub fn publish(&self, mut snapshot: PoolSnapshot) {
         snapshot.pool_name = self.inner.pool_name.clone();
+        snapshot.stratum_port = self.inner.stratum_port;
         snapshot.version = env!("CARGO_PKG_VERSION").to_string();
         snapshot.uptime_seconds = self.uptime_seconds();
         self.inner.snapshot.send_replace(snapshot);
@@ -83,6 +86,7 @@ impl AppState {
     pub fn snapshot(&self) -> PoolSnapshot {
         let mut s = self.inner.snapshot.borrow().clone();
         s.pool_name = self.inner.pool_name.clone();
+        s.stratum_port = self.inner.stratum_port;
         s.version = env!("CARGO_PKG_VERSION").to_string();
         s.uptime_seconds = self.uptime_seconds();
         s
