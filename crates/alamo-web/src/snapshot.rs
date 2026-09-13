@@ -13,6 +13,8 @@ pub struct PoolSnapshot {
     pub version: String,
     /// Seconds since start.
     pub uptime_seconds: u64,
+    /// TCP port miners connect to. The host is wherever the dashboard was reached.
+    pub stratum_port: u16,
     /// Unix time the snapshot was built.
     pub now: u64,
     /// Chains being mined, parent first.

@@ -177,7 +177,7 @@ mod tests {
     async fn state(tag: &str) -> (AppState, PathBuf) {
         let path = temp_db(tag);
         let store = Store::open(&path).await.unwrap();
-        (AppState::new("test", store), path)
+        (AppState::new("test", 3333, store), path)
     }
 
     async fn get_json(state: &AppState, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -331,6 +331,7 @@ mod tests {
         let first = socket.next().await.unwrap().unwrap().into_text().unwrap();
         let first: serde_json::Value = serde_json::from_str(&first).unwrap();
         assert_eq!(first["pool_name"], "test");
+        assert_eq!(first["stratum_port"], 3333);
         assert_eq!(first["shares_accepted"], 0);
 
         state.publish(PoolSnapshot {

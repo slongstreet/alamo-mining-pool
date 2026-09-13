@@ -106,6 +106,8 @@ export interface Status {
   pool_name: string;
   version: string;
   uptime_seconds: number;
+  /** TCP port miners connect to, on the same host as this dashboard. */
+  stratum_port: number;
   now: number;
   coins: CoinStatus[];
   hashrate: number;

@@ -44,7 +44,7 @@
       </div>
 
       <HashrateChart live={status.hashrate} workers={workerNames} />
-      <WorkerTable workers={status.workers} />
+      <WorkerTable workers={status.workers} stratumPort={status.stratum_port} coins={status.coins} />
 
       <div class="grid two">
         <ShareLog {now} />

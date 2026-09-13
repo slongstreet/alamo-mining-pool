@@ -1,14 +1,20 @@
 <script lang="ts">
-  import type { WorkerStatus } from '../api';
+  import type { CoinStatus, WorkerStatus } from '../api';
   import { formatDifficulty, formatDuration, formatHashrate, formatInteger, shortAddress } from '../format';
+  import MinerSetup from './MinerSetup.svelte';
 
-  let { workers }: { workers: WorkerStatus[] } = $props();
+  let {
+    workers,
+    stratumPort,
+    coins,
+  }: { workers: WorkerStatus[]; stratumPort: number; coins: CoinStatus[] } = $props();
 </script>
 
 <section class="panel">
   <h2>Workers</h2>
   {#if workers.length === 0}
-    <div class="empty">No workers yet. Point a miner at the stratum port with a payout address as the username.</div>
+    <p class="empty">No workers yet. Point a miner at the pool like this:</p>
+    <MinerSetup port={stratumPort} {coins} />
   {:else}
     <div class="scroll">
       <table>
@@ -52,6 +58,10 @@
         </tbody>
       </table>
     </div>
+    <details class="connect">
+      <summary>Connect another miner</summary>
+      <MinerSetup port={stratumPort} {coins} />
+    </details>
   {/if}
 </section>
 
@@ -83,5 +93,16 @@
   }
   .badge {
     margin-left: 0.35rem;
+  }
+  .connect {
+    margin-top: 0.9rem;
+  }
+  .connect summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+  .connect summary:hover {
+    color: var(--text);
   }
 </style>
