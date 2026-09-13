@@ -2,7 +2,7 @@ manifestVersion: 1
 id: longstreet-alamo
 category: bitcoin
 name: Alamo Mining Pool
-version: "0.1.1"
+version: "0.1.2"
 tagline: Solo mine Litecoin and merge-mine Dogecoin against your own nodes
 description: >-
   Alamo is a self-hosted solo mining pool. Miners connect over stratum with their
