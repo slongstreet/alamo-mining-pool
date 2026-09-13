@@ -99,11 +99,19 @@ can reach (`host.docker.internal` on Docker Desktop) and publish ports 3333 and 
 `deploy/umbrel/longstreet-alamo/` is a ready-made app for a community app store. It
 depends on the `longstreet-litecoin` and `longstreet-dogecoin` node apps and reads their
 RPC and ZMQ endpoints from the variables those apps export, so no credential is ever
-written into the store. Copy the directory into the store repository, then:
+written into the store. This directory is the source of truth; the store repository holds
+a copy of it. To publish a release:
 
-1. Check that the image tag and digest in `docker-compose.yml` are the release you want.
-   The pin is updated with each release.
-2. Install the app from the Umbrel UI. Umbrel copies the directory to the app's data
+1. Update the image tag and digest in `docker-compose.yml` to the new release. The digest
+   is the multi-arch index digest, which `docker buildx imagetools inspect` prints.
+2. Bump `version` in `umbrel-app.yml` and rewrite `releaseNotes`. This is the Umbrel app
+   version, independent of the Alamo release: Umbrel only offers an update when it changes,
+   and the store's CI rejects a push that touches the directory without bumping it.
+3. Copy the directory over the store's copy and push the store.
+
+To install:
+
+1. Install the app from the Umbrel UI. Umbrel copies the directory to the app's data
    directory and sources the node apps' exports before starting the container.
 3. Edit the two `fallback_address` values in `alamo.toml` under the app's data directory
    and restart the app.
