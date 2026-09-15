@@ -127,8 +127,18 @@ async function getJson<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+async function postJson<T>(path: string): Promise<T> {
+  const res = await fetch(path, { method: 'POST', headers: { accept: 'application/json' } });
+  if (!res.ok) {
+    throw new Error(`${path}: HTTP ${res.status}`);
+  }
+  return (await res.json()) as T;
+}
+
 export const api = {
   health: () => getJson<Health>('/api/health'),
+  /** Zero accepted/rejected share counts and best share for every worker. */
+  resetStats: () => postJson<{ status: string }>('/api/stats/reset'),
   status: () => getJson<Status>('/api/status'),
   /** Samples for the pool (empty worker) or one worker over the last `span` seconds. */
   hashrate: (span: number, worker = '') =>

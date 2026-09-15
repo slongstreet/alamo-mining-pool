@@ -228,6 +228,17 @@ impl Store {
         Ok(())
     }
 
+    /// Zero every worker's accepted/rejected counts and best share. Share history,
+    /// accepted work, and blocks are kept.
+    pub async fn reset_share_counters(&self) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE workers SET shares_accepted = 0, shares_rejected = 0, best_difficulty = 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Every worker the pool has seen, ordered by name.
     pub async fn load_workers(&self) -> Result<Vec<WorkerRow>, StoreError> {
         let rows: Vec<WorkerSql> = sqlx::query_as(

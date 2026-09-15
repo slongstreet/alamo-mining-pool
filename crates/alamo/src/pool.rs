@@ -13,7 +13,7 @@ use alamo_core::time::now_unix;
 use alamo_core::work::WorkTemplate;
 use alamo_store::{BlockRow, BlockStatus, CoinRounds, NewBlock, Store};
 use alamo_stratum::{BlockCandidate, PoolEvent, StratumServer, WorkReceiver};
-use alamo_web::{AppState, CoinStatus, NodeStatus, PoolSnapshot, RoundStatus};
+use alamo_web::{AppState, CoinStatus, Command, NodeStatus, PoolSnapshot, RoundStatus};
 use anyhow::{bail, Context};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -441,12 +441,16 @@ pub async fn run(
             shutdown.child_token(),
         ));
     }
+    let commands = state
+        .take_commands()
+        .context("web command receiver already taken")?;
     tasks.spawn(publisher(
         events_rx,
         work_rx,
         nodes,
         store.clone(),
         state,
+        commands,
         chains.parent.chain,
         chains.parent.coin.algorithm().share_multiplier(),
         shutdown.child_token(),
@@ -521,6 +525,7 @@ async fn publisher(
     nodes: Vec<(&'static str, watch::Receiver<NodeHealth>)>,
     store: Store,
     state: AppState,
+    mut commands: mpsc::Receiver<Command>,
     chain: Chain,
     share_multiplier: f64,
     shutdown: CancellationToken,
@@ -562,6 +567,29 @@ async fn publisher(
                     flush_persist(&mut persist).await;
                 }
             }
+            Some(command) = commands.recv() => match command {
+                Command::ResetStats => {
+                    // Queued shares must land before the zeroing or they would be
+                    // counted on top of it.
+                    flush_persist(&mut persist).await;
+                    match store.reset_share_counters().await {
+                        Ok(()) => {
+                            stats.reset_counters();
+                            tracing::info!("share counters and best share reset by operator");
+                        }
+                        Err(err) => tracing::warn!(%err, "could not reset share counters"),
+                    }
+                    remember_templates(&work, &mut templates);
+                    state.publish(build_snapshot(
+                        &stats,
+                        &templates,
+                        &nodes,
+                        blocks.clone(),
+                        &rounds,
+                        chain,
+                    ));
+                }
+            },
             _ = interval.tick() => {
                 if let Err(err) = persist.on_tick(&stats, now_unix()).await {
                     tracing::warn!(%err, "could not persist accounting");

@@ -9,12 +9,12 @@ pub mod metrics;
 pub mod snapshot;
 
 use alamo_store::Store;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
@@ -22,6 +22,14 @@ pub use config::WebConfig;
 pub use snapshot::{
     AuxPayoutStatus, CoinStatus, NodeStatus, PoolSnapshot, RoundStatus, WorkerStatus,
 };
+
+/// An operator action requested through the API, carried out by the pool task that
+/// owns the live statistics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// Zero every worker's accepted and rejected share counts and best share.
+    ResetStats,
+}
 
 /// State shared with request handlers.
 #[derive(Clone)]
@@ -37,11 +45,15 @@ struct Inner {
     snapshot: watch::Sender<PoolSnapshot>,
     /// History (shares, samples, blocks) is read straight from the store.
     store: Store,
+    /// Operator commands for the pool task; the receiver is taken once by that task.
+    commands: mpsc::Sender<Command>,
+    commands_rx: Mutex<Option<mpsc::Receiver<Command>>>,
 }
 
 impl AppState {
     /// Create the application state.
     pub fn new(pool_name: impl Into<String>, stratum_port: u16, store: Store) -> Self {
+        let (commands, commands_rx) = mpsc::channel(8);
         Self {
             inner: Arc::new(Inner {
                 pool_name: pool_name.into(),
@@ -49,8 +61,20 @@ impl AppState {
                 started_at: Instant::now(),
                 snapshot: watch::Sender::new(PoolSnapshot::default()),
                 store,
+                commands,
+                commands_rx: Mutex::new(Some(commands_rx)),
             }),
         }
+    }
+
+    /// The receiving end of operator commands. Only the first caller gets it.
+    pub fn take_commands(&self) -> Option<mpsc::Receiver<Command>> {
+        self.inner.commands_rx.lock().ok()?.take()
+    }
+
+    /// Queue an operator command. `false` when nobody is listening or the queue is full.
+    pub fn send_command(&self, command: Command) -> bool {
+        self.inner.commands.try_send(command).is_ok()
     }
 
     /// The database behind the history endpoints.
@@ -118,6 +142,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/hashrate", get(api::hashrate))
         .route("/api/shares", get(api::shares))
         .route("/api/blocks", get(api::blocks))
+        .route("/api/stats/reset", post(api::reset_stats))
         .route("/metrics", get(metrics::metrics))
         .fallback(assets::serve)
         .layer(TraceLayer::new_for_http())
