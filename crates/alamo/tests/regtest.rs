@@ -29,7 +29,10 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-const SHARE_DIFFICULTY: f64 = 0.0000005;
+/// Stratum share difficulty for the test session. In scrypt share units (65536 per unit
+/// of network difficulty) this is network difficulty 5e-7, still above regtest's ~4.7e-10,
+/// so every share the CPU miner finds is also a block on both chains.
+const SHARE_DIFFICULTY: f64 = 0.0000005 * 65536.0;
 
 /// Dogecoin regtest rejects auxpow blocks before this height.
 const DOGE_AUXPOW_START: u64 = 20;
