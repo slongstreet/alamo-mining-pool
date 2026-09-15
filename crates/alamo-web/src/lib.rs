@@ -9,7 +9,7 @@ pub mod metrics;
 pub mod snapshot;
 
 use alamo_store::Store;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -25,10 +25,13 @@ pub use snapshot::{
 
 /// An operator action requested through the API, carried out by the pool task that
 /// owns the live statistics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     /// Zero every worker's accepted and rejected share counts and best share.
     ResetStats,
+    /// Forget a worker that has no live session: its row, share log, and hashrate
+    /// history. Its accepted work stays in the pool total so rounds do not move.
+    RemoveWorker(String),
 }
 
 /// State shared with request handlers.
@@ -143,6 +146,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/shares", get(api::shares))
         .route("/api/blocks", get(api::blocks))
         .route("/api/stats/reset", post(api::reset_stats))
+        .route("/api/workers/{name}", delete(api::remove_worker))
         .route("/metrics", get(metrics::metrics))
         .fallback(assets::serve)
         .layer(TraceLayer::new_for_http())

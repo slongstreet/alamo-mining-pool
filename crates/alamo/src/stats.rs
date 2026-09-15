@@ -40,6 +40,8 @@ pub struct Stats {
     workers: HashMap<String, WorkerStats>,
     shares_accepted: u64,
     shares_rejected: u64,
+    /// Accepted work of workers since removed, so removal does not move the round.
+    retired_work: f64,
 }
 
 impl Default for Stats {
@@ -56,6 +58,7 @@ impl Stats {
             workers: HashMap::new(),
             shares_accepted: 0,
             shares_rejected: 0,
+            retired_work: 0.0,
         }
     }
 
@@ -123,7 +126,9 @@ impl Stats {
         let workers = store.load_workers().await?;
         let since = now.saturating_sub(HASHRATE_WINDOW_SECS) as i64;
         let shares = store.accepted_shares_since(since).await?;
-        Ok(Self::restore(&workers, &shares, now, share_multiplier))
+        let mut stats = Self::restore(&workers, &shares, now, share_multiplier);
+        stats.retired_work = store.retired_work().await?;
+        Ok(stats)
     }
 
     /// Apply one event.
@@ -207,6 +212,28 @@ impl Stats {
         self.shares_rejected = 0;
     }
 
+    /// Forget a worker. Its share counts leave the pool totals but its accepted work is
+    /// retired, not lost, so lifetime work and the current round stay put. Returns false
+    /// when the worker is unknown or still has a live session.
+    pub fn remove_worker(&mut self, name: &str) -> bool {
+        match self.workers.get(name) {
+            Some(w) if w.sessions.is_empty() => {}
+            _ => return false,
+        }
+        let w = self.workers.remove(name).expect("checked above");
+        self.shares_accepted -= w.accepted;
+        self.shares_rejected -= w.rejected;
+        self.retired_work += w.work_accepted;
+        true
+    }
+
+    /// Whether `name` currently has a live stratum session.
+    pub fn is_connected(&self, name: &str) -> bool {
+        self.workers
+            .get(name)
+            .is_some_and(|w| !w.sessions.is_empty())
+    }
+
     /// Accepted shares recorded (lifetime, including restored).
     pub fn shares_accepted(&self) -> u64 {
         self.shares_accepted
@@ -217,9 +244,10 @@ impl Stats {
         self.shares_rejected
     }
 
-    /// Lifetime accepted work in network difficulty-1 units, summed over every worker.
+    /// Lifetime accepted work in network difficulty-1 units, summed over every worker
+    /// plus the work of workers since removed.
     pub fn total_work(&self) -> f64 {
-        self.workers.values().map(|w| w.work_accepted).sum()
+        self.workers.values().map(|w| w.work_accepted).sum::<f64>() + self.retired_work
     }
 
     /// Best share any worker has found, in network difficulty-1 units.
@@ -453,6 +481,31 @@ mod tests {
         assert_eq!(w.shares_accepted, 0);
         assert!(w.hashrate > 0.0, "hashrate window survives a reset");
         assert_eq!(w.work_accepted, 10.0);
+    }
+
+    #[test]
+    fn removing_a_worker_drops_its_counts_but_retires_its_work() {
+        let mut s = Stats::new(65536.0);
+        let t0 = 1_000;
+        s.apply(&authorized(1, "a"), t0);
+        s.apply(&authorized(2, "b"), t0);
+        for i in 0..10u64 {
+            s.apply(&accepted_share(1, "a", 65536.0), t0 + i * 10);
+        }
+        s.apply(&accepted_share(2, "b", 65536.0), t0);
+        assert!(!s.remove_worker("a"), "a live worker cannot be removed");
+        assert!(!s.remove_worker("nobody"));
+        s.apply(
+            &PoolEvent::Disconnected {
+                session: 1,
+                workers: vec!["a".into()],
+            },
+            t0 + 100,
+        );
+        assert!(s.remove_worker("a"));
+        assert_eq!(s.workers(t0 + 100).len(), 1);
+        assert_eq!(s.shares_accepted(), 1);
+        assert_eq!(s.total_work(), 11.0, "retired work still counts");
     }
 
     #[test]

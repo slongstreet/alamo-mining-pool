@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api, type Status } from '../api';
   import { formatDifficulty, formatHashrate, formatInteger } from '../format';
+  import Info from './Info.svelte';
 
   let { status }: { status: Status } = $props();
 
@@ -48,6 +49,9 @@
   <div class="tile">
     <div class="label">
       Best share
+      <Info
+        text="The highest-difficulty share any worker has submitted since the last reset. A share whose difficulty reaches the network difficulty is a block. It is a record, not a predictor."
+      />
       <button class="ghost reset" onclick={resetStats} disabled={resetting} title="Zero share counts and best share for every worker">
         {resetting ? 'resetting…' : 'reset'}
       </button>
