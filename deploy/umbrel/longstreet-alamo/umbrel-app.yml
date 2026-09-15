@@ -14,9 +14,10 @@ description: >-
   and ZMQ endpoints automatically. Set your fallback payout addresses in
   alamo.toml under the app's data directory before pointing miners at port 3333.
 releaseNotes: >-
-  Alamo 0.1.5: a reset button for share counts and best share, a fix for the best
-  share shown after a restart, and difficulty changes that no longer resend the current
-  job, so variable difficulty settles instead of drifting.
+  Alamo 0.1.7: explainer tooltips on the round, best share, and luck figures; blocks
+  expected so far shown until the first block is found; long worker names truncated so
+  every column fits; and a button to remove a worker that is no longer mining. From this
+  release the app version is the Alamo version.
 developer: Scott Longstreet
 website: https://github.com/slongstreet/alamo-mining-pool
 icon: https://raw.githubusercontent.com/slongstreet/longstreet-umbrel-apps/refs/heads/main/longstreet-alamo/icon.svg
