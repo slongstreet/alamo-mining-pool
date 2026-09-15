@@ -57,7 +57,7 @@
           {#each shares as s (s.id)}
             <tr>
               <td class="muted num">{formatAgo(s.ts, now)}</td>
-              <td class="mono">{s.worker}</td>
+              <td class="mono worker" title={s.worker}>{s.worker}</td>
               <td class="r num">{formatDifficulty(s.difficulty)}</td>
               <td class="r num" class:hot={s.accepted && s.share_diff >= s.difficulty * 100}>
                 {s.accepted ? formatDifficulty(s.share_diff) : '—'}
@@ -90,6 +90,17 @@
   .log {
     max-height: 420px;
     overflow-y: auto;
+  }
+  .worker {
+    max-width: 10rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  @media (max-width: 640px) {
+    .worker {
+      max-width: 6rem;
+    }
   }
   .hot {
     color: var(--accent);

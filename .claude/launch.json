@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "alamo-regtest",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "-p", "alamo", "--", "--config", "config/alamo.regtest.toml"],
+      "port": 8080
+    }
+  ]
+}

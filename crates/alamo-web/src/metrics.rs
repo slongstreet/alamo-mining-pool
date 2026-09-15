@@ -139,6 +139,10 @@ pub fn render(s: &PoolSnapshot) -> String {
         "Lifetime luck: expected work over actual work, 100 is average.",
     );
     w.gauge(
+        "alamo_coin_expected_blocks",
+        "Blocks the pool's lifetime work would find on average at the current difficulty.",
+    );
+    w.gauge(
         "alamo_coin_block_probability",
         "Probability of at least one block within the horizon at the current hashrate.",
     );
@@ -206,6 +210,11 @@ fn coin_samples(w: &mut Writer<'_>, coin: &CoinStatus) {
     if let Some(luck) = coin.round.luck_percent {
         w.sample("alamo_coin_luck_percent", labels, luck);
     }
+    w.sample(
+        "alamo_coin_expected_blocks",
+        labels,
+        coin.round.expected_blocks,
+    );
     for (horizon, p) in [
         ("hour", coin.odds.p_hour),
         ("day", coin.odds.p_day),

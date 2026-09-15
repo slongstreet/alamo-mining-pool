@@ -184,6 +184,11 @@ payouts.
 - **`GET /api/health`** returns `{"status":"ok"}` while the daemon runs. Suitable for a
   liveness probe.
 - **`GET /api/status`** is the full status document as JSON.
+- **`POST /api/stats/reset`** zeroes share counts and best share for every worker (the
+  dashboard's `reset` button). **`DELETE /api/workers/{name}`** forgets an offline worker:
+  its row, share log, and hashrate history go; blocks it found stay, and its accepted
+  work is retired into the pool total so rounds and luck do not move. A connected worker
+  is refused with 409. Both are applied by the pool task within one publish interval.
 - **`GET /metrics`** is a Prometheus text endpoint. Useful alerts:
   - `alamo_node_up == 0` for more than a minute: a node is down.
   - `alamo_node_stale == 1`: a node has been down long enough that its template was

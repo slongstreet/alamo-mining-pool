@@ -49,7 +49,7 @@
               <td><span class="badge accent">{b.coin}</span></td>
               <td class="r num">{b.height.toLocaleString()}</td>
               <td class="mono" title={b.hash}>{shortHash(b.hash)}</td>
-              <td class="mono">{b.worker}</td>
+              <td class="mono worker" title={b.worker}>{b.worker}</td>
               <td class="r num">{formatCoins(b.reward_sats, b.coin)}</td>
               <td class="r num">{formatDifficulty(b.share_diff)} / {formatDifficulty(b.difficulty)}</td>
               <td>
@@ -65,3 +65,12 @@
     </div>
   {/if}
 </section>
+
+<style>
+  .worker {
+    max-width: 8rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+</style>

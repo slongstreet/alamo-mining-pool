@@ -589,6 +589,31 @@ async fn publisher(
                         chain,
                     ));
                 }
+                Command::RemoveWorker(name) => {
+                    // The API already refused connected workers, but a session may have
+                    // arrived since; and queued shares must land before the row goes.
+                    if stats.is_connected(&name) {
+                        tracing::warn!(worker = %name, "worker reconnected; not removed");
+                        continue;
+                    }
+                    flush_persist(&mut persist).await;
+                    match store.remove_worker(&name).await {
+                        Ok(_) => {
+                            stats.remove_worker(&name);
+                            tracing::info!(worker = %name, "worker removed by operator");
+                        }
+                        Err(err) => tracing::warn!(%err, worker = %name, "could not remove worker"),
+                    }
+                    remember_templates(&work, &mut templates);
+                    state.publish(build_snapshot(
+                        &stats,
+                        &templates,
+                        &nodes,
+                        blocks.clone(),
+                        &rounds,
+                        chain,
+                    ));
+                }
             },
             _ = interval.tick() => {
                 if let Err(err) = persist.on_tick(&stats, now_unix()).await {
@@ -689,6 +714,11 @@ fn round_status(
     let luck_percent = rounds
         .filter(|r| r.blocks_found > 0 && total_work > 0.0)
         .map(|r| alamo_core::odds::luck_percent(r.expected_work, total_work));
+    let expected_blocks = if expected_work > 0.0 {
+        total_work / expected_work
+    } else {
+        0.0
+    };
     RoundStatus {
         blocks_found: rounds.map_or(0, |r| r.blocks_found.max(0) as u64),
         started_at: rounds.and_then(|r| r.last_found_at),
@@ -700,6 +730,7 @@ fn round_status(
             0.0
         },
         luck_percent,
+        expected_blocks,
     }
 }
 
@@ -752,6 +783,7 @@ mod tests {
         assert_eq!(r.expected_work, 1_000.0);
         assert_eq!(r.progress, 0.25);
         assert_eq!(r.luck_percent, None);
+        assert_eq!(r.expected_blocks, 0.25);
     }
 
     #[test]
@@ -770,5 +802,6 @@ mod tests {
         assert_eq!(r.work, 800.0);
         assert_eq!(r.progress, 0.8);
         assert!((r.luck_percent.unwrap() - 83.333).abs() < 0.01);
+        assert_eq!(r.expected_blocks, 2.4);
     }
 }

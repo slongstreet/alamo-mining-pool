@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { CoinStatus, WorkerStatus } from '../api';
+  import { api, type CoinStatus, type WorkerStatus } from '../api';
   import { formatDifficulty, formatDuration, formatHashrate, formatInteger, shortAddress } from '../format';
   import MinerSetup from './MinerSetup.svelte';
 
@@ -8,6 +8,24 @@
     stratumPort,
     coins,
   }: { workers: WorkerStatus[]; stratumPort: number; coins: CoinStatus[] } = $props();
+
+  /** Workers whose removal is in flight; the row disappears with the next snapshot. */
+  let removing = $state<Set<string>>(new Set());
+  let removeError = $state<string | null>(null);
+
+  async function remove(w: WorkerStatus) {
+    if (!confirm(`Remove ${w.name} from the workers table?\n\nIts share counts, share log, and hashrate history are dropped. Blocks it found and the pool's lifetime work are kept. If it connects again it starts fresh.`)) return;
+    removing = new Set(removing).add(w.name);
+    removeError = null;
+    try {
+      await api.removeWorker(w.name);
+    } catch (err) {
+      removeError = err instanceof Error ? err.message : String(err);
+      const next = new Set(removing);
+      next.delete(w.name);
+      removing = next;
+    }
+  }
 </script>
 
 <section class="panel">
@@ -16,6 +34,7 @@
     <p class="empty">No workers yet. Point a miner at the pool like this:</p>
     <MinerSetup port={stratumPort} {coins} />
   {:else}
+    {#if removeError}<div class="bad small">{removeError}</div>{/if}
     <div class="scroll">
       <table>
         <thead>
@@ -27,14 +46,15 @@
             <th class="r">Shares</th>
             <th class="r">Best</th>
             <th class="r">Last share</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
           {#each workers as w (w.name)}
             <tr class:offline={w.connections === 0}>
-              <td>
+              <td class="name">
                 <span class="dot" class:on={w.connections > 0}></span>
-                <span class="mono">{w.name}</span>
+                <span class="mono" title={w.name}>{w.name}</span>
                 {#if w.connections > 1}<span class="badge">{w.connections}×</span>{/if}
               </td>
               <td class="pays">
@@ -53,6 +73,19 @@
               </td>
               <td class="r num">{formatDifficulty(w.best_difficulty)}</td>
               <td class="r num muted">{w.last_share_seconds == null ? '—' : `${formatDuration(w.last_share_seconds)} ago`}</td>
+              <td class="r">
+                {#if w.connections === 0}
+                  <button
+                    class="ghost remove"
+                    onclick={() => remove(w)}
+                    disabled={removing.has(w.name)}
+                    title="Remove this worker from the table"
+                    aria-label="Remove {w.name}"
+                  >
+                    {removing.has(w.name) ? '…' : '×'}
+                  </button>
+                {/if}
+              </td>
             </tr>
           {/each}
         </tbody>
@@ -83,8 +116,34 @@
   tr.offline td {
     color: var(--muted);
   }
+  .name {
+    max-width: 12rem;
+    white-space: nowrap;
+  }
+  .name .mono {
+    display: inline-block;
+    max-width: calc(100% - 1.5rem);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: bottom;
+  }
+  @media (max-width: 640px) {
+    .name {
+      max-width: 9rem;
+    }
+  }
+  .remove {
+    padding: 0 0.45rem;
+    line-height: 1.4;
+    font-size: 0.9rem;
+  }
+  .small {
+    font-size: 0.8rem;
+    margin-bottom: 0.5rem;
+  }
   .pays {
-    max-width: 24rem;
+    max-width: 18rem;
+    white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }

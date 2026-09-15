@@ -92,6 +92,9 @@ pub struct RoundStatus {
     /// Lifetime luck in percent: expected work over actual work for the blocks found.
     /// 100 is average, above 100 is lucky. `None` until the first block.
     pub luck_percent: Option<f64>,
+    /// Blocks the pool's lifetime work would find on average, at the current network
+    /// difficulty. Meaningful before the first block, when luck is not.
+    pub expected_blocks: f64,
 }
 
 /// Status of one worker.

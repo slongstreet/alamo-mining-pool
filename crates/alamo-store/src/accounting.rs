@@ -239,6 +239,43 @@ impl Store {
         Ok(())
     }
 
+    /// Forget a worker: its row, share log entries, and hashrate samples. Its accepted
+    /// work is banked in `retired_work` so pool-wide totals and rounds do not move; blocks
+    /// it found are kept. Returns the work retired, or `None` if there was no such worker.
+    pub async fn remove_worker(&self, name: &str) -> Result<Option<f64>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(f64,)> =
+            sqlx::query_as("SELECT work_accepted FROM workers WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((work,)) = row else {
+            return Ok(None);
+        };
+        sqlx::query("UPDATE pool_counters SET value = value + ? WHERE key = 'retired_work'")
+            .bind(work)
+            .execute(&mut *tx)
+            .await?;
+        for sql in [
+            "DELETE FROM workers WHERE name = ?",
+            "DELETE FROM shares WHERE worker = ?",
+            "DELETE FROM hashrate_samples WHERE worker = ?",
+        ] {
+            sqlx::query(sql).bind(name).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(Some(work))
+    }
+
+    /// Accepted work of workers that have been removed, in difficulty units.
+    pub async fn retired_work(&self) -> Result<f64, StoreError> {
+        let (work,): (f64,) =
+            sqlx::query_as("SELECT value FROM pool_counters WHERE key = 'retired_work'")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(work)
+    }
+
     /// Every worker the pool has seen, ordered by name.
     pub async fn load_workers(&self) -> Result<Vec<WorkerRow>, StoreError> {
         let rows: Vec<WorkerSql> = sqlx::query_as(
@@ -251,13 +288,14 @@ impl Store {
         Ok(rows.into_iter().map(WorkerRow::from).collect())
     }
 
-    /// Pool-wide accepted work in difficulty units, summed over every worker.
+    /// Pool-wide accepted work in difficulty units: every worker's plus the work of
+    /// workers since removed.
     pub async fn total_work(&self) -> Result<f64, StoreError> {
         let (work,): (f64,) =
             sqlx::query_as("SELECT COALESCE(SUM(work_accepted), 0.0) FROM workers")
                 .fetch_one(&self.pool)
                 .await?;
-        Ok(work)
+        Ok(work + self.retired_work().await?)
     }
 
     /// Accepted shares at or after `since`, oldest first, capped so a restart stays bounded.
@@ -407,6 +445,49 @@ mod tests {
         let recent = store.recent_shares(10).await.unwrap();
         assert_eq!(recent.len(), 2);
         assert!(recent[0].ts >= recent[1].ts);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn removing_a_worker_banks_its_work_and_drops_its_history() {
+        let path = temp_path("remove");
+        let store = Store::open(&path).await.unwrap();
+        store
+            .persist_batch(
+                &[worker("rig1", 1000), worker("rig2", 1000)],
+                &[share("rig1", 1010, true), share("rig2", 1020, true)],
+            )
+            .await
+            .unwrap();
+        store
+            .insert_hashrate_samples(&[HashrateSample {
+                ts: 1080,
+                worker: "rig1".into(),
+                hashrate: 5.0,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(store.total_work().await.unwrap(), 32.0);
+
+        assert_eq!(store.remove_worker("rig1").await.unwrap(), Some(16.0));
+        assert_eq!(store.remove_worker("rig1").await.unwrap(), None);
+
+        let workers = store.load_workers().await.unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].name, "rig2");
+        assert_eq!(store.retired_work().await.unwrap(), 16.0);
+        assert_eq!(store.total_work().await.unwrap(), 32.0);
+        assert!(store
+            .recent_shares(10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| s.worker == "rig2"));
+        assert!(store
+            .hashrate_samples_since(Some("rig1"), 0)
+            .await
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

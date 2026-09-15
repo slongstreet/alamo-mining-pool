@@ -24,6 +24,8 @@ export interface RoundStatus {
   expected_work: number;
   progress: number;
   luck_percent: number | null;
+  /** Blocks the pool's lifetime work would find on average at the current difficulty. */
+  expected_blocks: number;
 }
 
 export interface NodeStatus {
@@ -127,10 +129,16 @@ async function getJson<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-async function postJson<T>(path: string): Promise<T> {
-  const res = await fetch(path, { method: 'POST', headers: { accept: 'application/json' } });
+async function sendJson<T>(method: 'POST' | 'DELETE', path: string): Promise<T> {
+  const res = await fetch(path, { method, headers: { accept: 'application/json' } });
   if (!res.ok) {
-    throw new Error(`${path}: HTTP ${res.status}`);
+    let detail = '';
+    try {
+      detail = ((await res.json()) as { error?: string }).error ?? '';
+    } catch {
+      // Not JSON; the status is enough.
+    }
+    throw new Error(detail || `${path}: HTTP ${res.status}`);
   }
   return (await res.json()) as T;
 }
@@ -138,7 +146,10 @@ async function postJson<T>(path: string): Promise<T> {
 export const api = {
   health: () => getJson<Health>('/api/health'),
   /** Zero accepted/rejected share counts and best share for every worker. */
-  resetStats: () => postJson<{ status: string }>('/api/stats/reset'),
+  resetStats: () => sendJson<{ status: string }>('POST', '/api/stats/reset'),
+  /** Forget an offline worker: its row, share log, and hashrate history. */
+  removeWorker: (name: string) =>
+    sendJson<{ status: string }>('DELETE', `/api/workers/${encodeURIComponent(name)}`),
   status: () => getJson<Status>('/api/status'),
   /** Samples for the pool (empty worker) or one worker over the last `span` seconds. */
   hashrate: (span: number, worker = '') =>

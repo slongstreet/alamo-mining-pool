@@ -3,7 +3,7 @@
 use crate::{AppState, Command, PoolSnapshot};
 use alamo_store::{BlockRow, HashrateSample, ShareRow, StoreError};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -160,6 +160,39 @@ pub async fn reset_stats(State(state): State<AppState>) -> (StatusCode, Json<ser
     }
 }
 
+/// `DELETE /api/workers/{name}`: forget a worker that is not connected. Refused with 409
+/// while it has a live session and 404 when the dashboard has never seen it. Like reset,
+/// the pool task applies it within one publish interval.
+pub async fn remove_worker(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let snapshot = state.snapshot();
+    let Some(worker) = snapshot.workers.iter().find(|w| w.name == name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such worker" })),
+        );
+    };
+    if worker.connections > 0 {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "worker is connected; disconnect it first" })),
+        );
+    }
+    if state.send_command(Command::RemoveWorker(name)) {
+        (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "queued" })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "pool is not accepting commands" })),
+        )
+    }
+}
+
 /// Blocks found, newest first.
 pub async fn blocks(
     State(state): State<AppState>,
@@ -238,6 +271,50 @@ mod tests {
         drop(rx);
         let res = router(state).oneshot(post()).await.unwrap();
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn remove_worker_is_queued_only_for_known_offline_workers() {
+        use crate::{Command, WorkerStatus};
+        let (state, path) = state("remove").await;
+        let mut rx = state.take_commands().unwrap();
+        let worker = |name: &str, connections: usize| WorkerStatus {
+            name: name.into(),
+            address: "addr".into(),
+            fallback: false,
+            aux_payouts: Vec::new(),
+            connections,
+            difficulty: 1.0,
+            hashrate: 0.0,
+            shares_accepted: 0,
+            shares_rejected: 0,
+            best_difficulty: 0.0,
+            work_accepted: 0.0,
+            last_share_seconds: None,
+        };
+        state.publish(PoolSnapshot {
+            workers: vec![worker("live", 1), worker("gone", 0)],
+            ..PoolSnapshot::default()
+        });
+        let delete = |name: &str| {
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/workers/{name}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let res = router(state.clone()).oneshot(delete("gone")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        assert_eq!(rx.try_recv().unwrap(), Command::RemoveWorker("gone".into()));
+        let res = router(state.clone()).oneshot(delete("live")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let res = router(state.clone())
+            .oneshot(delete("nobody"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(rx.try_recv().is_err(), "only the offline worker was queued");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
