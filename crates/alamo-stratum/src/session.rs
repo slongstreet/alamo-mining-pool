@@ -113,7 +113,6 @@ impl Session {
                     let d = self.vardiff.clamp(d);
                     if (d - self.difficulty).abs() > f64::EPSILON {
                         self.set_difficulty(d, &mut fx);
-                        self.resend_current_job(&mut fx);
                     }
                 }
                 fx.respond(Response::ok(id, json!(true)));
@@ -199,7 +198,7 @@ impl Session {
         fx.respond(Response::ok(id, json!(true)));
         if first {
             self.set_difficulty(self.difficulty, fx);
-            self.resend_current_job(fx);
+            self.send_current_job(fx);
         }
     }
 
@@ -297,9 +296,12 @@ impl Session {
     }
 
     fn maybe_retarget(&mut self, now: Instant, fx: &mut Effects) {
+        // The new difficulty applies to the next job, as cgminer and ESP-Miner expect.
+        // Resending the current work under a new job id would let a miner that restarts
+        // its nonce search re-find and resubmit the same solutions past the per-job
+        // duplicate check, inflating its share rate right after every retarget.
         if let Some(new) = self.vardiff.evaluate(now, self.difficulty) {
             self.set_difficulty(new, fx);
-            self.resend_current_job(fx);
         }
     }
 
@@ -337,7 +339,7 @@ impl Session {
         fx
     }
 
-    fn resend_current_job(&mut self, fx: &mut Effects) {
+    fn send_current_job(&mut self, fx: &mut Effects) {
         self.send_job(false, fx);
     }
 
@@ -682,5 +684,42 @@ mod tests {
             panic!()
         };
         assert_eq!(r.error.as_ref().unwrap().code, 21);
+    }
+
+    #[test]
+    fn retarget_changes_difficulty_without_resending_the_job() {
+        let t0 = Instant::now();
+        let cfg = VardiffConfig::default();
+        let mut s = session();
+        s.handle(req("mining.subscribe", json!(["m"])), t0, 0);
+        s.handle(
+            req("mining.authorize", json!([format!("{}.rig", addr(1)), "x"])),
+            t0,
+            0,
+        );
+        let fx = s.on_work(work(true));
+        assert!(
+            matches!(&fx.outgoing[0], Outgoing::Notification(n) if n.method == "mining.notify")
+        );
+        assert_eq!(s.jobs.len(), 1);
+
+        // A quiet worker gets its difficulty lowered on the timer: set_difficulty only.
+        let fx = s.tick(t0 + std::time::Duration::from_secs_f64(cfg.retarget_seconds + 1.0));
+        assert_eq!(fx.outgoing.len(), 1, "{:?}", fx.outgoing);
+        let Outgoing::Notification(n) = &fx.outgoing[0] else {
+            panic!()
+        };
+        assert_eq!(n.method, "mining.set_difficulty");
+        let lowered = n.params[0].as_f64().unwrap();
+        assert!(lowered < cfg.initial_difficulty);
+        assert_eq!(s.jobs.len(), 1, "no new job until new work arrives");
+
+        // The next job carries the new target.
+        let fx = s.on_work(work(false));
+        assert!(
+            matches!(&fx.outgoing[0], Outgoing::Notification(n) if n.method == "mining.notify")
+        );
+        let newest = s.jobs.iter().max_by_key(|j| j.id.0).unwrap();
+        assert_eq!(newest.difficulty, lowered);
     }
 }
