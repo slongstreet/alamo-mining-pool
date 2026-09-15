@@ -26,9 +26,11 @@ pub struct VardiffConfig {
     pub max_difficulty: f64,
     /// Desired seconds between shares from one worker.
     pub target_share_seconds: f64,
-    /// Seconds between difficulty re-evaluations.
+    /// Minimum seconds between difficulty changes. The work-rate estimate behind each
+    /// change spans four times this.
     pub retarget_seconds: f64,
-    /// Only retarget when the observed interval differs by more than this percentage.
+    /// Only retarget when the estimated optimal difficulty differs from the current one
+    /// by more than this percentage.
     pub variance_percent: f64,
 }
 

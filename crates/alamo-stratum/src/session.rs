@@ -280,7 +280,7 @@ impl Session {
             Some(reason) => fx.respond(Response::err(id, reason.into())),
             None => {
                 fx.respond(Response::ok(id, json!(true)));
-                self.vardiff.on_share();
+                self.vardiff.on_share(now, job_difficulty);
                 fx.blocks = blocks;
             }
         }
