@@ -1,8 +1,24 @@
 <script lang="ts">
-  import type { Status } from '../api';
+  import { api, type Status } from '../api';
   import { formatDifficulty, formatHashrate, formatInteger } from '../format';
 
   let { status }: { status: Status } = $props();
+
+  let resetting = $state(false);
+  let resetError = $state<string | null>(null);
+
+  async function resetStats() {
+    if (!confirm('Reset accepted/rejected share counts and best share for every worker?')) return;
+    resetting = true;
+    resetError = null;
+    try {
+      await api.resetStats();
+    } catch (err) {
+      resetError = err instanceof Error ? err.message : String(err);
+    } finally {
+      resetting = false;
+    }
+  }
 
   const online = $derived(status.workers.filter((w) => w.connections > 0).length);
   const total = $derived(status.shares_accepted + status.shares_rejected);
@@ -30,9 +46,16 @@
     </div>
   </div>
   <div class="tile">
-    <div class="label">Best share</div>
+    <div class="label">
+      Best share
+      <button class="ghost reset" onclick={resetStats} disabled={resetting} title="Zero share counts and best share for every worker">
+        {resetting ? 'resetting…' : 'reset'}
+      </button>
+    </div>
     <div class="value num">{formatDifficulty(status.best_share_difficulty)}</div>
-    <div class="sub">difficulty, lifetime</div>
+    <div class="sub">
+      {#if resetError}<span class="bad">{resetError}</span>{:else}difficulty, since last reset{/if}
+    </div>
   </div>
   <div class="tile">
     <div class="label">Blocks found</div>

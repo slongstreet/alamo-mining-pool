@@ -1,6 +1,6 @@
 //! JSON API handlers and the snapshot WebSocket.
 
-use crate::{AppState, PoolSnapshot};
+use crate::{AppState, Command, PoolSnapshot};
 use alamo_store::{BlockRow, HashrateSample, ShareRow, StoreError};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -143,6 +143,23 @@ pub async fn shares(
     Ok(Json(state.store().recent_shares(q.clamp(100, 1000)).await?))
 }
 
+/// `POST /api/stats/reset`: zero accepted/rejected share counts and best share for every
+/// worker. The pool task applies it within one publish interval; the response only
+/// confirms it was queued.
+pub async fn reset_stats(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    if state.send_command(Command::ResetStats) {
+        (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "queued" })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "pool is not accepting commands" })),
+        )
+    }
+}
+
 /// Blocks found, newest first.
 pub async fn blocks(
     State(state): State<AppState>,
@@ -190,6 +207,38 @@ mod tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn reset_stats_is_queued_for_the_pool_task() {
+        use crate::Command;
+        let (state, path) = state("reset").await;
+        let mut rx = state.take_commands().unwrap();
+        let post = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/stats/reset")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let res = router(state.clone()).oneshot(post()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        assert_eq!(rx.try_recv().unwrap(), Command::ResetStats);
+        // GET is not allowed: the reset must be a deliberate POST.
+        let res = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats/reset")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+        drop(rx);
+        let res = router(state).oneshot(post()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[tokio::test]

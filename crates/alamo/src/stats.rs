@@ -84,7 +84,8 @@ impl Stats {
                 difficulty: 0.0,
                 accepted: row.shares_accepted.max(0) as u64,
                 rejected: row.shares_rejected.max(0) as u64,
-                best_difficulty: row.best_difficulty,
+                // Persisted in stratum share units (it is a MAX over share rows).
+                best_difficulty: row.best_difficulty / share_multiplier,
                 work_accepted: row.work_accepted,
                 last_share: (row.shares_accepted > 0).then_some(row.last_seen.max(0) as u64),
                 window: VecDeque::new(),
@@ -192,6 +193,18 @@ impl Stats {
                 }
             }
         }
+    }
+
+    /// Zero accepted/rejected counts and best share for every worker and the pool.
+    /// Hashrate windows, accepted work, and payout details are kept.
+    pub fn reset_counters(&mut self) {
+        for w in self.workers.values_mut() {
+            w.accepted = 0;
+            w.rejected = 0;
+            w.best_difficulty = 0.0;
+        }
+        self.shares_accepted = 0;
+        self.shares_rejected = 0;
     }
 
     /// Accepted shares recorded (lifetime, including restored).
@@ -421,5 +434,42 @@ mod tests {
         assert_eq!(w.work_accepted, 10.0);
         assert!((w.hashrate - 10.0 * HASHES_PER_DIFF1 / 90.0).abs() < 1.0);
         assert_eq!(s.total_work(), 10.0);
+    }
+
+    #[test]
+    fn reset_zeroes_counts_and_best_but_keeps_hashrate_and_work() {
+        let mut s = Stats::new(65536.0);
+        let t0 = 1_000;
+        s.apply(&authorized(1, "a"), t0);
+        for i in 0..10u64 {
+            s.apply(&accepted_share(1, "a", 65536.0), t0 + i * 10);
+        }
+        assert_eq!(s.shares_accepted(), 10);
+        s.reset_counters();
+        assert_eq!(s.shares_accepted(), 0);
+        assert_eq!(s.shares_rejected(), 0);
+        assert_eq!(s.best_difficulty(), 0.0);
+        let w = &s.workers(t0 + 90)[0];
+        assert_eq!(w.shares_accepted, 0);
+        assert!(w.hashrate > 0.0, "hashrate window survives a reset");
+        assert_eq!(w.work_accepted, 10.0);
+    }
+
+    #[test]
+    fn restored_best_share_is_converted_from_stratum_units() {
+        let row = WorkerRow {
+            name: "a".into(),
+            payout_address: "addr".into(),
+            fallback: false,
+            aux_payouts: Vec::new(),
+            first_seen: 0,
+            last_seen: 0,
+            shares_accepted: 1,
+            shares_rejected: 0,
+            best_difficulty: 229_126_140.0, // a 3496.2-diff share in scrypt share units
+            work_accepted: 0.0,
+        };
+        let s = Stats::restore(&[row], &[], 100, 65536.0);
+        assert!((s.best_difficulty() - 3496.187).abs() < 0.01);
     }
 }
