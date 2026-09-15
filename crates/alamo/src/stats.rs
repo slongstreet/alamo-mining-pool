@@ -18,26 +18,55 @@ struct WorkerStats {
     difficulty: f64,
     accepted: u64,
     rejected: u64,
+    /// Best share found, in network difficulty-1 units (comparable to block difficulty).
     best_difficulty: f64,
-    /// Lifetime accepted work in difficulty units.
+    /// Lifetime accepted work in network difficulty-1 units.
     work_accepted: f64,
     last_share: Option<u64>,
-    /// Accepted shares in the hashrate window: (unix time, job difficulty).
+    /// Accepted shares in the hashrate window: (unix time, work in difficulty-1 units).
     window: VecDeque<(u64, f64)>,
 }
 
 /// Aggregated pool statistics.
-#[derive(Debug, Default)]
+///
+/// Stratum share difficulty is a per-algorithm multiple of network difficulty (65536 for
+/// scrypt, see [`alamo_core::algo::Algorithm::share_multiplier`]). Events and persisted
+/// share rows carry stratum difficulty; everything accumulated here is converted to
+/// network difficulty-1 units so work, hashrate, and best share compare to block
+/// difficulty directly.
+#[derive(Debug)]
 pub struct Stats {
+    share_multiplier: f64,
     workers: HashMap<String, WorkerStats>,
     shares_accepted: u64,
     shares_rejected: u64,
 }
 
+impl Default for Stats {
+    fn default() -> Self {
+        Self::new(1.0)
+    }
+}
+
 impl Stats {
+    /// Empty statistics for a pool whose parent chain uses `share_multiplier`.
+    pub fn new(share_multiplier: f64) -> Self {
+        Self {
+            share_multiplier,
+            workers: HashMap::new(),
+            shares_accepted: 0,
+            shares_rejected: 0,
+        }
+    }
+
     /// Rebuild counters and the hashrate window from persisted rows.
-    pub fn restore(workers: &[WorkerRow], recent_accepted: &[ShareRow], now: u64) -> Self {
-        let mut stats = Self::default();
+    pub fn restore(
+        workers: &[WorkerRow],
+        recent_accepted: &[ShareRow],
+        now: u64,
+        share_multiplier: f64,
+    ) -> Self {
+        let mut stats = Self::new(share_multiplier);
         for row in workers {
             let w = WorkerStats {
                 address: row.payout_address.clone(),
@@ -76,7 +105,8 @@ impl Stats {
                     last_share: Some(share.ts as u64),
                     ..WorkerStats::default()
                 });
-            w.window.push_back((share.ts as u64, share.difficulty));
+            w.window
+                .push_back((share.ts as u64, share.difficulty / share_multiplier));
             if w.last_share.unwrap_or(0) < share.ts as u64 {
                 w.last_share = Some(share.ts as u64);
             }
@@ -88,11 +118,11 @@ impl Stats {
     }
 
     /// Load workers and recent accepted shares from the store.
-    pub async fn load(store: &Store, now: u64) -> Result<Self, StoreError> {
+    pub async fn load(store: &Store, now: u64, share_multiplier: f64) -> Result<Self, StoreError> {
         let workers = store.load_workers().await?;
         let since = now.saturating_sub(HASHRATE_WINDOW_SECS) as i64;
         let shares = store.accepted_shares_since(since).await?;
-        Ok(Self::restore(&workers, &shares, now))
+        Ok(Self::restore(&workers, &shares, now, share_multiplier))
     }
 
     /// Apply one event.
@@ -140,9 +170,12 @@ impl Stats {
                     w.accepted += 1;
                     self.shares_accepted += 1;
                     w.last_share = Some(now);
-                    w.best_difficulty = w.best_difficulty.max(*share_difficulty);
-                    w.work_accepted += *job_difficulty;
-                    w.window.push_back((now, *job_difficulty));
+                    w.best_difficulty = w
+                        .best_difficulty
+                        .max(*share_difficulty / self.share_multiplier);
+                    let work = *job_difficulty / self.share_multiplier;
+                    w.work_accepted += work;
+                    w.window.push_back((now, work));
                 }
                 trim(&mut w.window, now);
             }
@@ -171,12 +204,12 @@ impl Stats {
         self.shares_rejected
     }
 
-    /// Lifetime accepted work in difficulty units, summed over every worker.
+    /// Lifetime accepted work in network difficulty-1 units, summed over every worker.
     pub fn total_work(&self) -> f64 {
         self.workers.values().map(|w| w.work_accepted).sum()
     }
 
-    /// Best share difficulty any worker has found.
+    /// Best share any worker has found, in network difficulty-1 units.
     pub fn best_difficulty(&self) -> f64 {
         self.workers
             .values()
@@ -352,7 +385,7 @@ mod tests {
             .await
             .unwrap();
 
-        let restored = Stats::load(&store, (t0 + 90) as u64).await.unwrap();
+        let restored = Stats::load(&store, (t0 + 90) as u64, 1.0).await.unwrap();
         assert_eq!(restored.shares_accepted(), 10);
         let w = &restored.workers((t0 + 90) as u64)[0];
         assert_eq!(w.name, "rig1");
@@ -372,5 +405,21 @@ mod tests {
         let pool = samples.iter().find(|(n, _)| n.is_empty()).unwrap();
         assert!(pool.1 > 0.0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn scrypt_shares_are_accounted_in_network_units() {
+        // 65536 is the scrypt multiplier: a share at stratum difficulty 65536 is one unit
+        // of network difficulty and worth 2^32 hashes.
+        let mut s = Stats::new(65536.0);
+        let t0 = 1_000;
+        s.apply(&authorized(1, "a"), t0);
+        for i in 0..10u64 {
+            s.apply(&accepted_share(1, "a", 65536.0), t0 + i * 10);
+        }
+        let w = &s.workers(t0 + 90)[0];
+        assert_eq!(w.work_accepted, 10.0);
+        assert!((w.hashrate - 10.0 * HASHES_PER_DIFF1 / 90.0).abs() < 1.0);
+        assert_eq!(s.total_work(), 10.0);
     }
 }

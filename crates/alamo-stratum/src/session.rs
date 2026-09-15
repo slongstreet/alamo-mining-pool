@@ -12,7 +12,6 @@ use alamo_core::hash::sha256d;
 use alamo_core::header::BlockHeader;
 use alamo_core::job::{JobId, RejectReason, ShareOutcome};
 use alamo_core::payout::{PayoutSet, Payouts};
-use alamo_core::target::Target;
 use alamo_core::work::MergedWork;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -374,7 +373,7 @@ impl Session {
             coinbase,
             aux,
             difficulty: self.difficulty,
-            target: Target::from_difficulty(self.difficulty),
+            target: work.parent.algorithm.share_target(self.difficulty),
             stale: false,
             seen: Default::default(),
         };

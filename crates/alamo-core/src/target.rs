@@ -10,11 +10,12 @@ use std::fmt;
 pub struct Target(U256);
 
 impl Target {
-    /// The pool difficulty-1 target: `0x00000000FFFF0000...0000` (compact `0x1d00ffff`).
+    /// The network difficulty-1 target: `0x00000000FFFF0000...0000` (compact `0x1d00ffff`).
     ///
-    /// Share difficulty is measured relative to this target for every coin, regardless of
-    /// the coin's own proof-of-work limit. This matches ckpool, stratum miners, and
-    /// every public pool's notion of "difficulty".
+    /// Network difficulty is measured relative to this target for every coin, regardless
+    /// of the coin's own proof-of-work limit. Stratum share difficulty is a per-algorithm
+    /// multiple of it: see [`crate::algo::Algorithm::share_target`], which applies the
+    /// 2^16 factor scrypt miners expect.
     pub const DIFF1: Target = Target(U256([0, 0, 0, 0x0000_0000_ffff_0000]));
 
     /// Build a target from its compact ("bits") encoding as used in block headers.

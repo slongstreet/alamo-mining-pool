@@ -207,7 +207,7 @@ mod tests {
         }
         persist.flush().await.unwrap();
 
-        let restored = Stats::load(&store, 1_010).await.unwrap();
+        let restored = Stats::load(&store, 1_010, 1.0).await.unwrap();
         assert_eq!(restored.shares_accepted(), 1);
         assert_eq!(restored.shares_rejected(), 1);
         let w = &restored.workers(1_010)[0];

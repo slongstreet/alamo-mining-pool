@@ -448,6 +448,7 @@ pub async fn run(
         store.clone(),
         state,
         chains.parent.chain,
+        chains.parent.coin.algorithm().share_multiplier(),
         shutdown.child_token(),
     ));
 
@@ -513,6 +514,7 @@ const PUBLISH_INTERVAL: Duration = Duration::from_secs(2);
 /// on the tracker's 30 s tick).
 const BLOCKS_REFRESH_TICKS: u32 = 5;
 
+#[allow(clippy::too_many_arguments)]
 async fn publisher(
     mut events: mpsc::Receiver<PoolEvent>,
     work: WorkReceiver,
@@ -520,10 +522,11 @@ async fn publisher(
     store: Store,
     state: AppState,
     chain: Chain,
+    share_multiplier: f64,
     shutdown: CancellationToken,
 ) -> &'static str {
     let now = now_unix();
-    let mut stats = match Stats::load(&store, now).await {
+    let mut stats = match Stats::load(&store, now, share_multiplier).await {
         Ok(s) => {
             tracing::info!(
                 workers = s.workers(now).len(),
@@ -534,7 +537,7 @@ async fn publisher(
         }
         Err(err) => {
             tracing::warn!(%err, "could not restore stats");
-            Stats::default()
+            Stats::new(share_multiplier)
         }
     };
     let mut persist = Persistence::new(store.clone(), now);
