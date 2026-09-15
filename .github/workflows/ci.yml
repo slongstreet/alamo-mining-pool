@@ -19,6 +19,8 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
+      - name: Check that the Umbrel app pins this release
+        run: deploy/umbrel/check-version.sh
       - run: npm ci
         working-directory: web
       - run: npm run check

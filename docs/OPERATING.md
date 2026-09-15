@@ -102,12 +102,22 @@ RPC and ZMQ endpoints from the variables those apps export, so no credential is 
 written into the store. This directory is the source of truth; the store repository holds
 a copy of it. To publish a release:
 
-1. Update the image tag and digest in `docker-compose.yml` to the new release. The digest
-   is the multi-arch index digest, which `docker buildx imagetools inspect` prints.
-2. Bump `version` in `umbrel-app.yml` and rewrite `releaseNotes`. This is the Umbrel app
-   version, independent of the Alamo release: Umbrel only offers an update when it changes,
-   and the store's CI rejects a push that touches the directory without bumping it.
-3. Copy the directory over the store's copy and push the store.
+The Umbrel app version, the image tag it pins, and the workspace version are one number:
+an Alamo release is an Umbrel app release, and a store-only fix gets a patch release of
+Alamo. `deploy/umbrel/check-version.sh` runs in CI and fails when they drift; once the
+release image is on ghcr.io it also checks the pinned digest is that image's. To publish
+a release:
+
+1. In one PR, bump `version` in `Cargo.toml` and `umbrel-app.yml`, the image tag in
+   `docker-compose.yml`, and rewrite `releaseNotes`. The digest stays stale for now; CI
+   only warns until the image exists.
+2. Tag `vX.Y.Z` on main. The release workflow builds the binaries and pushes the image.
+3. In a second PR, set the digest in `docker-compose.yml` to the multi-arch index digest
+   (`docker buildx imagetools inspect ghcr.io/slongstreet/alamo-mining-pool:X.Y.Z`, or
+   the check script's error message prints it). CI now verifies it.
+4. Copy the directory over the store's copy and push the store. Umbrel only offers an
+   update when `version` changes, and the store's CI rejects a push that touches the
+   directory without bumping it.
 
 To install:
 
