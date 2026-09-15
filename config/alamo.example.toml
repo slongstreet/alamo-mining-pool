@@ -16,7 +16,8 @@ min_difficulty = 1024
 max_difficulty = 16777216
 # Aim for roughly one share every N seconds per worker.
 target_share_seconds = 10
-# How often to re-evaluate a worker's difficulty.
+# Minimum seconds between difficulty changes. Each change is based on the worker's
+# accepted work over the last four of these intervals, and moves at most 2x per step.
 retarget_seconds = 60
 # Only retarget when the observed interval is off by more than this percentage.
 variance_percent = 30
