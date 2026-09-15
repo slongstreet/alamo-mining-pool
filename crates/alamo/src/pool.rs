@@ -115,6 +115,16 @@ async fn connect_node(
             Err(err) => {
                 let delay = CONNECT_BACKOFF[attempt.min(CONNECT_BACKOFF.len() - 1)];
                 attempt += 1;
+                if attempt == 1 {
+                    // The listener opens only after every node answers, so from a miner's
+                    // side this looks like a dead pool rather than a node problem. Say so.
+                    tracing::warn!(
+                        coin = coin.symbol(),
+                        "stratum is not listening until this node answers; miners will be \
+                         refused or reset until then (check the node's RPC URL, credentials, \
+                         and rpcallowip)"
+                    );
+                }
                 tracing::warn!(
                     coin = coin.symbol(),
                     url = %cfg.rpc_url,
