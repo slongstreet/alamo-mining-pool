@@ -138,7 +138,7 @@ The dashboard is embedded at build time, so build `web/dist` first.
 | `pool.name` | Shown on the dashboard. |
 | `pool.data_dir` | Where `alamo.db` lives. Must be writable. |
 | `stratum.listen` | Where miners connect. `0.0.0.0:3333` to accept from the LAN. |
-| `stratum.vardiff.*` | Share difficulty range and target share interval. |
+| `stratum.vardiff.*` | Share difficulty range and target share interval, in the units miners display: for scrypt a share of difficulty 65536 equals one unit of network difficulty, as in cgminer and every Litecoin pool. |
 | `web.listen` | Dashboard and API. Bind to `127.0.0.1` and put a reverse proxy in front if the box is reachable from the internet; the API has no authentication. |
 | `coins.<coin>.rpc_url`, `rpc_user`, `rpc_password` | Node RPC. The password is never logged. |
 | `${NAME}` in any value | Replaced with the environment variable `NAME` when the file is read; startup fails naming the variable if it is unset. Comment lines are not expanded. |

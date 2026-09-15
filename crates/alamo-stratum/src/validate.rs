@@ -6,7 +6,6 @@ use alamo_core::auxpow::AuxPow;
 use alamo_core::hash::to_display_hex;
 use alamo_core::header::BlockHeader;
 use alamo_core::job::{RejectReason, ShareOutcome};
-use alamo_core::target::hash_difficulty;
 
 /// The fields of a `mining.submit`, already parsed from hex.
 #[derive(Clone, Debug)]
@@ -70,7 +69,7 @@ pub fn validate(
         nonce: submit.nonce,
     };
     let pow_hash = job.work.algorithm.pow_hash(&header.serialize());
-    let difficulty = hash_difficulty(&pow_hash);
+    let difficulty = job.work.algorithm.share_difficulty(&pow_hash);
 
     if !job.target.is_met_by(&pow_hash) {
         return (
@@ -139,21 +138,25 @@ mod tests {
     use crate::job::SessionJob;
     use alamo_core::coinbase::CoinbaseParts;
     use alamo_core::job::JobId;
-    use alamo_core::target::Target;
     use alamo_core::work::WorkTemplate;
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    /// A stratum difficulty far below the regtest network target (network difficulty
+    /// 1e-7 expressed in scrypt share units), so every accepted share is a block.
+    const TINY: f64 = 1e-7 * 65536.0;
+
     fn job(difficulty: f64) -> SessionJob {
         let work = Arc::new(WorkTemplate::regtest_sample(1, None));
         let coinbase = CoinbaseParts::build(&work, &[0x51], &[], 8).unwrap();
+        let target = work.algorithm.share_target(difficulty);
         SessionJob {
             id: JobId(7),
             work,
             coinbase,
             aux: Vec::new(),
             difficulty,
-            target: Target::from_difficulty(difficulty),
+            target,
             stale: false,
             seen: HashSet::new(),
         }
@@ -180,6 +183,7 @@ mod tests {
         let tree = AuxTree::single(hash);
         let work = Arc::new(WorkTemplate::regtest_sample(1, None));
         let coinbase = CoinbaseParts::build(&work, &[0x51], &tree.commitment(), 8).unwrap();
+        let target = work.algorithm.share_target(difficulty);
         SessionJob {
             id: JobId(8),
             work,
@@ -195,7 +199,7 @@ mod tests {
                 stale: false,
             }],
             difficulty,
-            target: Target::from_difficulty(difficulty),
+            target,
             stale: false,
             seen: HashSet::new(),
         }
@@ -225,8 +229,7 @@ mod tests {
 
     #[test]
     fn regtest_share_is_a_block_and_duplicates_are_rejected() {
-        // Share difficulty far below the regtest network target: any accepted share is a block.
-        let mut j = job(1e-7);
+        let mut j = job(TINY);
         let nonce = mine(&mut j);
         let (outcome, block) =
             validate(&mut j, &[1, 2, 3, 4], &submit(nonce), "addr", 1_700_000_100);
@@ -249,13 +252,13 @@ mod tests {
 
     #[test]
     fn rejects_stale_bad_ntime_and_bad_extranonce() {
-        let mut j = job(1e-7);
+        let mut j = job(TINY);
         j.stale = true;
         assert_eq!(
             validate(&mut j, &[0; 4], &submit(1), "a", 1_700_000_100).0,
             ShareOutcome::Rejected(RejectReason::StaleJob)
         );
-        let mut j = job(1e-7);
+        let mut j = job(TINY);
         let mut s = submit(1);
         s.ntime = 1;
         assert_eq!(
@@ -273,7 +276,7 @@ mod tests {
     #[test]
     fn merged_share_yields_parent_and_aux_blocks() {
         use alamo_core::auxpow::{decode_for_test, MERGED_MINING_MAGIC};
-        let mut j = merged_job(1e-7);
+        let mut j = merged_job(TINY);
         let nonce = mine(&mut j);
         let (outcome, blocks) =
             validate(&mut j, &[1, 2, 3, 4], &submit(nonce), "addr", 1_700_000_100);

@@ -17,7 +17,6 @@ use alamo_core::hash::{from_display_hex, sha256d, to_display_hex};
 use alamo_core::header::BlockHeader;
 use alamo_core::merkle::root_from_branch;
 use alamo_core::payout::{AuxPayoutTable, PayoutSet, PayoutTable};
-use alamo_core::target::Target;
 use alamo_core::Algorithm;
 use alamo_store::Store;
 use alamo_stratum::job::prevhash_from_stratum;
@@ -206,7 +205,8 @@ async fn mines_a_block_on_regtest() {
     coinbase.extend_from_slice(&extranonce2);
     coinbase.extend_from_slice(&coinb2);
     let merkle_root = root_from_branch(&sha256d(&coinbase), &branch);
-    let share_target = Target::from_difficulty(difficulty);
+    // Mine against the target a real scrypt miner would derive from set_difficulty.
+    let share_target = Algorithm::Scrypt.share_target(difficulty);
     let mut header = BlockHeader {
         version,
         prev_hash,
