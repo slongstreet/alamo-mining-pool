@@ -2,7 +2,7 @@ manifestVersion: 1
 id: longstreet-alamo
 category: bitcoin
 name: Alamo Mining Pool
-version: "0.1.8"
+version: "0.1.9"
 tagline: Solo mine Litecoin and merge-mine Dogecoin against your own nodes
 description: >-
   Alamo is a self-hosted solo mining pool. Miners connect over stratum with their
@@ -14,10 +14,10 @@ description: >-
   and ZMQ endpoints automatically. Set your fallback payout addresses in
   alamo.toml under the app's data directory before pointing miners at port 3333.
 releaseNotes: >-
-  Alamo 0.1.8: explainer tooltips on the round, best share, and luck figures; blocks
-  expected so far shown until the first block is found; long worker names truncated so
-  every column fits; and a button to remove a worker that is no longer mining. From this
-  release the app version is the Alamo version.
+  Alamo 0.1.9: fixes the current round and lifetime work reading 65,536 times too high
+  after a restart; the block odds panel shows time to block and luck side by side; worker
+  names keep the rig name and shorten the address instead; workers list the active rigs
+  first; and the share-count reset moves to the Workers panel.
 developer: Scott Longstreet
 website: https://github.com/slongstreet/alamo-mining-pool
 icon: https://raw.githubusercontent.com/slongstreet/longstreet-umbrel-apps/refs/heads/main/longstreet-alamo/icon.svg
