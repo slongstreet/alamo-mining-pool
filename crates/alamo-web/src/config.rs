@@ -9,4 +9,9 @@ use std::net::SocketAddr;
 pub struct WebConfig {
     /// Address to listen on.
     pub listen: SocketAddr,
+    /// Refuse every change from the dashboard: settings, share-count reset, worker
+    /// removal. For deployments where the dashboard is reachable by people who should
+    /// not operate the pool; the API has no authentication of its own.
+    #[serde(default)]
+    pub read_only: bool,
 }

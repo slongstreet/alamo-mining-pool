@@ -8,6 +8,7 @@
 mod accounting;
 mod blocks;
 mod retention;
+mod settings;
 
 pub use accounting::{AuxPayoutRecord, HashrateSample, NewShare, ShareRow, WorkerRow, WorkerWrite};
 pub use blocks::{BlockRow, BlockStatus, CoinRounds, NewBlock};
@@ -15,7 +16,7 @@ pub use retention::{RetentionPolicy, RetentionReport};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Storage errors.
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +36,7 @@ pub enum StoreError {
 #[derive(Clone, Debug)]
 pub struct Store {
     pool: SqlitePool,
+    path: PathBuf,
 }
 
 impl Store {
@@ -55,7 +57,10 @@ impl Store {
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         tracing::info!(path = %path.display(), "database ready");
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            path: path.to_path_buf(),
+        })
     }
 
     /// The underlying connection pool.

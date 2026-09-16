@@ -150,6 +150,7 @@ The dashboard is embedded at build time, so build `web/dist` first.
 | `stratum.listen` | Where miners connect. `0.0.0.0:3333` to accept from the LAN. |
 | `stratum.vardiff.*` | Share difficulty range and target share interval, in the units miners display: for scrypt a share of difficulty 65536 equals one unit of network difficulty, as in cgminer and every Litecoin pool. |
 | `web.listen` | Dashboard and API. Bind to `127.0.0.1` and put a reverse proxy in front if the box is reachable from the internet; the API has no authentication. |
+| `web.read_only` | Refuse every change from the dashboard (settings, share-count reset, worker removal). |
 | `coins.<coin>.rpc_url`, `rpc_user`, `rpc_password` | Node RPC. The password is never logged. |
 | `${NAME}` in any value | Replaced with the environment variable `NAME` when the file is read; startup fails naming the variable if it is unset. Comment lines are not expanded. |
 | `coins.<coin>.zmq_hashblock` | The node's `zmqpubhashblock` endpoint, `tcp://host:port`. |
@@ -157,6 +158,23 @@ The dashboard is embedded at build time, so build `web/dist` first.
 | `coins.<coin>.template_stale_secs` | How long a node may be unreachable before its template is withdrawn (default 120). |
 
 `alamo --config alamo.toml --check` validates the file and exits.
+
+### Settings page
+
+The dashboard's Settings page (the link in the header) changes a few things without a
+restart: the pool name, the coinbase tag, each coin's fallback payout address, the vardiff
+settings, and the log level. It also shows each node's endpoint and health with a "Test
+connection" button, downloads the recent log and a consistent copy of the database, and
+resets share counts. Changes are stored in `alamo.db` and override the file; each one is
+marked on the page and can be reverted to the file's value. A stored value that no longer
+validates on startup (say, after switching a node to another network) is dropped with a
+warning in the log.
+
+Node endpoints and credentials are deliberately not editable there: the API has no
+authentication, so anyone who can open the dashboard could otherwise repoint the pool at
+a host of their choosing. If people who should not operate the pool can reach the
+dashboard, set `[web] read_only = true`; every change from the page, including the
+share-count reset, is then refused with 403.
 
 ### Miner setup
 

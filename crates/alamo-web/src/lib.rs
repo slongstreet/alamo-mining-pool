@@ -5,20 +5,28 @@
 pub mod api;
 pub mod assets;
 pub mod config;
+pub mod logs;
 pub mod metrics;
+pub mod settings;
 pub mod snapshot;
 
 use alamo_store::Store;
-use axum::routing::{delete, get, post};
-use axum::Router;
+use axum::routing::{delete, get, post, put};
+use axum::{middleware, Router};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
 pub use config::WebConfig;
+pub use logs::LogBuffer;
+pub use settings::{
+    CoinSettings, LogControl, NodeProbe, Operator, Setting, SettingsDoc, SettingsError,
+    SettingsPatch, VardiffPatch, VardiffSettings,
+};
 pub use snapshot::{
     AuxPayoutStatus, CoinStatus, NodeStatus, PoolSnapshot, RoundStatus, WorkerStatus,
 };
@@ -41,8 +49,14 @@ pub struct AppState {
 }
 
 struct Inner {
-    pool_name: String,
+    pool_name: RwLock<String>,
     stratum_port: u16,
+    /// `[web] read_only`: every mutating endpoint answers 403.
+    read_only: AtomicBool,
+    /// Recent log lines for download; empty until the binary installs its buffer.
+    logs: OnceLock<LogBuffer>,
+    /// Settings hook; absent until the pool has connected to its nodes.
+    operator: OnceLock<Arc<dyn Operator>>,
     started_at: Instant,
     /// The latest status document. WebSocket clients subscribe to it.
     snapshot: watch::Sender<PoolSnapshot>,
@@ -59,8 +73,11 @@ impl AppState {
         let (commands, commands_rx) = mpsc::channel(8);
         Self {
             inner: Arc::new(Inner {
-                pool_name: pool_name.into(),
+                pool_name: RwLock::new(pool_name.into()),
                 stratum_port,
+                read_only: AtomicBool::new(false),
+                logs: OnceLock::new(),
+                operator: OnceLock::new(),
                 started_at: Instant::now(),
                 snapshot: watch::Sender::new(PoolSnapshot::default()),
                 store,
@@ -90,9 +107,52 @@ impl AppState {
         self.inner.snapshot.subscribe()
     }
 
-    /// Configured pool name.
-    pub fn pool_name(&self) -> &str {
-        &self.inner.pool_name
+    /// Pool name shown on the dashboard.
+    pub fn pool_name(&self) -> String {
+        self.inner
+            .pool_name
+            .read()
+            .map(|n| n.clone())
+            .unwrap_or_default()
+    }
+
+    /// Rename the pool; the next snapshot carries the new name.
+    pub fn set_pool_name(&self, name: &str) {
+        if let Ok(mut current) = self.inner.pool_name.write() {
+            *current = name.to_string();
+        }
+        self.inner.snapshot.send_modify(|_| {});
+    }
+
+    /// Refuse every mutating request from now on (or accept them again).
+    pub fn set_read_only(&self, read_only: bool) {
+        self.inner.read_only.store(read_only, Ordering::Relaxed);
+    }
+
+    /// Whether mutating requests are refused.
+    pub fn read_only(&self) -> bool {
+        self.inner.read_only.load(Ordering::Relaxed)
+    }
+
+    /// Hand over the log buffer the tracing subscriber writes to. Only the first call
+    /// takes effect.
+    pub fn install_logs(&self, logs: LogBuffer) {
+        let _ = self.inner.logs.set(logs);
+    }
+
+    /// The log buffer, empty when none was installed.
+    pub fn logs(&self) -> LogBuffer {
+        self.inner.logs.get().cloned().unwrap_or_default()
+    }
+
+    /// Install the settings hook. Only the first call takes effect.
+    pub fn install_operator(&self, operator: Arc<dyn Operator>) {
+        let _ = self.inner.operator.set(operator);
+    }
+
+    /// The settings hook, once the pool has installed it.
+    pub fn operator(&self) -> Option<Arc<dyn Operator>> {
+        self.inner.operator.get().cloned()
     }
 
     /// Seconds since the daemon started.
@@ -102,7 +162,7 @@ impl AppState {
 
     /// Replace the published status document and wake WebSocket clients.
     pub fn publish(&self, mut snapshot: PoolSnapshot) {
-        snapshot.pool_name = self.inner.pool_name.clone();
+        snapshot.pool_name = self.pool_name();
         snapshot.stratum_port = self.inner.stratum_port;
         snapshot.version = env!("CARGO_PKG_VERSION").to_string();
         snapshot.uptime_seconds = self.uptime_seconds();
@@ -112,7 +172,7 @@ impl AppState {
     /// The current status document.
     pub fn snapshot(&self) -> PoolSnapshot {
         let mut s = self.inner.snapshot.borrow().clone();
-        s.pool_name = self.inner.pool_name.clone();
+        s.pool_name = self.pool_name();
         s.stratum_port = self.inner.stratum_port;
         s.version = env!("CARGO_PKG_VERSION").to_string();
         s.uptime_seconds = self.uptime_seconds();
@@ -138,6 +198,15 @@ pub enum ServeError {
 
 /// Build the router: `/api/*` handlers and the embedded dashboard for everything else.
 pub fn router(state: AppState) -> Router {
+    // Everything that changes state goes through the read-only guard.
+    let writes = Router::new()
+        .route("/api/stats/reset", post(api::reset_stats))
+        .route("/api/workers/{name}", delete(api::remove_worker))
+        .route("/api/settings", put(api::put_settings))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::refuse_when_read_only,
+        ));
     Router::new()
         .route("/api/health", get(api::health))
         .route("/api/status", get(api::status))
@@ -145,8 +214,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/hashrate", get(api::hashrate))
         .route("/api/shares", get(api::shares))
         .route("/api/blocks", get(api::blocks))
-        .route("/api/stats/reset", post(api::reset_stats))
-        .route("/api/workers/{name}", delete(api::remove_worker))
+        .route("/api/settings", get(api::get_settings))
+        .route("/api/nodes/{key}/test", post(api::test_node))
+        .route("/api/logs", get(api::download_logs))
+        .route("/api/backup", get(api::download_backup))
+        .merge(writes)
         .route("/metrics", get(metrics::metrics))
         .fallback(assets::serve)
         .layer(TraceLayer::new_for_http())

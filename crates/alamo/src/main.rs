@@ -2,12 +2,17 @@
 
 #![forbid(unsafe_code)]
 
+use alamo::settings::LogSetup;
 use alamo::Config;
+use alamo_web::LogBuffer;
 use anyhow::Context;
 use clap::Parser;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{reload, EnvFilter};
 
 /// Self-hosted solo mining pool.
 #[derive(Parser, Debug)]
@@ -24,12 +29,23 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
+    // The filter can be changed from the dashboard; the log buffer feeds its download.
+    let filter = std::env::var(EnvFilter::DEFAULT_ENV).unwrap_or_else(|_| "info".to_string());
+    let (filter_layer, filter_handle) =
+        reload::Layer::new(EnvFilter::try_new(&filter).unwrap_or_else(|_| EnvFilter::new("info")));
+    let logs = LogBuffer::default();
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(logs.layer())
         .init();
+    let log = LogSetup {
+        filter,
+        control: Arc::new(move |directive: &str| {
+            let filter = EnvFilter::try_new(directive).map_err(|e| e.to_string())?;
+            filter_handle.reload(filter).map_err(|e| e.to_string())
+        }),
+    };
 
     let args = Args::parse();
     let config = Config::load(&args.config)?;
@@ -57,6 +73,11 @@ async fn main() -> anyhow::Result<()> {
         config.stratum.listen.port(),
         store.clone(),
     );
+    state.install_logs(logs);
+    state.set_read_only(config.web.read_only);
+    if config.web.read_only {
+        tracing::info!("dashboard is read-only; settings and resets are refused");
+    }
 
     let web = tokio::spawn(alamo_web::serve(
         config.web.clone(),
@@ -67,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
         config,
         store,
         state,
+        log,
         shutdown.child_token(),
     ));
     tokio::pin!(web, pool);

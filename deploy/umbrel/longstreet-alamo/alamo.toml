@@ -1,6 +1,7 @@
 # Alamo Mining Pool on Umbrel. Node endpoints and credentials come from the Litecoin and
 # Dogecoin node apps through environment variables; the daemon substitutes ${NAME} when it
-# reads this file. Edit only the two fallback_address values.
+# reads this file. The two fallback_address values are the only ones to edit here, and the
+# dashboard's Settings page can set them too (its values override this file).
 
 [pool]
 name = "Alamo Solo Pool"

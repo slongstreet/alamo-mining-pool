@@ -20,7 +20,7 @@ use alamo_core::payout::{AuxPayoutTable, PayoutSet, PayoutTable};
 use alamo_core::Algorithm;
 use alamo_store::Store;
 use alamo_stratum::job::prevhash_from_stratum;
-use alamo_stratum::{BlockCandidate, PoolEvent, StratumConfig, StratumServer, VardiffConfig};
+use alamo_stratum::{BlockCandidate, PoolEvent, StratumServer, VardiffConfig};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,16 +113,15 @@ async fn mines_a_block_on_regtest() {
     let (events_tx, mut events_rx) = mpsc::channel::<PoolEvent>(256);
     let (blocks_tx, mut blocks_rx) = mpsc::channel(4);
     let bound = StratumServer {
-        config: StratumConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
-            vardiff: VardiffConfig {
-                initial_difficulty: SHARE_DIFFICULTY,
-                min_difficulty: SHARE_DIFFICULTY,
-                ..Default::default()
-            },
-        },
+        listen: "127.0.0.1:0".parse().unwrap(),
+        vardiff: watch::channel(VardiffConfig {
+            initial_difficulty: SHARE_DIFFICULTY,
+            min_difficulty: SHARE_DIFFICULTY,
+            ..Default::default()
+        })
+        .1,
+        payouts: watch::channel(payouts).1,
         work: work_rx.clone(),
-        payouts,
         events: events_tx,
         blocks: blocks_tx,
     }

@@ -141,8 +141,9 @@ pub struct TemplateSource {
     pub rpc: RpcClient,
     /// The coin being mined.
     pub coin: Arc<dyn Coin>,
-    /// Bytes for the coinbase scriptSig tag.
-    pub coinbase_tag: Vec<u8>,
+    /// Bytes for the coinbase scriptSig tag. A change is picked up on the next poll and
+    /// produces a fresh template (a non-clean job, so shares in flight stay valid).
+    pub coinbase_tag: watch::Receiver<Vec<u8>>,
     /// How often to check the chain tip.
     pub poll_interval: Duration,
     /// How often to refresh the template even without a new tip (picks up new fees).
@@ -165,6 +166,9 @@ const FAILURE_POLL: Duration = Duration::from_secs(2);
 impl TemplateSource {
     /// A source with default timings, no notifications, and no health reporting.
     pub fn new(rpc: RpcClient, coin: Arc<dyn Coin>, coinbase_tag: Vec<u8>) -> Self {
+        // A receiver keeps its value after the sender is dropped, so a fixed tag needs
+        // no live channel.
+        let (_, coinbase_tag) = watch::channel(coinbase_tag);
         Self {
             rpc,
             coin,
@@ -189,6 +193,7 @@ impl TemplateSource {
     async fn poll_loop(mut self, tx: watch::Sender<Option<Arc<WorkTemplate>>>) {
         let mut next_id: u64 = 1;
         let mut last_tip: Option<String> = None;
+        let mut last_tag: Option<Vec<u8>> = None;
         let mut last_refresh = Instant::now() - self.refresh_interval;
         let mut last_ok: Option<Instant> = None;
         let mut health = NodeHealth::default();
@@ -197,7 +202,10 @@ impl TemplateSource {
             .as_mut()
             .map_or(0, |rx| rx.borrow_and_update().blocks);
         loop {
-            match self.fetch(&last_tip, last_refresh, JobId(next_id)).await {
+            match self
+                .fetch(&last_tip, &last_tag, last_refresh, JobId(next_id))
+                .await
+            {
                 Ok(fetched) => {
                     if health.failures > 0 {
                         tracing::info!(coin = self.coin.symbol(), "node reachable again");
@@ -207,9 +215,17 @@ impl TemplateSource {
                     health.failures = 0;
                     health.last_error = None;
                     health.last_ok = Some(now_unix());
-                    if let Some((tip, work)) = fetched {
+                    if let Some((tip, tag, work)) = fetched {
                         next_id += 1;
                         last_refresh = Instant::now();
+                        if last_tag.as_ref().is_some_and(|t| *t != tag) {
+                            tracing::info!(
+                                coin = work.coin,
+                                tag = %String::from_utf8_lossy(&tag),
+                                "coinbase tag changed"
+                            );
+                        }
+                        last_tag = Some(tag);
                         tracing::info!(
                             coin = work.coin,
                             height = work.height,
@@ -271,17 +287,34 @@ impl TemplateSource {
         }
     }
 
-    /// Sleep for `delay`, or return early when ZMQ reports a new block.
+    /// Sleep for `delay`, or return early when ZMQ reports a new block or the coinbase
+    /// tag changes.
     async fn wait(&mut self, delay: Duration, zmq_blocks: &mut u64) {
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
+        // A tag fixed at construction has no sender; then only the timer and ZMQ apply.
+        let mut tag_live = !self.coinbase_tag.has_changed().is_err();
         loop {
             let Some(rx) = self.zmq.as_mut() else {
-                sleep.await;
-                return;
+                tokio::select! {
+                    _ = &mut sleep => return,
+                    changed = self.coinbase_tag.changed(), if tag_live => {
+                        if changed.is_ok() {
+                            return;
+                        }
+                        tag_live = false;
+                    }
+                }
+                continue;
             };
             tokio::select! {
                 _ = &mut sleep => return,
+                changed = self.coinbase_tag.changed(), if tag_live => {
+                    if changed.is_ok() {
+                        return;
+                    }
+                    tag_live = false;
+                }
                 changed = rx.changed() => {
                     if changed.is_err() {
                         self.zmq = None;
@@ -299,24 +332,28 @@ impl TemplateSource {
         }
     }
 
-    /// Fetch a template if the tip moved or the refresh interval elapsed.
+    /// Fetch a template if the tip moved, the tag changed, or the refresh interval
+    /// elapsed. Returns the tip and tag the template was built for.
     async fn fetch(
         &self,
         last_tip: &Option<String>,
+        last_tag: &Option<Vec<u8>>,
         last_refresh: Instant,
         id: JobId,
-    ) -> Result<Option<(String, WorkTemplate)>, TemplateError> {
+    ) -> Result<Option<(String, Vec<u8>, WorkTemplate)>, TemplateError> {
         let tip = self.rpc.get_best_block_hash().await?;
         let tip_changed = last_tip.as_deref() != Some(tip.as_str());
-        if !tip_changed && last_refresh.elapsed() < self.refresh_interval {
+        let tag = self.coinbase_tag.borrow().clone();
+        let tag_changed = last_tag.as_ref() != Some(&tag);
+        if !tip_changed && !tag_changed && last_refresh.elapsed() < self.refresh_interval {
             return Ok(None);
         }
         let raw = self
             .rpc
             .get_block_template(self.coin.template_rules())
             .await?;
-        let work = convert(raw, self.coin.as_ref(), &self.coinbase_tag, id, tip_changed)?;
-        Ok(Some((tip, work)))
+        let work = convert(raw, self.coin.as_ref(), &tag, id, tip_changed)?;
+        Ok(Some((tip, tag, work)))
     }
 }
 

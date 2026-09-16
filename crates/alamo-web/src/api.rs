@@ -1,10 +1,13 @@
 //! JSON API handlers and the snapshot WebSocket.
 
+use crate::settings::{NodeProbe, SettingsDoc, SettingsError, SettingsPatch};
 use crate::{AppState, Command, PoolSnapshot};
 use alamo_store::{BlockRow, HashrateSample, ShareRow, StoreError};
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -201,6 +204,166 @@ pub async fn blocks(
     Ok(Json(state.store().recent_blocks(q.clamp(50, 500)).await?))
 }
 
+/// A refused request: a JSON `{"error": ...}` body with the given status.
+#[derive(Debug)]
+pub struct Refusal(StatusCode, String);
+
+impl IntoResponse for Refusal {
+    fn into_response(self) -> Response {
+        (self.0, Json(serde_json::json!({ "error": self.1 }))).into_response()
+    }
+}
+
+fn error(status: StatusCode, message: impl Into<String>) -> Refusal {
+    Refusal(status, message.into())
+}
+
+/// Middleware on every mutating route: 403 while `[web] read_only` is set.
+pub async fn refuse_when_read_only(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.read_only() {
+        return error(
+            StatusCode::FORBIDDEN,
+            "the dashboard is read-only ([web] read_only = true)",
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
+/// The settings hook, or the 503 to answer with while the pool is still connecting.
+fn operator(state: &AppState) -> Result<std::sync::Arc<dyn crate::Operator>, Refusal> {
+    state.operator().ok_or_else(|| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the pool is still connecting to its nodes",
+        )
+    })
+}
+
+fn with_read_only(state: &AppState, mut doc: SettingsDoc) -> SettingsDoc {
+    doc.read_only = state.read_only();
+    doc
+}
+
+/// `GET /api/settings`: the settings document.
+pub async fn get_settings(State(state): State<AppState>) -> Result<Json<SettingsDoc>, Refusal> {
+    let op = operator(&state)?;
+    Ok(Json(with_read_only(&state, op.settings())))
+}
+
+/// `PUT /api/settings`: apply a patch and return the new document. Invalid values are
+/// refused with 400 and a reason; nothing is stored unless the whole patch validates.
+pub async fn put_settings(
+    State(state): State<AppState>,
+    Json(patch): Json<SettingsPatch>,
+) -> Result<Json<SettingsDoc>, Refusal> {
+    let op = operator(&state)?;
+    match op.apply(patch).await {
+        Ok(doc) => Ok(Json(with_read_only(&state, doc))),
+        Err(SettingsError::Invalid(reason)) => Err(error(StatusCode::BAD_REQUEST, reason)),
+        Err(err @ SettingsError::Store(_)) => {
+            tracing::warn!(%err, "settings change failed");
+            Err(error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+        }
+    }
+}
+
+/// `POST /api/nodes/{key}/test`: ask a coin's node who it is. A node that does not
+/// answer is a 502 with the reason.
+pub async fn test_node(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<Json<NodeProbe>, Refusal> {
+    let op = operator(&state)?;
+    op.probe_node(&key)
+        .await
+        .map(Json)
+        .map_err(|reason| error(StatusCode::BAD_GATEWAY, reason))
+}
+
+fn attachment(name: &str, mime: &'static str) -> [(header::HeaderName, String); 3] {
+    [
+        (header::CONTENT_TYPE, mime.to_string()),
+        (
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{name}\""),
+        ),
+        (header::CACHE_CONTROL, "no-store".to_string()),
+    ]
+}
+
+fn stamp() -> String {
+    chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+/// `GET /api/logs`: the recent log as a text file.
+pub async fn download_logs(State(state): State<AppState>) -> Response {
+    let mut text = format!(
+        "# alamo {} log, downloaded {}\n",
+        env!("CARGO_PKG_VERSION"),
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+    );
+    text.push_str(&state.logs().contents());
+    (
+        attachment(
+            &format!("alamo-{}.log", stamp()),
+            "text/plain; charset=utf-8",
+        ),
+        text,
+    )
+        .into_response()
+}
+
+/// `GET /api/backup`: a consistent copy of the database, made with `VACUUM INTO` and
+/// streamed from a temporary file beside it that is unlinked as soon as it is open.
+pub async fn download_backup(State(state): State<AppState>) -> Response {
+    let store = state.store();
+    let temp = store.path().with_file_name(format!(
+        "alamo-backup-{}-{}.db",
+        std::process::id(),
+        stamp()
+    ));
+    if let Err(err) = store.backup_to(&temp).await {
+        tracing::warn!(%err, "database backup failed");
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("backup failed: {err}"),
+        )
+        .into_response();
+    }
+    let file = match tokio::fs::File::open(&temp).await {
+        Ok(file) => file,
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("backup failed: {err}"),
+            )
+            .into_response();
+        }
+    };
+    let size = file.metadata().await.ok().map(|m| m.len());
+    // The open handle keeps the data readable after the name is gone.
+    if let Err(err) = tokio::fs::remove_file(&temp).await {
+        tracing::warn!(path = %temp.display(), %err, "could not remove backup file");
+    }
+    let mut response = (
+        attachment(&format!("alamo-{}.db", stamp()), "application/vnd.sqlite3"),
+        Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+    )
+        .into_response();
+    if let Some(size) = size {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, size.into());
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{router, AppState, PoolSnapshot};
@@ -240,6 +403,208 @@ mod tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// An operator that records patches and answers with a fixed document.
+    struct FakeOperator {
+        patches: std::sync::Mutex<Vec<crate::SettingsPatch>>,
+    }
+
+    impl crate::Operator for FakeOperator {
+        fn settings(&self) -> crate::SettingsDoc {
+            crate::SettingsDoc {
+                pool_name: crate::Setting::from_file("Fake".to_string()),
+                coinbase_tag_max_bytes: 41,
+                ..Default::default()
+            }
+        }
+
+        fn apply(
+            &self,
+            patch: crate::SettingsPatch,
+        ) -> crate::settings::BoxFuture<'_, Result<crate::SettingsDoc, crate::SettingsError>>
+        {
+            Box::pin(async move {
+                if patch.pool_name == Some(Some(String::new())) {
+                    return Err(crate::SettingsError::Invalid(
+                        "pool name must not be empty".into(),
+                    ));
+                }
+                let mut doc = self.settings();
+                if let Some(Some(name)) = &patch.pool_name {
+                    doc.pool_name = crate::Setting::overridden("Fake".into(), name.clone());
+                }
+                self.patches.lock().unwrap().push(patch);
+                Ok(doc)
+            })
+        }
+
+        fn probe_node(
+            &self,
+            key: &str,
+        ) -> crate::settings::BoxFuture<'_, Result<crate::NodeProbe, String>> {
+            let key = key.to_string();
+            Box::pin(async move {
+                if key == "ltc" {
+                    Ok(crate::NodeProbe {
+                        key,
+                        subversion: "/LitecoinCore:0.21.4/".into(),
+                        ..Default::default()
+                    })
+                } else {
+                    Err(format!("unknown coin {key}"))
+                }
+            })
+        }
+    }
+
+    async fn send(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut req = Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(json) => {
+                req = req.header("content-type", "application/json");
+                Body::from(json.to_string())
+            }
+            None => Body::empty(),
+        };
+        let res = router(state.clone())
+            .oneshot(req.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 24)
+            .await
+            .unwrap();
+        (status, headers, bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn settings_wait_for_the_operator_then_pass_patches_through() {
+        let (state, path) = state("settings").await;
+        let (status, _, body) = send(&state, "GET", "/api/settings", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+
+        let op = std::sync::Arc::new(FakeOperator {
+            patches: Default::default(),
+        });
+        state.install_operator(op.clone());
+        let (status, _, body) = send(&state, "GET", "/api/settings", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(doc["pool_name"]["value"], "Fake");
+        assert_eq!(doc["read_only"], false);
+
+        let patch =
+            serde_json::json!({ "pool_name": "Renamed", "vardiff": { "min_difficulty": null } });
+        let (status, _, body) = send(&state, "PUT", "/api/settings", Some(patch)).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(doc["pool_name"]["value"], "Renamed");
+        assert_eq!(doc["pool_name"]["overridden"], true);
+        {
+            let recorded = op.patches.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].vardiff.min_difficulty, Some(None));
+        }
+
+        let (status, _, body) = send(
+            &state,
+            "PUT",
+            "/api/settings",
+            Some(serde_json::json!({ "pool_name": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err["error"], "pool name must not be empty");
+
+        let (status, _, body) = send(&state, "POST", "/api/nodes/ltc/test", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let probe: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(probe["subversion"], "/LitecoinCore:0.21.4/");
+        let (status, _, _) = send(&state, "POST", "/api/nodes/btc/test", None).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn read_only_refuses_every_write_but_still_serves_reads() {
+        let (state, path) = state("readonly").await;
+        state.install_operator(std::sync::Arc::new(FakeOperator {
+            patches: Default::default(),
+        }));
+        state.set_read_only(true);
+        let _rx = state.take_commands().unwrap();
+        for (method, uri) in [
+            ("POST", "/api/stats/reset"),
+            ("DELETE", "/api/workers/x"),
+            ("PUT", "/api/settings"),
+        ] {
+            let body = (method == "PUT").then(|| serde_json::json!({}));
+            let (status, _, bytes) = send(&state, method, uri, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+            let err: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(err["error"].as_str().unwrap().contains("read-only"));
+        }
+        let (status, _, body) = send(&state, "GET", "/api/settings", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(doc["read_only"], true);
+        let (status, _, _) = send(&state, "GET", "/api/logs", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn logs_and_backup_download_as_attachments() {
+        let (state, path) = state("downloads").await;
+        let logs = crate::LogBuffer::default();
+        logs.push("2026-09-16T00:00:00.000Z  INFO hello".into());
+        state.install_logs(logs);
+        let (status, headers, body) = send(&state, "GET", "/api/logs", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let disposition = headers["content-disposition"].to_str().unwrap();
+        assert!(
+            disposition.starts_with("attachment; filename=\"alamo-"),
+            "{disposition}"
+        );
+        assert!(disposition.ends_with(".log\""), "{disposition}");
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.starts_with("# alamo "), "{text}");
+        assert!(text.ends_with("INFO hello\n"), "{text}");
+
+        state
+            .store()
+            .set_setting("pool.name", "kept", 1)
+            .await
+            .unwrap();
+        let (status, headers, body) = send(&state, "GET", "/api/backup", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "application/vnd.sqlite3");
+        assert_eq!(
+            headers["content-length"].to_str().unwrap(),
+            body.len().to_string()
+        );
+        assert!(body.starts_with(b"SQLite format 3\0"));
+        let restored_path = path.with_file_name("restored.db");
+        std::fs::write(&restored_path, &body).unwrap();
+        let restored = Store::open(&restored_path).await.unwrap();
+        assert_eq!(restored.load_settings().await.unwrap()["pool.name"], "kept");
+        // The temporary file was unlinked once open.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("backup"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[tokio::test]

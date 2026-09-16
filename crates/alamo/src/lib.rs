@@ -5,6 +5,7 @@
 pub mod config;
 pub mod persist;
 pub mod pool;
+pub mod settings;
 pub mod stats;
 
 pub use config::Config;

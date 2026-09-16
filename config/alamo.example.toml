@@ -24,6 +24,11 @@ variance_percent = 30
 
 [web]
 listen = "0.0.0.0:8080"
+# The dashboard's Settings page can change the pool name, coinbase tag, fallback payout
+# addresses, vardiff, and log level; changes are stored in the database and override
+# this file. The API has no authentication, so if people who should not operate the pool
+# can reach the dashboard, make it read-only:
+# read_only = true
 
 # Litecoin is the parent chain. Miners connect with an LTC address as username.
 [coins.ltc]
@@ -44,7 +49,8 @@ rpc_password = "change-me"
 # template_stale_secs = 120
 # Paid if a worker's username is not a valid LTC address.
 fallback_address = "ltc1qexampleexampleexampleexampleexampleexamp"
-# Text placed in the coinbase scriptSig.
+# Text placed in the coinbase scriptSig. With merge mining the aux commitment leaves
+# room for 41 bytes.
 coinbase_tag = "/alamo/"
 
 # Dogecoin is merge-mined against Litecoin.

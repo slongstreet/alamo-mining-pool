@@ -9,14 +9,24 @@
   import WorkerTable from './lib/components/WorkerTable.svelte';
   import ShareLog from './lib/components/ShareLog.svelte';
   import BlockHistory from './lib/components/BlockHistory.svelte';
+  import SettingsPage from './lib/components/settings/SettingsPage.svelte';
 
   const live = new LiveStatus();
   const theme = new ThemePreference();
   theme.apply();
 
+  // Two pages, told apart by the hash so the daemon serves one document for both.
+  let hash = $state(location.hash);
+  const page = $derived(hash.startsWith('#/settings') ? 'settings' : 'dashboard');
+
   onMount(() => {
     live.start();
-    return () => live.stop();
+    const onHash = () => (hash = location.hash);
+    window.addEventListener('hashchange', onHash);
+    return () => {
+      live.stop();
+      window.removeEventListener('hashchange', onHash);
+    };
   });
 
   const status = $derived(live.status);
@@ -25,9 +35,11 @@
 </script>
 
 <main>
-  <Header {status} connection={live.connection} error={live.error} {theme} />
+  <Header {status} connection={live.connection} error={live.error} {theme} {page} />
 
-  {#if status}
+  {#if page === 'settings'}
+    <SettingsPage {status} />
+  {:else if status}
     <div class="grid">
       <StatTiles {status} />
 

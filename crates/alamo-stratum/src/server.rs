@@ -1,6 +1,6 @@
 //! TCP listener and per-connection tasks.
 
-use crate::config::StratumConfig;
+use crate::config::VardiffConfig;
 use crate::events::{BlockCandidate, PoolEvent};
 use crate::job::EXTRANONCE1_LEN;
 use crate::protocol::Request;
@@ -38,12 +38,16 @@ pub enum ServeError {
 
 /// The stratum server and everything its sessions need.
 pub struct StratumServer {
-    /// Listener settings.
-    pub config: StratumConfig,
+    /// Address to listen on.
+    pub listen: SocketAddr,
+    /// Variable-difficulty settings. Read when a miner connects, so a change applies to
+    /// new connections and leaves running sessions alone.
+    pub vardiff: watch::Receiver<VardiffConfig>,
+    /// Maps usernames and passwords to payout scripts on every chain. Read when a miner
+    /// connects; a changed fallback address applies to sessions authorized after it.
+    pub payouts: watch::Receiver<Arc<PayoutSet>>,
     /// Source of work templates.
     pub work: WorkReceiver,
-    /// Maps usernames and passwords to payout scripts on every chain.
-    pub payouts: Arc<PayoutSet>,
     /// Where session events go.
     pub events: mpsc::Sender<PoolEvent>,
     /// Where found blocks go.
@@ -61,7 +65,7 @@ pub struct Bound {
 impl StratumServer {
     /// Bind the listen address.
     pub async fn bind(self) -> Result<Bound, ServeError> {
-        let addr = self.config.listen;
+        let addr = self.listen;
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|source| ServeError::Bind { addr, source })?;
@@ -137,8 +141,8 @@ async fn handle_connection(
     let mut session = Session::new(
         id,
         extranonce1(id),
-        server.config.vardiff.clone(),
-        server.payouts.clone(),
+        server.vardiff.borrow().clone(),
+        server.payouts.borrow().clone(),
         Instant::now(),
     );
     let mut work = server.work.clone();
