@@ -4,12 +4,12 @@ use alamo_coins::CoinConfig;
 use alamo_stratum::StratumConfig;
 use alamo_web::WebConfig;
 use anyhow::{bail, Context};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The whole `alamo.toml`.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Pool identity and storage.
@@ -24,7 +24,7 @@ pub struct Config {
 }
 
 /// Pool identity and storage.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PoolConfig {
     /// Display name shown on the dashboard.
@@ -52,6 +52,16 @@ impl Config {
     /// Path of the SQLite database.
     pub fn database_path(&self) -> PathBuf {
         self.pool.data_dir.join("alamo.db")
+    }
+
+    /// The effective configuration as TOML, with every RPC password replaced by a
+    /// placeholder, for the dashboard's diagnostics view.
+    pub fn redacted_toml(&self) -> String {
+        let mut copy = self.clone();
+        for coin in copy.coins.values_mut() {
+            coin.rpc_password = "<redacted>".to_string();
+        }
+        toml::to_string_pretty(&copy).unwrap_or_else(|err| format!("# could not render: {err}"))
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -168,6 +178,18 @@ mod tests {
         assert_eq!(cfg.coins.len(), 2);
         assert_eq!(cfg.coins["doge"].merge_mined_with.as_deref(), Some("ltc"));
         assert_eq!(cfg.stratum.listen.port(), 3333);
+    }
+
+    #[test]
+    fn redacted_toml_hides_passwords() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/alamo.example.toml");
+        let cfg = Config::load(&path).unwrap();
+        let text = cfg.redacted_toml();
+        assert!(!text.contains("change-me"), "{text}");
+        assert!(text.contains("rpc_password = \"<redacted>\""), "{text}");
+        assert!(text.contains("[coins.doge]"), "{text}");
+        let again: Config = toml::from_str(&text).unwrap();
+        assert_eq!(again.coins["ltc"].rpc_url, cfg.coins["ltc"].rpc_url);
     }
 
     #[test]

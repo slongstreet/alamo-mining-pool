@@ -34,7 +34,7 @@
     <div class="label">
       Best share
       <Info
-        text="The highest-difficulty share any worker has submitted since the last reset. A share whose difficulty reaches the network difficulty is a block. It is a record, not a predictor. Reset it from the Workers panel."
+        text="The highest-difficulty share any worker has submitted since the last reset. A share whose difficulty reaches the network difficulty is a block. It is a record, not a predictor. Reset it from the Settings page."
       />
     </div>
     <div class="value num">{formatDifficulty(status.best_share_difficulty)}</div>

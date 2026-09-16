@@ -9,8 +9,14 @@
     connection,
     error,
     theme,
-  }: { status: Status | null; connection: Connection; error: string | null; theme: ThemePreference } =
-    $props();
+    page,
+  }: {
+    status: Status | null;
+    connection: Connection;
+    error: string | null;
+    theme: ThemePreference;
+    page: 'dashboard' | 'settings';
+  } = $props();
 
   const labels: Record<Connection, string> = {
     connecting: 'connecting',
@@ -49,6 +55,11 @@
       {labels[connection]}
     </span>
     <button class="ghost" onclick={() => theme.cycle()} title="Cycle theme">{themeLabel}</button>
+    {#if page === 'settings'}
+      <a class="ghost" href="#/">Dashboard</a>
+    {:else}
+      <a class="ghost" href="#/settings">Settings</a>
+    {/if}
   </div>
 </header>
 

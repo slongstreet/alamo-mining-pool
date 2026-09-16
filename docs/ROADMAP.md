@@ -89,6 +89,19 @@ Work proceeds in waves. Each wave ends with something runnable and tested.
   store app under `deploy/umbrel/` that takes node endpoints and credentials from the
   Litecoin and Dogecoin node apps' exports.
 
+## Wave 6 — Settings page
+- [x] Settings stored in the database override `alamo.toml` and apply live: pool name,
+  coinbase tag (the template source picks it up at once), fallback payout addresses and
+  vardiff (new connections), and the log level (a reloadable filter). Each setting shows
+  whether it is an override and can be reverted to the file's value; a stored value that
+  no longer validates at startup is dropped with a warning.
+- [x] Node cards with endpoint, ZMQ, timing, live health, and a "Test connection" probe.
+  Endpoints and credentials stay in the file: the API has no authentication.
+- [x] Log download from a fixed-size in-memory ring buffer (about 2 MB), database backup
+  via `VACUUM INTO`, share-count reset moved here from the Workers panel, and a redacted
+  view of the effective configuration.
+- [x] `[web] read_only` refuses every change from the dashboard.
+
 ## Later
 - Additional coins via the `Coin` abstraction (BTC/BCH sha256d solo are cheap).
 - Stratum v2.

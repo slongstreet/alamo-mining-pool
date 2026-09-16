@@ -15,7 +15,7 @@ pub struct StratumConfig {
 }
 
 /// Variable-difficulty settings.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VardiffConfig {
     /// Difficulty a new connection starts at.

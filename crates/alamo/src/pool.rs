@@ -3,6 +3,7 @@
 
 use crate::config::Config;
 use crate::persist::Persistence;
+use crate::settings::{LiveSettings, LogSetup};
 use crate::stats::Stats;
 use alamo_coins::{
     merge, Chain, Coin, CoinConfig, NodeHealth, RpcClient, TemplateSource, ZmqStatus, ZmqSubscriber,
@@ -288,13 +289,7 @@ struct NodeFeed {
     zmq: Option<ZmqFeed>,
 }
 
-fn node_feed(node: &ChainNode) -> NodeFeed {
-    let tag = node
-        .config
-        .coinbase_tag
-        .clone()
-        .unwrap_or_else(|| "/alamo/".into())
-        .into_bytes();
+fn node_feed(node: &ChainNode, tag: watch::Receiver<Vec<u8>>) -> NodeFeed {
     let (health_tx, health) = watch::channel(NodeHealth::default());
     let (zmq, zmq_rx) = match &node.config.zmq_hashblock {
         Some(endpoint) => {
@@ -320,7 +315,8 @@ fn node_feed(node: &ChainNode) -> NodeFeed {
         stale_after: Duration::from_secs(node.config.template_stale_secs),
         zmq: zmq_rx,
         health: Some(health_tx),
-        ..TemplateSource::new(node.rpc.clone(), node.coin.clone(), tag)
+        coinbase_tag: tag,
+        ..TemplateSource::new(node.rpc.clone(), node.coin.clone(), Vec::new())
     };
     NodeFeed {
         source,
@@ -363,11 +359,18 @@ pub async fn run(
     config: Config,
     store: Store,
     state: AppState,
+    log: LogSetup,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let Some(chains) = connect_chains(&config, &shutdown).await? else {
         return Ok(());
     };
+    // Settings stored in the database override the file; the pool tasks below watch
+    // the channels this owns, so a change from the dashboard reaches them live.
+    let settings = LiveSettings::start(&config, &chains, store.clone(), state.clone(), log)
+        .await
+        .context("loading settings")?;
+    state.install_operator(settings.clone());
 
     let (work_tx, work_rx) = watch::channel(None);
     let (events_tx, events_rx) = mpsc::channel::<PoolEvent>(4096);
@@ -381,7 +384,7 @@ pub async fn run(
     let (parent_tx, parent_rx) = watch::channel::<Option<Arc<WorkTemplate>>>(None);
     let health = spawn_feed(
         &mut tasks,
-        node_feed(&chains.parent),
+        node_feed(&chains.parent, settings.coinbase_tag()),
         parent_tx,
         &shutdown,
         "template source",
@@ -392,7 +395,7 @@ pub async fn run(
         let (aux_tx, aux_rx) = watch::channel::<Option<Arc<WorkTemplate>>>(None);
         let health = spawn_feed(
             &mut tasks,
-            node_feed(node),
+            node_feed(node, settings.coinbase_tag()),
             aux_tx,
             &shutdown,
             "aux template source",
@@ -407,9 +410,10 @@ pub async fn run(
     });
 
     let bound = StratumServer {
-        config: config.stratum.clone(),
+        listen: config.stratum.listen,
+        vardiff: settings.vardiff(),
+        payouts: settings.payouts(),
         work: work_rx.clone(),
-        payouts: Arc::new(chains.payout_set()),
         events: events_tx,
         blocks: blocks_tx,
     }

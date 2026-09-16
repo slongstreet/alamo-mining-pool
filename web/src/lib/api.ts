@@ -123,24 +123,102 @@ export interface Status {
   blocks: BlockRow[];
 }
 
+/** A non-2xx answer, with the daemon's reason when it gave one. */
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function detail(res: Response): Promise<string> {
+  try {
+    return ((await res.json()) as { error?: string }).error ?? '';
+  } catch {
+    return '';
+  }
+}
+
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(path, { headers: { accept: 'application/json' } });
   if (!res.ok) {
-    throw new Error(`${path}: HTTP ${res.status}`);
+    throw new ApiError(res.status, (await detail(res)) || `${path}: HTTP ${res.status}`);
   }
   return (await res.json()) as T;
 }
 
-async function sendJson<T>(method: 'POST' | 'DELETE', path: string): Promise<T> {
-  const res = await fetch(path, { method, headers: { accept: 'application/json' } });
+/** One operator setting: the value in force, the config file's value, and which applies. */
+export interface Setting<T> {
+  value: T;
+  file_value: T;
+  overridden: boolean;
+}
+
+export interface CoinSettings {
+  key: string;
+  symbol: string;
+  chain: string;
+  merge_mined_with: string | null;
+  fallback_address: Setting<string>;
+  rpc_url: string;
+  rpc_user: string;
+  zmq_hashblock: string | null;
+  poll_interval_ms: number;
+  template_refresh_secs: number;
+  template_stale_secs: number;
+}
+
+export type VardiffField =
+  | 'initial_difficulty'
+  | 'min_difficulty'
+  | 'max_difficulty'
+  | 'target_share_seconds'
+  | 'retarget_seconds'
+  | 'variance_percent';
+
+export type VardiffSettings = Record<VardiffField, Setting<number>>;
+
+export interface SettingsDoc {
+  read_only: boolean;
+  pool_name: Setting<string>;
+  coinbase_tag: Setting<string>;
+  coinbase_tag_max_bytes: number;
+  coins: CoinSettings[];
+  vardiff: VardiffSettings;
+  log_level: Setting<string>;
+  config_toml: string;
+}
+
+/** A change: a value stores an override, `null` reverts to the config file, absent leaves it. */
+export interface SettingsPatch {
+  pool_name?: string | null;
+  coinbase_tag?: string | null;
+  fallback_addresses?: Record<string, string | null>;
+  vardiff?: Partial<Record<VardiffField, number | null>>;
+  log_level?: string | null;
+}
+
+export interface NodeProbe {
+  key: string;
+  symbol: string;
+  chain: string;
+  height: number;
+  subversion: string;
+  protocol_version: number;
+  connections: number;
+  initial_block_download: boolean;
+  latency_ms: number;
+}
+
+async function sendJson<T>(method: 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = { accept: 'application/json' };
+  if (body !== undefined) {
+    headers['content-type'] = 'application/json';
+  }
+  const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   if (!res.ok) {
-    let detail = '';
-    try {
-      detail = ((await res.json()) as { error?: string }).error ?? '';
-    } catch {
-      // Not JSON; the status is enough.
-    }
-    throw new Error(detail || `${path}: HTTP ${res.status}`);
+    throw new ApiError(res.status, (await detail(res)) || `${path}: HTTP ${res.status}`);
   }
   return (await res.json()) as T;
 }
@@ -160,6 +238,17 @@ export const api = {
     ),
   shares: (limit: number) => getJson<ShareRow[]>(`/api/shares?limit=${limit}`),
   blocks: (limit: number) => getJson<BlockRow[]>(`/api/blocks?limit=${limit}`),
+  settings: () => getJson<SettingsDoc>('/api/settings'),
+  /** Apply a change; the daemon validates the whole patch before storing any of it. */
+  updateSettings: (patch: SettingsPatch) => sendJson<SettingsDoc>('PUT', '/api/settings', patch),
+  /** Ask a coin's node who it is. */
+  testNode: (key: string) => sendJson<NodeProbe>('POST', `/api/nodes/${encodeURIComponent(key)}/test`),
+};
+
+/** Where the log and database downloads live; plain links, so the browser saves them. */
+export const downloads = {
+  logs: '/api/logs',
+  backup: '/api/backup',
 };
 
 /** WebSocket URL for the live snapshot stream, relative to where the page was served. */

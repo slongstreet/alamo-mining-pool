@@ -99,6 +99,7 @@ dependencies = [
  "alamo-core",
  "alamo-store",
  "axum",
+ "chrono",
  "futures",
  "mime_guess",
  "rust-embed",
@@ -111,6 +112,7 @@ dependencies = [
  "tower",
  "tower-http 0.7.1",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
