@@ -94,14 +94,17 @@ impl Store {
         Ok(n)
     }
 
-    /// Record a found block, stamping it with the pool's total accepted work so far.
-    /// Returns its row id.
+    /// Record a found block, stamping it with the pool's total accepted work so far:
+    /// every worker's plus the work of workers since removed, in stratum share units as
+    /// the worker rows keep it. Returns its row id.
     pub async fn insert_block(&self, block: &NewBlock) -> Result<i64, StoreError> {
         let result = sqlx::query(
             "INSERT INTO blocks (coin, height, hash, worker, difficulty, share_diff, reward_sats,
                                  found_at, status, work_at_found)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                     (SELECT COALESCE(SUM(work_accepted), 0.0) FROM workers))
+                     (SELECT COALESCE(SUM(work_accepted), 0.0) FROM workers)
+                     + (SELECT COALESCE(SUM(value), 0.0) FROM pool_counters
+                        WHERE key = 'retired_work'))
              ON CONFLICT (coin, hash) DO UPDATE SET status = excluded.status",
         )
         .bind(&block.coin)
@@ -268,6 +271,15 @@ mod tests {
         );
         // Current round: 105 total minus 100 banked at block "b".
         assert_eq!(store.total_work().await.unwrap() - 100.0, 5.0);
+
+        // Work retired with a removed worker is banked at the next block as well.
+        assert_eq!(store.remove_worker("w").await.unwrap(), Some(105.0));
+        store
+            .insert_block(&block("c", 40, BlockStatus::Accepted))
+            .await
+            .unwrap();
+        let rounds = store.coin_rounds().await.unwrap();
+        assert_eq!(rounds[0].last_work_at_found, Some(105.0));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

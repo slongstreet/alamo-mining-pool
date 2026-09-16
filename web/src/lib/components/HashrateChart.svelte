@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type HashrateSample } from '../api';
-  import { formatClock, formatHashrate } from '../format';
+  import { formatClock, formatHashrate, shortWorker } from '../format';
 
   let { live, workers }: { live: number; workers: string[] } = $props();
 
@@ -86,7 +86,7 @@
         <select bind:value={worker} class="ghost">
           <option value="">Pool</option>
           {#each workers as w (w)}
-            <option value={w}>{w}</option>
+            <option value={w}>{shortWorker(w)}</option>
           {/each}
         </select>
       {/if}

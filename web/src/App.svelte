@@ -33,7 +33,7 @@
 
       <div class="grid two">
         {#each status.coins as coin (coin.symbol)}
-          <OddsPanel {coin} bestShare={status.best_share_difficulty} {now} />
+          <OddsPanel {coin} bestShare={status.best_share_difficulty} {now} scoringSince={status.scoring_since} />
         {/each}
         {#if status.coins.length === 0}
           <section class="panel">

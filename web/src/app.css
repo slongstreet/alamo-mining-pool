@@ -135,20 +135,8 @@ h2 {
 
 .tile .label {
   display: flex;
-  justify-content: space-between;
   align-items: baseline;
-  gap: 0.5rem;
-}
-
-.tile .label .reset {
-  font-size: 0.7rem;
-  padding: 0.05rem 0.45rem;
-  text-transform: none;
-  letter-spacing: 0;
-}
-
-.tile .sub .bad {
-  color: var(--bad);
+  gap: 0.4rem;
 }
 
 .tile .value {

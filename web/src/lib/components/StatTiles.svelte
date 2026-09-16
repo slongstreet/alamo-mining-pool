@@ -1,25 +1,9 @@
 <script lang="ts">
-  import { api, type Status } from '../api';
+  import type { Status } from '../api';
   import { formatDifficulty, formatHashrate, formatInteger } from '../format';
   import Info from './Info.svelte';
 
   let { status }: { status: Status } = $props();
-
-  let resetting = $state(false);
-  let resetError = $state<string | null>(null);
-
-  async function resetStats() {
-    if (!confirm('Reset accepted/rejected share counts and best share for every worker?')) return;
-    resetting = true;
-    resetError = null;
-    try {
-      await api.resetStats();
-    } catch (err) {
-      resetError = err instanceof Error ? err.message : String(err);
-    } finally {
-      resetting = false;
-    }
-  }
 
   const online = $derived(status.workers.filter((w) => w.connections > 0).length);
   const total = $derived(status.shares_accepted + status.shares_rejected);
@@ -50,16 +34,11 @@
     <div class="label">
       Best share
       <Info
-        text="The highest-difficulty share any worker has submitted since the last reset. A share whose difficulty reaches the network difficulty is a block. It is a record, not a predictor."
+        text="The highest-difficulty share any worker has submitted since the last reset. A share whose difficulty reaches the network difficulty is a block. It is a record, not a predictor. Reset it from the Workers panel."
       />
-      <button class="ghost reset" onclick={resetStats} disabled={resetting} title="Zero share counts and best share for every worker">
-        {resetting ? 'resetting…' : 'reset'}
-      </button>
     </div>
     <div class="value num">{formatDifficulty(status.best_share_difficulty)}</div>
-    <div class="sub">
-      {#if resetError}<span class="bad">{resetError}</span>{:else}difficulty, since last reset{/if}
-    </div>
+    <div class="sub">difficulty, since last reset</div>
   </div>
   <div class="tile">
     <div class="label">Blocks found</div>

@@ -42,6 +42,8 @@ pub struct Stats {
     shares_rejected: u64,
     /// Accepted work of workers since removed, so removal does not move the round.
     retired_work: f64,
+    /// When the pool first saw a worker: the start of the score before any block.
+    scoring_since: Option<u64>,
 }
 
 impl Default for Stats {
@@ -59,6 +61,7 @@ impl Stats {
             shares_accepted: 0,
             shares_rejected: 0,
             retired_work: 0.0,
+            scoring_since: None,
         }
     }
 
@@ -87,14 +90,15 @@ impl Stats {
                 difficulty: 0.0,
                 accepted: row.shares_accepted.max(0) as u64,
                 rejected: row.shares_rejected.max(0) as u64,
-                // Persisted in stratum share units (it is a MAX over share rows).
+                // Persisted in stratum share units (a MAX and a SUM over share rows).
                 best_difficulty: row.best_difficulty / share_multiplier,
-                work_accepted: row.work_accepted,
+                work_accepted: row.work_accepted / share_multiplier,
                 last_share: (row.shares_accepted > 0).then_some(row.last_seen.max(0) as u64),
                 window: VecDeque::new(),
             };
             stats.shares_accepted += w.accepted;
             stats.shares_rejected += w.rejected;
+            stats.note_seen(row.first_seen.max(0) as u64);
             stats.workers.insert(row.name.clone(), w);
         }
         let cutoff = now.saturating_sub(HASHRATE_WINDOW_SECS);
@@ -127,8 +131,24 @@ impl Stats {
         let since = now.saturating_sub(HASHRATE_WINDOW_SECS) as i64;
         let shares = store.accepted_shares_since(since).await?;
         let mut stats = Self::restore(&workers, &shares, now, share_multiplier);
-        stats.retired_work = store.retired_work().await?;
+        // Banked from worker rows, so stratum share units as well.
+        stats.retired_work = store.retired_work().await? / share_multiplier;
         Ok(stats)
+    }
+
+    /// Stratum share difficulty per unit of network difficulty on the parent chain.
+    pub fn share_multiplier(&self) -> f64 {
+        self.share_multiplier
+    }
+
+    /// Unix time the pool first saw a worker, if it ever has. Survives worker removal,
+    /// since the removed worker's work still counts.
+    pub fn scoring_since(&self) -> Option<u64> {
+        self.scoring_since
+    }
+
+    fn note_seen(&mut self, at: u64) {
+        self.scoring_since = Some(self.scoring_since.map_or(at, |t| t.min(at)));
     }
 
     /// Apply one event.
@@ -141,6 +161,7 @@ impl Stats {
                 fallback,
                 aux,
             } => {
+                self.note_seen(now);
                 let w = self.workers.entry(worker.clone()).or_default();
                 w.address = address.clone();
                 w.fallback = *fallback;
@@ -273,7 +294,8 @@ impl Stats {
         samples
     }
 
-    /// Per-worker status, connected workers first, then by name.
+    /// Per-worker status: connected workers first, then the most recent share first,
+    /// then by name.
     pub fn workers(&self, now: u64) -> Vec<WorkerStatus> {
         let mut out: Vec<WorkerStatus> = self
             .workers
@@ -296,6 +318,11 @@ impl Stats {
         out.sort_by(|a, b| {
             (b.connections > 0)
                 .cmp(&(a.connections > 0))
+                .then_with(|| {
+                    a.last_share_seconds
+                        .unwrap_or(u64::MAX)
+                        .cmp(&b.last_share_seconds.unwrap_or(u64::MAX))
+                })
                 .then_with(|| a.name.cmp(&b.name))
         });
         out
@@ -361,6 +388,75 @@ mod tests {
                     .unwrap_or(0)
             ))
             .join("pool.db")
+    }
+
+    #[tokio::test]
+    async fn restore_converts_persisted_work_from_stratum_units() {
+        let path = temp_db();
+        let store = Store::open(&path).await.unwrap();
+        let t0 = 1_700_000_000i64;
+        let worker = |name: &str| WorkerWrite {
+            name: name.into(),
+            payout_address: "ltc1qabc".into(),
+            fallback: false,
+            aux_payouts: vec![],
+            ts: t0,
+        };
+        // Two scrypt shares at stratum difficulty 65536: one unit of network work each.
+        let share = |name: &str, i: i64| NewShare {
+            ts: t0 + i,
+            worker: name.into(),
+            difficulty: 65_536.0,
+            share_diff: 2.0 * 65_536.0,
+            accepted: true,
+            reject_reason: None,
+        };
+        store
+            .persist_batch(
+                &[worker("rig1"), worker("rig2")],
+                &[share("rig1", 1), share("rig1", 2), share("rig2", 3)],
+            )
+            .await
+            .unwrap();
+        store.remove_worker("rig2").await.unwrap();
+
+        let restored = Stats::load(&store, (t0 + 10) as u64, 65_536.0)
+            .await
+            .unwrap();
+        let w = &restored.workers((t0 + 10) as u64)[0];
+        assert_eq!(w.work_accepted, 2.0);
+        assert_eq!(w.best_difficulty, 2.0);
+        assert_eq!(restored.total_work(), 3.0, "retired work converts too");
+        assert_eq!(restored.scoring_since(), Some(t0 as u64));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn workers_order_connected_first_then_most_recent_share() {
+        let mut s = Stats::default();
+        let t0 = 1_700_000_000;
+        s.apply(&authorized(1, "old"), t0);
+        s.apply(&accepted_share(1, "old", 1.0), t0);
+        s.apply(&authorized(2, "fresh"), t0);
+        s.apply(&accepted_share(2, "fresh", 1.0), t0 + 50);
+        s.apply(&authorized(3, "live"), t0);
+        s.apply(
+            &PoolEvent::Disconnected {
+                session: 1,
+                workers: vec!["old".into()],
+            },
+            t0 + 60,
+        );
+        s.apply(
+            &PoolEvent::Disconnected {
+                session: 2,
+                workers: vec!["fresh".into()],
+            },
+            t0 + 60,
+        );
+        let names: Vec<_> = s.workers(t0 + 60).into_iter().map(|w| w.name).collect();
+        assert_eq!(names, ["live", "fresh", "old"]);
+        assert_eq!(s.scoring_since(), Some(t0));
     }
 
     #[test]

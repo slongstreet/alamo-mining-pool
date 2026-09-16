@@ -2,6 +2,7 @@
   import type { CoinStatus } from '../api';
   import {
     formatAgo,
+    formatClock,
     formatCoins,
     formatDifficulty,
     formatDuration,
@@ -11,7 +12,12 @@
   } from '../format';
   import Info from './Info.svelte';
 
-  let { coin, bestShare, now }: { coin: CoinStatus; bestShare: number; now: number } = $props();
+  let {
+    coin,
+    bestShare,
+    now,
+    scoringSince,
+  }: { coin: CoinStatus; bestShare: number; now: number; scoringSince: number | null } = $props();
 
   const horizons = $derived([
     { label: 'Next hour', p: coin.odds.p_hour },
@@ -53,14 +59,20 @@
     'is lucky.';
   const expectedHelp =
     'Lifetime work ÷ the current network difficulty: how many blocks that much work finds on ' +
-    'average. Luck is only defined once a block is found; until then this shows whether the pool ' +
-    'is running ahead of or behind the odds. Approximate across difficulty changes.';
+    'average. Below one block it is shown as a percentage of a block. Luck is only defined once ' +
+    'a block is found; until then this shows whether the pool is running ahead of or behind the ' +
+    'odds. Approximate across difficulty changes.';
 
-  /** Fractional blocks: three decimals while small, so early progress is visible. */
-  function formatExpectedBlocks(n: number): string {
-    if (!Number.isFinite(n)) return '—';
-    return n >= 10 ? n.toFixed(1) : n >= 1 ? n.toFixed(2) : n.toFixed(3);
-  }
+  /**
+   * Blocks the work so far would find on average. A solo miner spends most of its life
+   * below one block, so that range reads as a percentage of a block instead of "0.000".
+   */
+  const expected = $derived.by(() => {
+    const n = coin.round.expected_blocks;
+    if (!Number.isFinite(n)) return { value: '—', caption: 'blocks expected so far' };
+    if (n < 1) return { value: formatPercent(n), caption: 'of a block expected so far' };
+    return { value: n >= 10 ? n.toFixed(1) : n.toFixed(2), caption: 'blocks expected so far' };
+  });
 </script>
 
 <section class="panel">
@@ -81,26 +93,27 @@
     </span>
   </div>
 
-  <div class="eta">
-    <div>
+  <div class="stats">
+    <div class="stat">
+      <div class="label">Time to block</div>
       <div class="big num">{formatDuration(coin.odds.expected_seconds)}</div>
-      <div class="muted">expected time to find a block at {coin.odds.hashrate > 0 ? 'current' : 'zero'} hashrate</div>
+      <div class="muted">expected at {coin.odds.hashrate > 0 ? 'current' : 'zero'} hashrate</div>
     </div>
-    <div class="luck">
-      {#if luck != null}
+    {#if luck != null}
+      <div class="stat">
+        <div class="label">Luck <Info text={luckHelp} align="right" /></div>
         <div class="big num {luckClass}">{formatPercentValue(luck)}</div>
         <div class="muted">
-          lifetime luck over {coin.round.blocks_found} block{coin.round.blocks_found === 1 ? '' : 's'}
-          <Info text={luckHelp} align="right" />
+          lifetime, over {coin.round.blocks_found} block{coin.round.blocks_found === 1 ? '' : 's'}
         </div>
-      {:else}
-        <div class="big num">{formatExpectedBlocks(coin.round.expected_blocks)}</div>
-        <div class="muted">
-          blocks expected so far · none found yet
-          <Info text={expectedHelp} align="right" />
-        </div>
-      {/if}
-    </div>
+      </div>
+    {:else}
+      <div class="stat">
+        <div class="label">Blocks expected <Info text={expectedHelp} align="right" /></div>
+        <div class="big num">{expected.value}</div>
+        <div class="muted">{expected.caption} · none found yet</div>
+      </div>
+    {/if}
   </div>
 
   <ul class="bars">
@@ -127,8 +140,11 @@
     <div class="muted small">
       {#if coin.round.started_at != null}
         since the last block, {formatAgo(coin.round.started_at, now)}
+      {:else if scoringSince != null}
+        since the first worker connected, {formatClock(scoringSince)} ({formatAgo(scoringSince, now)}) · no
+        {coin.symbol} block yet
       {:else}
-        since the pool started keeping score; no {coin.symbol} block yet
+        since the pool started keeping score · no {coin.symbol} block yet
       {/if}
     </div>
 
@@ -157,15 +173,29 @@
   .head span {
     font-size: 0.8rem;
   }
-  .eta {
-    display: flex;
-    justify-content: space-between;
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 1rem;
-    flex-wrap: wrap;
-    margin: 0.75rem 0 1rem;
+    margin: 0.85rem 0 1.1rem;
   }
-  .luck {
-    text-align: right;
+  .stat {
+    min-width: 0;
+  }
+  .stat .label {
+    font-size: 0.78rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    margin-bottom: 0.2rem;
+  }
+  @media (max-width: 420px) {
+    .stats {
+      grid-template-columns: 1fr;
+    }
   }
   .big {
     font-size: 2rem;
@@ -182,8 +212,9 @@
   .big.bad {
     color: var(--bad);
   }
-  .eta .muted {
+  .stat .muted {
     font-size: 0.82rem;
+    margin-top: 0.15rem;
   }
   .bars {
     list-style: none;
