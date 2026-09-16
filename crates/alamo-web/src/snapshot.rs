@@ -29,6 +29,8 @@ pub struct PoolSnapshot {
     pub total_work: f64,
     /// Best share difficulty any worker has found.
     pub best_share_difficulty: f64,
+    /// Unix time the pool first saw a worker: when it started keeping score.
+    pub scoring_since: Option<u64>,
     /// Workers seen, connected first.
     pub workers: Vec<WorkerStatus>,
     /// Recent blocks, newest first.

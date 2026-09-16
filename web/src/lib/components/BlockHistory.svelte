@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { BlockRow, CoinStatus } from '../api';
-  import { formatAgo, formatCoins, formatDifficulty, shortHash } from '../format';
+  import { formatAgo, formatCoins, formatDifficulty, shortHash, shortWorker } from '../format';
 
   let { blocks, coins, now }: { blocks: BlockRow[]; coins: CoinStatus[]; now: number } = $props();
 
@@ -49,7 +49,7 @@
               <td><span class="badge accent">{b.coin}</span></td>
               <td class="r num">{b.height.toLocaleString()}</td>
               <td class="mono" title={b.hash}>{shortHash(b.hash)}</td>
-              <td class="mono worker" title={b.worker}>{b.worker}</td>
+              <td class="mono worker" title={b.worker}>{shortWorker(b.worker)}</td>
               <td class="r num">{formatCoins(b.reward_sats, b.coin)}</td>
               <td class="r num">{formatDifficulty(b.share_diff)} / {formatDifficulty(b.difficulty)}</td>
               <td>
@@ -68,7 +68,7 @@
 
 <style>
   .worker {
-    max-width: 8rem;
+    max-width: 16rem;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

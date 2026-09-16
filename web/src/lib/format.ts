@@ -54,7 +54,7 @@ export function formatDuration(seconds: number | null | undefined): string {
   if (hours < 48) return `${hours.toFixed(1)}h`;
   const days = hours / 24;
   if (days < 365) return `${days.toFixed(1)}d`;
-  return `${(days / 365.25).toFixed(2)}y`;
+  return `${(days / 365.25).toFixed(1)}y`;
 }
 
 /** "3m ago", "2.1h ago", given unix seconds and the current unix time. */
@@ -81,8 +81,9 @@ export function formatPercentValue(pct: number | null | undefined): string {
 export function formatCoins(baseUnits: number | null | undefined, symbol: string): string {
   if (baseUnits == null) return '—';
   const coins = baseUnits / 1e8;
-  const text = coins >= 1000 ? coins.toFixed(2) : coins >= 1 ? coins.toFixed(4) : coins.toFixed(8);
-  return `${text.replace(/\.?0+$/, '')} ${symbol}`;
+  const decimals = coins >= 1000 ? 2 : coins >= 1 ? 4 : 8;
+  const text = coins.toLocaleString('en-US', { maximumFractionDigits: decimals });
+  return `${text} ${symbol}`;
 }
 
 export function formatInteger(n: number): string {
@@ -96,6 +97,21 @@ export function shortHash(hash: string, keep = 8): string {
 export function shortAddress(address: string): string {
   if (!address) return '—';
   return address.length <= 18 ? address : `${address.slice(0, 9)}…${address.slice(-6)}`;
+}
+
+/**
+ * A stratum username for display. Miners connect as `<address>.<worker>`, and the worker
+ * part is what tells rigs apart, so it is kept whole and only the address is shortened:
+ * `ltc1q3…x7k2.rig1`. A name with no worker part shortens like an address.
+ */
+export function shortWorker(name: string): string {
+  if (!name) return '—';
+  const dot = name.indexOf('.');
+  if (dot <= 0) return shortAddress(name);
+  const address = name.slice(0, dot);
+  const worker = name.slice(dot);
+  const short = address.length <= 12 ? address : `${address.slice(0, 6)}…${address.slice(-4)}`;
+  return `${short}${worker}`;
 }
 
 export function formatClock(unix: number): string {

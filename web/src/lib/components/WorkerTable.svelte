@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api, type CoinStatus, type WorkerStatus } from '../api';
-  import { formatDifficulty, formatDuration, formatHashrate, formatInteger, shortAddress } from '../format';
+  import { formatDifficulty, formatDuration, formatHashrate, formatInteger, shortAddress, shortWorker } from '../format';
   import MinerSetup from './MinerSetup.svelte';
 
   let {
@@ -12,6 +12,20 @@
   /** Workers whose removal is in flight; the row disappears with the next snapshot. */
   let removing = $state<Set<string>>(new Set());
   let removeError = $state<string | null>(null);
+  let resetting = $state(false);
+
+  async function resetStats() {
+    if (!confirm('Reset accepted/rejected share counts and best share for every worker?')) return;
+    resetting = true;
+    removeError = null;
+    try {
+      await api.resetStats();
+    } catch (err) {
+      removeError = err instanceof Error ? err.message : String(err);
+    } finally {
+      resetting = false;
+    }
+  }
 
   async function remove(w: WorkerStatus) {
     if (!confirm(`Remove ${w.name} from the workers table?\n\nIts share counts, share log, and hashrate history are dropped. Blocks it found and the pool's lifetime work are kept. If it connects again it starts fresh.`)) return;
@@ -29,7 +43,19 @@
 </script>
 
 <section class="panel">
-  <h2>Workers</h2>
+  <div class="head">
+    <h2>Workers</h2>
+    {#if workers.length > 0}
+      <button
+        class="ghost"
+        onclick={resetStats}
+        disabled={resetting}
+        title="Zero share counts and best share for every worker. Hashrate, accepted work, and blocks are kept."
+      >
+        {resetting ? 'Resetting…' : 'Reset share counts'}
+      </button>
+    {/if}
+  </div>
   {#if workers.length === 0}
     <p class="empty">No workers yet. Point a miner at the pool like this:</p>
     <MinerSetup port={stratumPort} {coins} />
@@ -54,7 +80,7 @@
             <tr class:offline={w.connections === 0}>
               <td class="name">
                 <span class="dot" class:on={w.connections > 0}></span>
-                <span class="mono" title={w.name}>{w.name}</span>
+                <span class="mono" title={w.name}>{shortWorker(w.name)}</span>
                 {#if w.connections > 1}<span class="badge">{w.connections}×</span>{/if}
               </td>
               <td class="pays">
@@ -99,6 +125,16 @@
 </section>
 
 <style>
+  .head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 0.5rem;
+  }
+  .head h2 {
+    margin: 0;
+  }
   .dot {
     display: inline-block;
     width: 8px;
@@ -116,8 +152,10 @@
   tr.offline td {
     color: var(--muted);
   }
+  /* Names are already shortened to `ltc1q3…x7k2.rig1`; the ellipsis is only a backstop
+     for very long worker parts. */
   .name {
-    max-width: 12rem;
+    max-width: 20rem;
     white-space: nowrap;
   }
   .name .mono {
@@ -129,7 +167,7 @@
   }
   @media (max-width: 640px) {
     .name {
-      max-width: 9rem;
+      max-width: 14rem;
     }
   }
   .remove {

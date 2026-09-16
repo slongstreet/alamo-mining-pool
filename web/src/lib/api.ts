@@ -117,6 +117,8 @@ export interface Status {
   shares_rejected: number;
   total_work: number;
   best_share_difficulty: number;
+  /** Unix time the pool first saw a worker: when it started keeping score. */
+  scoring_since: number | null;
   workers: WorkerStatus[];
   blocks: BlockRow[];
 }

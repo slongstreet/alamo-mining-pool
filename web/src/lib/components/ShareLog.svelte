@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type ShareRow } from '../api';
-  import { formatAgo, formatDifficulty } from '../format';
+  import { formatAgo, formatDifficulty, shortWorker } from '../format';
 
   let { now }: { now: number } = $props();
 
@@ -57,7 +57,7 @@
           {#each shares as s (s.id)}
             <tr>
               <td class="muted num">{formatAgo(s.ts, now)}</td>
-              <td class="mono worker" title={s.worker}>{s.worker}</td>
+              <td class="mono worker" title={s.worker}>{shortWorker(s.worker)}</td>
               <td class="r num">{formatDifficulty(s.difficulty)}</td>
               <td class="r num" class:hot={s.accepted && s.share_diff >= s.difficulty * 100}>
                 {s.accepted ? formatDifficulty(s.share_diff) : '—'}
@@ -92,14 +92,14 @@
     overflow-y: auto;
   }
   .worker {
-    max-width: 10rem;
+    max-width: 18rem;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   @media (max-width: 640px) {
     .worker {
-      max-width: 6rem;
+      max-width: 12rem;
     }
   }
   .hot {

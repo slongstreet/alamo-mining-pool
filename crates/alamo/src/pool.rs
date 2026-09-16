@@ -654,11 +654,18 @@ async fn flush_persist(persist: &mut Persistence) {
     }
 }
 
+/// Pool-wide figures every chain's status is derived from.
+#[derive(Clone, Copy)]
+struct PoolFigures {
+    hashrate: f64,
+    total_work: f64,
+    share_multiplier: f64,
+}
+
 fn coin_status(
     w: &WorkTemplate,
     chain: Chain,
-    hashrate: f64,
-    total_work: f64,
+    pool: PoolFigures,
     rounds: Option<&CoinRounds>,
     health: &NodeHealth,
     now: u64,
@@ -671,8 +678,13 @@ fn coin_status(
         network_difficulty,
         template_age_seconds: now.saturating_sub(w.created_at),
         coinbase_value: w.coinbase_value,
-        odds: OddsSummary::compute(hashrate, network_difficulty),
-        round: round_status(network_difficulty, total_work, rounds),
+        odds: OddsSummary::compute(pool.hashrate, network_difficulty),
+        round: round_status(
+            network_difficulty,
+            pool.total_work,
+            rounds,
+            pool.share_multiplier,
+        ),
         node: node_status(health, now),
     }
 }
@@ -703,12 +715,17 @@ fn remember_templates(
 }
 
 /// The current round on one chain. Before the first block the round spans all work.
+/// The store banks work at each block in stratum share units; `share_multiplier`
+/// converts it to the network units everything else here uses.
 fn round_status(
     network_difficulty: f64,
     total_work: f64,
     rounds: Option<&CoinRounds>,
+    share_multiplier: f64,
 ) -> RoundStatus {
-    let banked = rounds.and_then(|r| r.last_work_at_found).unwrap_or(0.0);
+    let banked = rounds
+        .and_then(|r| r.last_work_at_found)
+        .map_or(0.0, |w| w / share_multiplier);
     let work = (total_work - banked).max(0.0);
     let expected_work = network_difficulty;
     let luck_percent = rounds
@@ -746,6 +763,11 @@ fn build_snapshot(
     let workers = stats.workers(now);
     let hashrate = workers.iter().map(|w| w.hashrate).fold(0.0, |a, b| a + b);
     let total_work = stats.total_work();
+    let pool = PoolFigures {
+        hashrate,
+        total_work,
+        share_multiplier: stats.share_multiplier(),
+    };
     // Coins appear once they have had a template; node health rides along.
     let coins = nodes
         .iter()
@@ -753,7 +775,7 @@ fn build_snapshot(
             let w = templates.get(coin)?;
             let r = rounds.iter().find(|r| r.coin == *coin);
             let health = health.borrow().clone();
-            Some(coin_status(w, chain, hashrate, total_work, r, &health, now))
+            Some(coin_status(w, chain, pool, r, &health, now))
         })
         .collect();
     PoolSnapshot {
@@ -764,6 +786,7 @@ fn build_snapshot(
         shares_rejected: stats.shares_rejected(),
         total_work,
         best_share_difficulty: stats.best_difficulty(),
+        scoring_since: stats.scoring_since(),
         workers,
         blocks,
         ..Default::default()
@@ -776,7 +799,7 @@ mod tests {
 
     #[test]
     fn round_before_any_block_counts_all_work_and_has_no_luck() {
-        let r = round_status(1_000.0, 250.0, None);
+        let r = round_status(1_000.0, 250.0, None, 1.0);
         assert_eq!(r.blocks_found, 0);
         assert_eq!(r.started_at, None);
         assert_eq!(r.work, 250.0);
@@ -796,7 +819,16 @@ mod tests {
             last_work_at_found: Some(1_600.0),
         };
         // 2 blocks expected to take 2_000 work; the pool did 2_400: luck 83%.
-        let r = round_status(1_000.0, 2_400.0, Some(&rounds));
+        let r = round_status(1_000.0, 2_400.0, Some(&rounds), 1.0);
+        let banked_in_share_units = CoinRounds {
+            last_work_at_found: Some(1_600.0 * 65_536.0),
+            ..rounds.clone()
+        };
+        assert_eq!(
+            round_status(1_000.0, 2_400.0, Some(&banked_in_share_units), 65_536.0),
+            r,
+            "work banked by the store is in stratum share units"
+        );
         assert_eq!(r.blocks_found, 2);
         assert_eq!(r.started_at, Some(500));
         assert_eq!(r.work, 800.0);
