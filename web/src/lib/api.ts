@@ -116,7 +116,17 @@ export interface Status {
   shares_accepted: number;
   shares_rejected: number;
   total_work: number;
+  /**
+   * Stratum share units per unit of network difficulty (65536 for scrypt). Job
+   * difficulties are in stratum units, as the miner sees them; every other difficulty
+   * the API reports, including `share_diff`, is in network units.
+   */
+  share_multiplier: number;
   best_share_difficulty: number;
+  /** Worker that found the best share, once there is one. */
+  best_share_worker: string | null;
+  /** Unix time the best share arrived, when known. */
+  best_share_at: number | null;
   /** Unix time the pool first saw a worker: when it started keeping score. */
   scoring_since: number | null;
   workers: WorkerStatus[];

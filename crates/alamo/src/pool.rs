@@ -759,7 +759,7 @@ fn build_snapshot(
     stats: &Stats,
     templates: &HashMap<&'static str, Arc<WorkTemplate>>,
     nodes: &[(&'static str, watch::Receiver<NodeHealth>)],
-    blocks: Vec<BlockRow>,
+    mut blocks: Vec<BlockRow>,
     rounds: &[CoinRounds],
     chain: Chain,
 ) -> PoolSnapshot {
@@ -767,11 +767,18 @@ fn build_snapshot(
     let workers = stats.workers(now);
     let hashrate = workers.iter().map(|w| w.hashrate).fold(0.0, |a, b| a + b);
     let total_work = stats.total_work();
+    let share_multiplier = stats.share_multiplier();
     let pool = PoolFigures {
         hashrate,
         total_work,
-        share_multiplier: stats.share_multiplier(),
+        share_multiplier,
     };
+    // Blocks are stored with the winning share in stratum units; the API reports network
+    // units so the figure compares to the block's difficulty next to it.
+    for b in &mut blocks {
+        b.share_diff /= share_multiplier;
+    }
+    let best = stats.best_share();
     // Coins appear once they have had a template; node health rides along.
     let coins = nodes
         .iter()
@@ -789,7 +796,10 @@ fn build_snapshot(
         shares_accepted: stats.shares_accepted(),
         shares_rejected: stats.shares_rejected(),
         total_work,
-        best_share_difficulty: stats.best_difficulty(),
+        share_multiplier,
+        best_share_difficulty: best.as_ref().map_or(0.0, |b| b.difficulty),
+        best_share_worker: best.as_ref().map(|b| b.worker.clone()),
+        best_share_at: best.and_then(|b| b.at),
         scoring_since: stats.scoring_since(),
         workers,
         blocks,

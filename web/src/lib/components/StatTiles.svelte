@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Status } from '../api';
-  import { formatDifficulty, formatHashrate, formatInteger } from '../format';
+  import { formatAgo, formatClock, formatDifficulty, formatHashrate, formatInteger, shortWorker } from '../format';
   import Info from './Info.svelte';
 
   let { status }: { status: Status } = $props();
@@ -38,7 +38,16 @@
       />
     </div>
     <div class="value num">{formatDifficulty(status.best_share_difficulty)}</div>
-    <div class="sub">difficulty, since last reset</div>
+    {#if status.best_share_worker}
+      <div class="sub">
+        <span class="mono" title={status.best_share_worker}>{shortWorker(status.best_share_worker)}</span>
+        {#if status.best_share_at != null}
+          · <span title={formatClock(status.best_share_at)}>{formatAgo(status.best_share_at, status.now)}</span>
+        {/if}
+      </div>
+    {:else}
+      <div class="sub">difficulty, since last reset</div>
+    {/if}
   </div>
   <div class="tile">
     <div class="label">Blocks found</div>

@@ -35,6 +35,8 @@ pub struct WorkerRow {
     pub shares_rejected: i64,
     /// Best share difficulty seen.
     pub best_difficulty: f64,
+    /// Unix time the best share arrived; `None` before the first accepted share.
+    pub best_at: Option<i64>,
     /// Lifetime accepted work: the sum of job difficulty over accepted shares.
     pub work_accepted: f64,
 }
@@ -112,6 +114,7 @@ struct WorkerSql {
     shares_accepted: i64,
     shares_rejected: i64,
     best_difficulty: f64,
+    best_at: Option<i64>,
     work_accepted: f64,
 }
 
@@ -128,6 +131,7 @@ impl From<WorkerSql> for WorkerRow {
             shares_accepted: row.shares_accepted,
             shares_rejected: row.shares_rejected,
             best_difficulty: row.best_difficulty,
+            best_at: row.best_at,
             work_accepted: row.work_accepted,
         }
     }
@@ -211,6 +215,7 @@ impl Store {
                     last_seen = MAX(last_seen, ?),
                     shares_accepted = shares_accepted + ?,
                     shares_rejected = shares_rejected + ?,
+                    best_at = CASE WHEN ? > best_difficulty THEN ? ELSE best_at END,
                     best_difficulty = MAX(best_difficulty, ?),
                     work_accepted = work_accepted + ?
                  WHERE name = ?",
@@ -218,6 +223,8 @@ impl Store {
             .bind(s.ts)
             .bind(accepted)
             .bind(rejected)
+            .bind(best)
+            .bind(s.ts)
             .bind(best)
             .bind(work)
             .bind(&s.worker)
@@ -232,7 +239,8 @@ impl Store {
     /// accepted work, and blocks are kept.
     pub async fn reset_share_counters(&self) -> Result<(), StoreError> {
         sqlx::query(
-            "UPDATE workers SET shares_accepted = 0, shares_rejected = 0, best_difficulty = 0",
+            "UPDATE workers SET
+                shares_accepted = 0, shares_rejected = 0, best_difficulty = 0, best_at = NULL",
         )
         .execute(&self.pool)
         .await?;
@@ -280,7 +288,7 @@ impl Store {
     pub async fn load_workers(&self) -> Result<Vec<WorkerRow>, StoreError> {
         let rows: Vec<WorkerSql> = sqlx::query_as(
             "SELECT name, payout_address, aux_payouts, fallback, first_seen, last_seen,
-                    shares_accepted, shares_rejected, best_difficulty, work_accepted
+                    shares_accepted, shares_rejected, best_difficulty, best_at, work_accepted
              FROM workers ORDER BY name",
         )
         .fetch_all(&self.pool)
@@ -435,6 +443,11 @@ mod tests {
         assert_eq!(workers[0].shares_accepted, 1);
         assert_eq!(workers[0].shares_rejected, 1);
         assert_eq!(workers[0].best_difficulty, 32.0);
+        assert_eq!(
+            workers[0].best_at,
+            Some(1010),
+            "best_at follows the best share"
+        );
         assert_eq!(workers[0].work_accepted, 16.0);
         assert_eq!(store.total_work().await.unwrap(), 16.0);
 
