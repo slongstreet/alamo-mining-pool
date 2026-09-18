@@ -4,6 +4,7 @@ use alamo_core::odds::HASHES_PER_DIFF1;
 use alamo_store::{ShareRow, Store, StoreError, WorkerRow};
 use alamo_stratum::PoolEvent;
 use alamo_web::{AuxPayoutStatus, WorkerStatus};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Window over which hashrate is estimated, in seconds.
@@ -20,6 +21,8 @@ struct WorkerStats {
     rejected: u64,
     /// Best share found, in network difficulty-1 units (comparable to block difficulty).
     best_difficulty: f64,
+    /// When the best share arrived.
+    best_at: Option<u64>,
     /// Lifetime accepted work in network difficulty-1 units.
     work_accepted: f64,
     last_share: Option<u64>,
@@ -92,6 +95,7 @@ impl Stats {
                 rejected: row.shares_rejected.max(0) as u64,
                 // Persisted in stratum share units (a MAX and a SUM over share rows).
                 best_difficulty: row.best_difficulty / share_multiplier,
+                best_at: row.best_at.map(|t| t.max(0) as u64),
                 work_accepted: row.work_accepted / share_multiplier,
                 last_share: (row.shares_accepted > 0).then_some(row.last_seen.max(0) as u64),
                 window: VecDeque::new(),
@@ -197,9 +201,11 @@ impl Stats {
                     w.accepted += 1;
                     self.shares_accepted += 1;
                     w.last_share = Some(now);
-                    w.best_difficulty = w
-                        .best_difficulty
-                        .max(*share_difficulty / self.share_multiplier);
+                    let share = *share_difficulty / self.share_multiplier;
+                    if share > w.best_difficulty {
+                        w.best_difficulty = share;
+                        w.best_at = Some(now);
+                    }
                     let work = *job_difficulty / self.share_multiplier;
                     w.work_accepted += work;
                     w.window.push_back((now, work));
@@ -228,6 +234,7 @@ impl Stats {
             w.accepted = 0;
             w.rejected = 0;
             w.best_difficulty = 0.0;
+            w.best_at = None;
         }
         self.shares_accepted = 0;
         self.shares_rejected = 0;
@@ -273,10 +280,32 @@ impl Stats {
 
     /// Best share any worker has found, in network difficulty-1 units.
     pub fn best_difficulty(&self) -> f64 {
+        self.best_share().map_or(0.0, |b| b.difficulty)
+    }
+
+    /// The pool's best share: which worker found it, its difficulty in network
+    /// difficulty-1 units, and when it arrived (unknown for rows persisted before the
+    /// time was recorded). `None` until a share is accepted.
+    pub fn best_share(&self) -> Option<BestShare> {
         self.workers
-            .values()
-            .map(|w| w.best_difficulty)
-            .fold(0.0, f64::max)
+            .iter()
+            .filter(|(_, w)| w.best_difficulty > 0.0)
+            .max_by(|(a_name, a), (b_name, b)| {
+                a.best_difficulty
+                    .total_cmp(&b.best_difficulty)
+                    // A tie goes to the earlier share; unknown times lose to known ones.
+                    .then_with(|| {
+                        b.best_at
+                            .unwrap_or(u64::MAX)
+                            .cmp(&a.best_at.unwrap_or(u64::MAX))
+                    })
+                    .then_with(|| b_name.cmp(a_name))
+            })
+            .map(|(name, w)| BestShare {
+                worker: name.clone(),
+                difficulty: w.best_difficulty,
+                at: w.best_at,
+            })
     }
 
     /// Per-worker hashrate samples plus the pool total (empty name).
@@ -294,8 +323,8 @@ impl Stats {
         samples
     }
 
-    /// Per-worker status: connected workers first, then the most recent share first,
-    /// then by name.
+    /// Per-worker status: connected workers first, then by name in natural order
+    /// (`rig2` before `rig10`), so rows keep their places as shares come in.
     pub fn workers(&self, now: u64) -> Vec<WorkerStatus> {
         let mut out: Vec<WorkerStatus> = self
             .workers
@@ -318,14 +347,56 @@ impl Stats {
         out.sort_by(|a, b| {
             (b.connections > 0)
                 .cmp(&(a.connections > 0))
-                .then_with(|| {
-                    a.last_share_seconds
-                        .unwrap_or(u64::MAX)
-                        .cmp(&b.last_share_seconds.unwrap_or(u64::MAX))
-                })
-                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| natural_cmp(&a.name, &b.name))
         });
         out
+    }
+}
+
+/// The pool's best share and who found it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BestShare {
+    /// Worker name.
+    pub worker: String,
+    /// In network difficulty-1 units.
+    pub difficulty: f64,
+    /// Unix time it arrived, when known.
+    pub at: Option<u64>,
+}
+
+/// Compare names so runs of digits order numerically: `rig2` < `rig10`. Equal numbers
+/// with different spellings (`rig02`, `rig2`) fall back to plain byte order.
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let (mut x, mut y) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (x.first(), y.first()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(&c), Some(&d)) if c.is_ascii_digit() && d.is_ascii_digit() => {
+                let nx = x.iter().take_while(|c| c.is_ascii_digit()).count();
+                let ny = y.iter().take_while(|c| c.is_ascii_digit()).count();
+                let (dx, dy) = (&x[..nx], &y[..ny]);
+                // Strip leading zeros, then a longer run is a bigger number.
+                let tx = dx.iter().position(|&c| c != b'0').unwrap_or(nx);
+                let ty = dy.iter().position(|&c| c != b'0').unwrap_or(ny);
+                let ord = (nx - tx)
+                    .cmp(&(ny - ty))
+                    .then_with(|| dx[tx..].cmp(&dy[ty..]));
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+                x = &x[nx..];
+                y = &y[ny..];
+            }
+            (Some(&c), Some(&d)) => {
+                if c != d {
+                    return c.cmp(&d);
+                }
+                x = &x[1..];
+                y = &y[1..];
+            }
+        }
     }
 }
 
@@ -432,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn workers_order_connected_first_then_most_recent_share() {
+    fn workers_order_connected_first_then_by_name() {
         let mut s = Stats::default();
         let t0 = 1_700_000_000;
         s.apply(&authorized(1, "old"), t0);
@@ -457,6 +528,73 @@ mod tests {
         let names: Vec<_> = s.workers(t0 + 60).into_iter().map(|w| w.name).collect();
         assert_eq!(names, ["live", "fresh", "old"]);
         assert_eq!(s.scoring_since(), Some(t0));
+
+        // A new share must not move a connected worker.
+        s.apply(&authorized(4, "rig10"), t0 + 70);
+        s.apply(&authorized(5, "rig2"), t0 + 70);
+        s.apply(&accepted_share(4, "rig10", 1.0), t0 + 80);
+        let names: Vec<_> = s.workers(t0 + 80).into_iter().map(|w| w.name).collect();
+        assert_eq!(names, ["live", "rig2", "rig10", "fresh", "old"]);
+    }
+
+    #[test]
+    fn natural_order() {
+        let mut names = vec![
+            "rig10", "rig2", "rig1", "b", "a.rig2", "a.rig10", "rig02", "rig2",
+        ];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(
+            names,
+            ["a.rig2", "a.rig10", "b", "rig1", "rig02", "rig2", "rig2", "rig10"]
+        );
+        assert_eq!(natural_cmp("x", "x"), Ordering::Equal);
+    }
+
+    #[test]
+    fn best_share_names_the_worker_and_time() {
+        let mut s = Stats::default();
+        let t0 = 1_700_000_000;
+        assert_eq!(s.best_share(), None);
+        s.apply(&authorized(1, "a"), t0);
+        s.apply(&authorized(2, "b"), t0);
+        s.apply(&accepted_share(1, "a", 1.0), t0 + 1);
+        s.apply(&accepted_share(2, "b", 1.0), t0 + 2);
+        let best = s.best_share().unwrap();
+        assert_eq!(
+            (best.worker.as_str(), best.difficulty, best.at),
+            ("a", 2.0, Some(t0 + 1))
+        );
+        s.apply(
+            &PoolEvent::Share {
+                session: 2,
+                worker: "b".into(),
+                coin: "LTC",
+                job_difficulty: 1.0,
+                share_difficulty: 5.0,
+                rejected: None,
+            },
+            t0 + 3,
+        );
+        let best = s.best_share().unwrap();
+        assert_eq!(
+            (best.worker.as_str(), best.difficulty, best.at),
+            ("b", 5.0, Some(t0 + 3))
+        );
+        // An equal share later does not take the record.
+        s.apply(
+            &PoolEvent::Share {
+                session: 1,
+                worker: "a".into(),
+                coin: "LTC",
+                job_difficulty: 1.0,
+                share_difficulty: 5.0,
+                rejected: None,
+            },
+            t0 + 4,
+        );
+        assert_eq!(s.best_share().unwrap().worker, "b");
+        s.reset_counters();
+        assert_eq!(s.best_share(), None);
     }
 
     #[test]
@@ -616,9 +754,11 @@ mod tests {
             shares_accepted: 1,
             shares_rejected: 0,
             best_difficulty: 229_126_140.0, // a 3496.2-diff share in scrypt share units
+            best_at: Some(90),
             work_accepted: 0.0,
         };
         let s = Stats::restore(&[row], &[], 100, 65536.0);
         assert!((s.best_difficulty() - 3496.187).abs() < 0.01);
+        assert_eq!(s.best_share().unwrap().at, Some(90));
     }
 }

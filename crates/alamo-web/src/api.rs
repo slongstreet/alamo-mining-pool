@@ -138,12 +138,30 @@ impl LimitQuery {
     }
 }
 
-/// Most recent shares, newest first.
+/// Stratum share units per unit of network difficulty, or 1 before the pool has
+/// published a snapshot. The store keeps `share_diff` in stratum units; the API reports
+/// network units, matching the best-share figures in the status document.
+fn share_multiplier(state: &AppState) -> f64 {
+    let m = state.snapshot().share_multiplier;
+    if m > 0.0 {
+        m
+    } else {
+        1.0
+    }
+}
+
+/// Most recent shares, newest first. `share_diff` is in network units; `difficulty`
+/// (the job's) stays in stratum units.
 pub async fn shares(
     State(state): State<AppState>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<ShareRow>>, ApiError> {
-    Ok(Json(state.store().recent_shares(q.clamp(100, 1000)).await?))
+    let m = share_multiplier(&state);
+    let mut rows = state.store().recent_shares(q.clamp(100, 1000)).await?;
+    for r in &mut rows {
+        r.share_diff /= m;
+    }
+    Ok(Json(rows))
 }
 
 /// `POST /api/stats/reset`: zero accepted/rejected share counts and best share for every
@@ -201,7 +219,12 @@ pub async fn blocks(
     State(state): State<AppState>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<BlockRow>>, ApiError> {
-    Ok(Json(state.store().recent_blocks(q.clamp(50, 500)).await?))
+    let m = share_multiplier(&state);
+    let mut rows = state.store().recent_blocks(q.clamp(50, 500)).await?;
+    for r in &mut rows {
+        r.share_diff /= m;
+    }
+    Ok(Json(rows))
 }
 
 /// A refused request: a JSON `{"error": ...}` body with the given status.
@@ -786,6 +809,38 @@ mod tests {
         assert_eq!(json.as_array().unwrap().len(), 2);
         assert_eq!(json[0]["worker"], "rig");
         assert_eq!(json[0]["accepted"], true);
+        assert_eq!(
+            json[0]["share_diff"], 9.0,
+            "stratum units until a snapshot says otherwise"
+        );
+
+        // Once the pool reports its share multiplier, share_diff comes back in network
+        // units while the job difficulty stays as the miner saw it.
+        state.publish(PoolSnapshot {
+            share_multiplier: 4.0,
+            ..Default::default()
+        });
+        state
+            .store()
+            .insert_block(&alamo_store::NewBlock {
+                coin: "LTC".into(),
+                height: 1,
+                hash: "00ab".into(),
+                worker: "rig".into(),
+                difficulty: 3.0,
+                share_diff: 12.0,
+                reward_sats: None,
+                found_at: now as u64,
+                status: alamo_store::BlockStatus::Accepted,
+            })
+            .await
+            .unwrap();
+        let (_, json) = get_json(&state, "/api/shares?limit=1").await;
+        assert_eq!(json[0]["share_diff"], 2.25);
+        assert_eq!(json[0]["difficulty"], 8.0);
+        let (_, json) = get_json(&state, "/api/blocks").await;
+        assert_eq!(json[0]["share_diff"], 3.0);
+        assert_eq!(json[0]["difficulty"], 3.0);
 
         let (_, json) = get_json(&state, "/api/shares?limit=0").await;
         assert_eq!(
@@ -804,7 +859,7 @@ mod tests {
 
         let (status, json) = get_json(&state, "/api/blocks").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(json.as_array().unwrap().is_empty());
+        assert_eq!(json.as_array().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

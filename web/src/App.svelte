@@ -59,7 +59,7 @@
       <WorkerTable workers={status.workers} stratumPort={status.stratum_port} coins={status.coins} />
 
       <div class="grid two">
-        <ShareLog {now} />
+        <ShareLog {now} shareMultiplier={status.share_multiplier} />
         <BlockHistory blocks={status.blocks} coins={status.coins} {now} />
       </div>
     </div>

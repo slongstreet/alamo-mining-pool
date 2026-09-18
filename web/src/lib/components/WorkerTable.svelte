@@ -1,7 +1,12 @@
 <script lang="ts">
   import { api, type CoinStatus, type WorkerStatus } from '../api';
   import { formatDifficulty, formatDuration, formatHashrate, formatInteger, shortAddress, shortWorker } from '../format';
+  import Info from './Info.svelte';
   import MinerSetup from './MinerSetup.svelte';
+
+  const diffHelp =
+    'The share difficulty the pool currently asks this worker for, in stratum units: the number ' +
+    'the miner itself reports. Best is in network units, comparable to the network difficulty.';
 
   let {
     workers,
@@ -42,7 +47,7 @@
             <th>Worker</th>
             <th>Pays</th>
             <th class="r">Hashrate</th>
-            <th class="r">Diff</th>
+            <th class="r">Diff <Info text={diffHelp} align="right" /></th>
             <th class="r">Shares</th>
             <th class="r">Best</th>
             <th class="r">Last share</th>

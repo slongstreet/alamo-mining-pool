@@ -1,9 +1,16 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type ShareRow } from '../api';
-  import { formatAgo, formatDifficulty, shortWorker } from '../format';
+  import { formatAgo, formatClock, formatDifficulty, shortWorker } from '../format';
+  import Info from './Info.svelte';
 
-  let { now }: { now: number } = $props();
+  /** `shareMultiplier` converts the job difficulty (stratum units) to network units. */
+  let { now, shareMultiplier }: { now: number; shareMultiplier: number } = $props();
+
+  const jobHelp =
+    'The difficulty the pool asked the miner for, in stratum units: the number the miner itself ' +
+    'reports. Share diff, Best share, and the network difficulty are in network units, which are ' +
+    'this divided by the share multiplier (65,536 for scrypt).';
 
   let shares = $state<ShareRow[]>([]);
   let paused = $state(false);
@@ -48,7 +55,7 @@
           <tr>
             <th>When</th>
             <th>Worker</th>
-            <th class="r">Job diff</th>
+            <th class="r">Job diff <Info text={jobHelp} align="right" /></th>
             <th class="r">Share diff</th>
             <th>Result</th>
           </tr>
@@ -56,10 +63,10 @@
         <tbody>
           {#each shares as s (s.id)}
             <tr>
-              <td class="muted num">{formatAgo(s.ts, now)}</td>
+              <td class="muted num" title={formatClock(s.ts)}>{formatAgo(s.ts, now)}</td>
               <td class="mono worker" title={s.worker}>{shortWorker(s.worker)}</td>
               <td class="r num">{formatDifficulty(s.difficulty)}</td>
-              <td class="r num" class:hot={s.accepted && s.share_diff >= s.difficulty * 100}>
+              <td class="r num" class:hot={s.accepted && s.share_diff * shareMultiplier >= s.difficulty * 100}>
                 {s.accepted ? formatDifficulty(s.share_diff) : '—'}
               </td>
               <td>

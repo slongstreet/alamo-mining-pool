@@ -27,8 +27,17 @@ pub struct PoolSnapshot {
     pub shares_rejected: u64,
     /// Lifetime accepted work in difficulty units.
     pub total_work: f64,
+    /// Stratum share difficulty per unit of network difficulty on the parent chain
+    /// (65536 for scrypt). Job difficulties (`WorkerStatus::difficulty`, the share log's
+    /// `difficulty`) are in stratum units, as the miner sees them; every other difficulty
+    /// the API reports, including `share_diff`, is in network units.
+    pub share_multiplier: f64,
     /// Best share difficulty any worker has found.
     pub best_share_difficulty: f64,
+    /// Worker that found the best share.
+    pub best_share_worker: Option<String>,
+    /// Unix time the best share arrived, when known.
+    pub best_share_at: Option<u64>,
     /// Unix time the pool first saw a worker: when it started keeping score.
     pub scoring_since: Option<u64>,
     /// Workers seen, connected first.

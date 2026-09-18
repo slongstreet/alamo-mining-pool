@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { BlockRow, CoinStatus } from '../api';
-  import { formatAgo, formatCoins, formatDifficulty, shortHash, shortWorker } from '../format';
+  import { formatAgo, formatClock, formatCoins, formatDifficulty, shortHash, shortWorker } from '../format';
 
   let { blocks, coins, now }: { blocks: BlockRow[]; coins: CoinStatus[]; now: number } = $props();
 
@@ -45,7 +45,7 @@
         <tbody>
           {#each blocks as b (b.id)}
             <tr>
-              <td class="muted num">{formatAgo(b.found_at, now)}</td>
+              <td class="muted num" title={formatClock(b.found_at)}>{formatAgo(b.found_at, now)}</td>
               <td><span class="badge accent">{b.coin}</span></td>
               <td class="r num">{b.height.toLocaleString()}</td>
               <td class="mono" title={b.hash}>{shortHash(b.hash)}</td>
