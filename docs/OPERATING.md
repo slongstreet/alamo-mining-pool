@@ -149,9 +149,11 @@ The dashboard is embedded at build time, so build `web/dist` first.
 | `pool.data_dir` | Where `alamo.db` lives. Must be writable. |
 | `stratum.listen` | Where miners connect. `0.0.0.0:3333` to accept from the LAN. |
 | `stratum.vardiff.*` | Share difficulty range and target share interval, in the units miners display: for scrypt a share of difficulty 65536 equals one unit of network difficulty, as in cgminer and every Litecoin pool. |
+| `coins.<coin>.stratum.listen`, `.vardiff.*` | A parent coin's own listener and vardiff, instead of `[stratum]`. Each parent coin is its own lane; two parents cannot share an address. Not allowed on a merge-mined coin. |
 | `web.listen` | Dashboard and API. Bind to `127.0.0.1` and put a reverse proxy in front if the box is reachable from the internet; the API has no authentication. |
 | `web.read_only` | Refuse every change from the dashboard (settings, share-count reset, worker removal). |
 | `coins.<coin>.rpc_url`, `rpc_user`, `rpc_password` | Node RPC. The password is never logged. |
+| `[coins.<coin>]` keys | Case does not matter (`[coins.LTC]` is `ltc`); two keys that differ only by case are refused. |
 | `${NAME}` in any value | Replaced with the environment variable `NAME` when the file is read; startup fails naming the variable if it is unset. Comment lines are not expanded. |
 | `coins.<coin>.zmq_hashblock` | The node's `zmqpubhashblock` endpoint, `tcp://host:port`. |
 | `coins.<coin>.fallback_address` | Paid when a miner's username is not a valid address. |
@@ -166,9 +168,13 @@ restart: the pool name, the coinbase tag, each coin's fallback payout address, t
 settings, and the log level. It also shows each node's endpoint and health with a "Test
 connection" button, downloads the recent log and a consistent copy of the database, and
 resets share counts. Changes are stored in `alamo.db` and override the file; each one is
-marked on the page and can be reverted to the file's value. A stored value that no longer
-validates on startup (say, after switching a node to another network) is dropped with a
-warning in the log.
+marked on the page and can be reverted to the file's value. Overrides are stored under
+the config path they override: `stratum.vardiff.<field>` for lanes on `[stratum]`,
+`coins.<coin>.stratum.vardiff.<field>` for a parent with its own section. A stored value
+that no longer validates (say, after switching a node to another network) is dropped with
+a warning in the log. A coin's fallback address is checked once that coin's node has
+answered, so until then its stored override is kept and the page does not list the coin;
+other values are checked at startup.
 
 Node endpoints and credentials are deliberately not editable there: the API has no
 authentication, so anyone who can open the dashboard could otherwise repoint the pool at
@@ -239,8 +245,10 @@ timeout and Docker's `stop_grace_period` in the compose file both allow for that
 
 ## When something looks wrong
 
-**`node unreachable` at startup.** The daemon keeps retrying with backoff and starts as
-soon as the node answers, so this is normal while nodes boot. If it never connects, check
+**`node unreachable` at startup.** The daemon keeps retrying with backoff and opens that
+coin's stratum listener as soon as its nodes answer, so this is normal while nodes boot.
+Each parent coin starts on its own: one coin's node being down does not keep another
+coin's miners out. If it never connects, check
 `rpc_url`, `rpc_user`, `rpc_password`, and the node's `rpcallowip`.
 
 **`template fetch failed` while running.** The node stopped answering. The pool keeps

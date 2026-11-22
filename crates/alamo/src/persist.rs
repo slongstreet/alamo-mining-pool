@@ -13,29 +13,54 @@ const SAMPLE_INTERVAL: u64 = 60;
 /// Run retention every ten minutes.
 const RETAIN_INTERVAL: u64 = 600;
 
-/// One lane's queued accounting writes and periodic sampling, plus retention.
+/// One lane's queued accounting writes and periodic hashrate sampling.
 pub struct Persistence {
     store: Store,
     lane: String,
-    policy: RetentionPolicy,
     authorized: Vec<WorkerWrite>,
     shares: Vec<NewShare>,
     last_sample_ts: u64,
+}
+
+/// Retention for the whole database, run once per interval however many lanes there are.
+pub struct Retention {
+    store: Store,
+    policy: RetentionPolicy,
     last_retain_at: u64,
 }
 
+impl Retention {
+    /// Wrap a store. `now` is used so retention does not immediately re-run after a
+    /// restart.
+    pub fn new(store: Store, now: u64) -> Self {
+        Self {
+            store,
+            policy: RetentionPolicy::default(),
+            last_retain_at: now,
+        }
+    }
+
+    /// Trim and downsample if the interval has passed. Called on the publisher tick.
+    pub async fn maybe_retain(&mut self, now: u64) -> Result<(), StoreError> {
+        if now.saturating_sub(self.last_retain_at) < RETAIN_INTERVAL {
+            return Ok(());
+        }
+        let report = self.store.retain(&self.policy, now as i64).await?;
+        self.last_retain_at = now;
+        log_retention(report);
+        Ok(())
+    }
+}
+
 impl Persistence {
-    /// Wrap a store for `lane`, the parent coin's config key. `now` is used so retention
-    /// does not immediately re-run after a restart.
-    pub fn new(store: Store, lane: &str, now: u64) -> Self {
+    /// Wrap a store for `lane`, the parent coin's config key.
+    pub fn new(store: Store, lane: &str) -> Self {
         Self {
             store,
             lane: lane.to_owned(),
-            policy: RetentionPolicy::default(),
             authorized: Vec::new(),
             shares: Vec::new(),
             last_sample_ts: 0,
-            last_retain_at: now,
         }
     }
 
@@ -103,11 +128,11 @@ impl Persistence {
         Ok(())
     }
 
-    /// Flush, maybe sample hashrate, maybe retain. Called on the publisher tick.
+    /// Flush and maybe sample hashrate. Called on the publisher tick for a lane that has
+    /// connected.
     pub async fn on_tick(&mut self, stats: &Stats, now: u64) -> Result<(), StoreError> {
         self.flush().await?;
         self.maybe_sample(stats, now).await?;
-        self.maybe_retain(now).await?;
         Ok(())
     }
 
@@ -129,16 +154,6 @@ impl Persistence {
             .insert_hashrate_samples(&self.lane, &samples)
             .await?;
         self.last_sample_ts = ts;
-        Ok(())
-    }
-
-    async fn maybe_retain(&mut self, now: u64) -> Result<(), StoreError> {
-        if now.saturating_sub(self.last_retain_at) < RETAIN_INTERVAL {
-            return Ok(());
-        }
-        let report = self.store.retain(&self.policy, now as i64).await?;
-        self.last_retain_at = now;
-        log_retention(report);
         Ok(())
     }
 }
@@ -177,7 +192,7 @@ mod tests {
     async fn flush_then_reload_matches_live_counters() {
         let path = temp_db();
         let store = Store::open(&path).await.unwrap();
-        let mut persist = Persistence::new(store.clone(), "ltc", 1_000);
+        let mut persist = Persistence::new(store.clone(), "ltc");
         let mut stats = Stats::default();
         let auth = PoolEvent::Authorized {
             session: 1,

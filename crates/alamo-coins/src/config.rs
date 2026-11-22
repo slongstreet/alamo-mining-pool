@@ -1,5 +1,6 @@
 //! Per-coin configuration.
 
+use alamo_core::stratum_config::StratumConfig;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for one coin's node connection and payout behavior.
@@ -37,6 +38,11 @@ pub struct CoinConfig {
     /// template leaves miners on their last job until the node returns.
     #[serde(default = "default_stale_secs")]
     pub template_stale_secs: u64,
+    /// This parent coin's own stratum listener and vardiff (`[coins.<key>.stratum]`).
+    /// Absent, the coin uses the pool-wide `[stratum]` section. Not allowed on a
+    /// merge-mined coin, which has no listener of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stratum: Option<StratumConfig>,
 }
 
 fn default_true() -> bool {

@@ -19,14 +19,13 @@ a vardiff that copes with ASIC-scale hashrate.
   unchanged against a `bitcoind`.
 
 ### What blocks Bitcoin today
-- **One parent only.** `connect_chains` bails with "only one parent chain is supported"
-  (`crates/alamo/src/pool.rs`). The config has one `[stratum]` listener and one vardiff.
+- ~~**One parent only.**~~ Done: every enabled parent is a lane with its own listener and
+  vardiff (`[coins.<key>.stratum]`), started independently.
 - **No version rolling.** `mining.configure` answers `version-rolling: false`
   (`crates/alamo-stratum/src/session.rs`). Modern SHA-256 ASICs expect BIP310.
-- **Stats are global.** One `Stats` with one `share_multiplier`, one pool hashrate, one
-  best share. Scrypt and SHA-256 hashrate cannot be summed.
-- **Storage has no lane.** `workers` is keyed by name alone; `shares`, `hashrate_samples`
-  (`worker = ''` is the pool total), and `retired_work` are pool-wide.
+- ~~**Stats are global.**~~ Done: one `Stats` per lane, each with its own
+  `share_multiplier`. The API still shows only the primary lane (section 7 is next).
+- ~~**Storage has no lane.**~~ Done: migration 0008 (section 6).
 
 ### Prework before real BTC hashrate is pointed at it
 - [x] **Block submission retries.** An unreachable node is retried for several minutes
@@ -37,8 +36,8 @@ a vardiff that copes with ASIC-scale hashrate.
 - [x] **Vardiff fast start.** A worker measured at 8x the target share rate or more jumps
   straight to its measured difficulty after five seconds instead of doubling once a
   minute.
-- [ ] **Startup is all-or-nothing.** Stratum does not listen until every node answers, so
-  a syncing `bitcoind` would hold LTC miners off. Fixed by starting lanes independently
+- [x] **Startup is all-or-nothing.** Stratum did not listen until every node answered, so
+  a syncing `bitcoind` would have held LTC miners off. Lanes now start independently
   (below).
 
 ## Technical design
@@ -68,16 +67,24 @@ fallback_address = "bc1q..."
 [coins.btc.stratum]
 listen = "0.0.0.0:3334"
 
-[coins.btc.stratum.vardiff]
+[coins.btc.stratum.vardiff]   # optional; if present, every field
 initial_difficulty = 2048
 min_difficulty = 0.001
 max_difficulty = 1073741824
+target_share_seconds = 10
+retarget_seconds = 60
+variance_percent = 30
 ```
 
 - `[stratum]` stays as the default for a parent without its own `[coins.<key>.stratum]`
   section, so existing files and a BTC-only file both work.
 - Two parents resolving to the same listen address is a startup error with a message that
   names both coins.
+- Coin keys are lower-cased when the file is loaded; keys differing only by case are an
+  error. A `stratum` section on a merge-mined coin is an error.
+- Stored vardiff overrides mirror the config path: `stratum.vardiff.<field>` applies to
+  every lane on `[stratum]`, `coins.<key>.stratum.vardiff.<field>` to a lane with its own
+  section, so existing rows keep working.
 - Separate ports rather than routing one port by address prefix: a username that is not a
   valid address would have no unambiguous fallback lane.
 

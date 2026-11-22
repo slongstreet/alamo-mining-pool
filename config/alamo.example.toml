@@ -6,6 +6,8 @@ name = "Alamo Solo Pool"
 # Directory for the SQLite database and other state.
 data_dir = "./data"
 
+# Stratum listener and vardiff for every parent coin without its own
+# [coins.<key>.stratum] section (see the end of this file).
 [stratum]
 listen = "0.0.0.0:3333"
 
@@ -64,3 +66,22 @@ rpc_password = "change-me"
 # Miners put their DOGE address in the stratum password field, bare ("D...") or tagged
 # ("doge=D..."). This address is paid when a worker does not supply one.
 fallback_address = "DExampleExampleExampleExampleExampl"
+
+# Each enabled coin without merge_mined_with is a parent with its own lane: its own
+# listener, vardiff, statistics, and accounting. Lanes start independently, so one whose
+# node is still syncing never keeps another's miners out. A parent uses [stratum] above
+# unless it has a section of its own; two parents cannot share a listen address. A
+# merge-mined coin has no section: its miners connect to the parent. If the vardiff
+# table is present it must name all six fields; without it the built-in defaults apply.
+# The dashboard's vardiff overrides for such a lane are stored as
+# coins.<key>.stratum.vardiff.<field>.
+#
+# [coins.<key>.stratum]
+# listen = "0.0.0.0:3334"
+# [coins.<key>.stratum.vardiff]
+# initial_difficulty = 65536
+# min_difficulty = 1024
+# max_difficulty = 16777216
+# target_share_seconds = 10
+# retarget_seconds = 60
+# variance_percent = 30

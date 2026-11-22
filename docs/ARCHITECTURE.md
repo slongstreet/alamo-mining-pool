@@ -15,6 +15,35 @@
 
 The `alamo` binary wires these together. Everything lives in one process.
 
+## Lanes
+
+A lane is one parent coin plus the aux coins merge-mined with it: its own nodes, stratum
+listener, vardiff, payout tables, block submitter, confirmation trackers, statistics, and
+accounting. Every enabled coin without `merge_mined_with` is a lane, keyed by its
+(lower-case) config key; the key also scopes the lane's rows in the database. A parent
+listens on `[stratum]` unless it has a `[coins.<key>.stratum]` section; two lanes may not
+resolve to the same address.
+
+Lanes start independently. Each connects its own nodes with retry and backoff and opens
+its listener once all of them answer, so a lane whose node is down or syncing never holds
+another lane's miners off. A configuration mistake found while a lane starts (a node on
+another network than the config implies, a fallback address that does not fit it, a
+listener that cannot bind) stops the whole daemon, because waiting will not fix it; an
+unreachable node never stops anything.
+
+One publisher task owns every lane's `Stats` and `Persistence`. Each lane's stratum
+server reports on its own event channel, so an event's lane is the channel it arrived on
+and nothing is added to the per-share path; session ids restart at 1 per server and are
+only ever compared within a lane. Retention runs once for the whole database. The status
+document, share-count reset, and worker removal currently describe the primary lane (the
+parent on the default `[stratum]` section, else the first by key); the other lanes run and
+persist fully.
+
+Settings start from the config alone. The coinbase tag is one global value whose byte
+budget is the tightest over all configured lanes. Vardiff and payout tables are per lane.
+A stored fallback-address override can only be checked against its coin's network, so
+one for a lane that has not connected yet waits and is validated when the lane connects.
+
 ## Crates
 
 ### alamo-core
@@ -39,9 +68,9 @@ there is no libzmq dependency. Polling never stops; it slows to every 10 s while
 subscription is up and is the fallback when it is not.
 
 Each source reports `NodeHealth` on its own watch channel: whether the last RPC call
-succeeded, consecutive failures, the last error, and the ZMQ state. At startup the daemon
-retries an unreachable node with backoff instead of exiting, so it can boot before its
-nodes do. If a node stays unreachable past `template_stale_secs`, the source withdraws its
+succeeded, consecutive failures, the last error, and the ZMQ state. At startup each lane
+retries an unreachable node with backoff instead of exiting, so the daemon can boot before
+its nodes do. If a node stays unreachable past `template_stale_secs`, the source withdraws its
 template (`None` on the channel): a withdrawn aux template drops out of merged work on the
 next job, while a withdrawn parent leaves miners on their last job because stratum v1 has
 no way to pause them. When the node returns, the template is refetched whatever the tip.
@@ -78,7 +107,8 @@ database reads. Everything else is served from the embedded `web/dist`. The dash
 that draws its charts as inline SVG.
 
 ### alamo
-Config loading and validation, tracing setup, task supervision, graceful shutdown.
+Config loading and validation, tracing setup, lane startup and task supervision, the
+publisher, live settings, graceful shutdown.
 SIGINT and SIGTERM take the same path: cancel every task, flush pending accounting to
 the store, and exit once the servers drain or after five seconds, whichever comes first.
 

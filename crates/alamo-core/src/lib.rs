@@ -18,6 +18,7 @@ pub mod job;
 pub mod merkle;
 pub mod odds;
 pub mod payout;
+pub mod stratum_config;
 pub mod target;
 pub mod time;
 pub mod work;
