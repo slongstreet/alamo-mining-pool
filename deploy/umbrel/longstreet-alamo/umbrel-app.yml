@@ -2,7 +2,7 @@ manifestVersion: 1
 id: longstreet-alamo
 category: bitcoin
 name: Alamo Mining Pool
-version: "0.1.12"
+version: "0.1.13"
 tagline: Solo mine Litecoin and merge-mine Dogecoin against your own nodes
 description: >-
   Alamo is a self-hosted solo mining pool. Miners connect over stratum with their
@@ -15,12 +15,13 @@ description: >-
   Settings page (or in alamo.toml under the app's data directory) before pointing miners
   at port 3333.
 releaseNotes: >-
-  Alamo 0.1.12: safer block submission. A block is retried for several minutes when the
-  node cannot be reached instead of being dropped, and a copy of any block the node has
-  not accepted is kept under the data directory's blocks folder. Blocks for different
-  chains are submitted independently, so a slow node never delays the other chain. A
-  miner far above its starting difficulty is moved to the right difficulty within
-  seconds instead of doubling once a minute.
+  Alamo 0.1.13: groundwork for mining more than one parent chain. Workers, shares, and
+  hashrate history are now kept per lane (a parent coin and its merge-mined coins); your
+  existing history is carried over and mining is unchanged. The status API lists lanes,
+  and a stored fallback address is no longer dropped when its node is slow to start.
+  Breaking for Prometheus users: every per-lane metric now carries a lane label, so
+  queries against the old unlabelled series need sum() or a lane matcher. The database
+  is upgraded on first start and cannot be opened by older versions afterwards.
 developer: Scott Longstreet
 website: https://github.com/slongstreet/alamo-mining-pool
 icon: https://raw.githubusercontent.com/slongstreet/longstreet-umbrel-apps/refs/heads/main/longstreet-alamo/icon.svg
