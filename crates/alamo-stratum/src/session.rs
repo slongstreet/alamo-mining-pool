@@ -11,7 +11,7 @@ use alamo_core::coinbase::CoinbaseParts;
 use alamo_core::hash::sha256d;
 use alamo_core::header::BlockHeader;
 use alamo_core::job::{JobId, RejectReason, ShareOutcome};
-use alamo_core::payout::{PayoutSet, Payouts};
+use alamo_core::payout::{password_difficulty, PayoutSet, Payouts};
 use alamo_core::work::MergedWork;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -64,6 +64,10 @@ pub struct Session {
     work: Option<Arc<MergedWork>>,
     vardiff: Vardiff,
     payouts: Arc<PayoutSet>,
+    /// Header version bits the lane lets miners roll (BIP310); zero when it offers none.
+    pool_version_mask: u32,
+    /// The mask negotiated with `mining.configure`; zero until then.
+    version_mask: u32,
 }
 
 impl Session {
@@ -86,7 +90,22 @@ impl Session {
             work: None,
             vardiff: Vardiff::new(vardiff_cfg, now),
             payouts,
+            pool_version_mask: 0,
+            version_mask: 0,
         }
+    }
+
+    /// Offer BIP310 version rolling over the header bits in `mask` (the lane coin's
+    /// `version_rolling_mask`, BIP320's `0x1fffe000` for Bitcoin). Zero, the default,
+    /// keeps `mining.configure` answering `version-rolling: false`.
+    pub fn with_version_rolling(mut self, mask: u32) -> Self {
+        self.pool_version_mask = mask;
+        self
+    }
+
+    /// The version-rolling mask negotiated with the miner (zero if none).
+    pub fn version_mask(&self) -> u32 {
+        self.version_mask
     }
 
     /// Authorized worker names.
@@ -103,10 +122,7 @@ impl Session {
             "mining.subscribe" => self.subscribe(id, params, &mut fx),
             "mining.authorize" => self.authorize(id, params, &mut fx),
             "mining.submit" => self.submit(id, params, now, now_unix, &mut fx),
-            "mining.configure" => {
-                // No extensions (version rolling is not used by scrypt miners).
-                fx.respond(Response::ok(id, json!({ "version-rolling": false })));
-            }
+            "mining.configure" => self.configure(id, params, &mut fx),
             "mining.extranonce.subscribe" => fx.respond(Response::ok(id, json!(true))),
             "mining.suggest_difficulty" => {
                 if let Some(d) = params.first().and_then(Value::as_f64).filter(|d| *d > 0.0) {
@@ -139,6 +155,85 @@ impl Session {
             EXTRANONCE2_LEN,
         ]);
         fx.respond(Response::ok(id, result));
+    }
+
+    /// BIP310 `mining.configure`. Answers every requested extension: `version-rolling`
+    /// with the mask the miner and the lane share, everything else `false`. A lane that
+    /// offers no version rolling answers `{"version-rolling": false}` whatever was asked,
+    /// as it always has. It may arrive before or after subscribe and authorize.
+    fn configure(&mut self, id: Value, params: &[Value], fx: &mut Effects) {
+        if self.pool_version_mask == 0 {
+            fx.respond(Response::ok(id, json!({ "version-rolling": false })));
+            return;
+        }
+        let requested = params.first().and_then(Value::as_array);
+        let options = params.get(1);
+        let mut result = serde_json::Map::new();
+        for code in requested.into_iter().flatten().filter_map(Value::as_str) {
+            if code == "version-rolling" {
+                self.configure_version_rolling(options, &mut result);
+            } else {
+                result.insert(code.to_owned(), Value::Bool(false));
+            }
+        }
+        fx.respond(Response::ok(id, Value::Object(result)));
+    }
+
+    fn configure_version_rolling(
+        &mut self,
+        options: Option<&Value>,
+        result: &mut serde_json::Map<String, Value>,
+    ) {
+        let option = |name: &str| options.and_then(|o| o.get(name));
+        // BIP310: a miner that sends no mask may roll any bit.
+        let miner_mask = match option("version-rolling.mask") {
+            None | Some(Value::Null) => Some(u32::MAX),
+            Some(Value::String(hex)) if !hex.is_empty() && hex.len() <= 8 => {
+                u32::from_str_radix(hex, 16).ok()
+            }
+            Some(_) => None,
+        };
+        let Some(miner_mask) = miner_mask else {
+            self.version_mask = 0;
+            result.insert(
+                "version-rolling".into(),
+                Value::String("version-rolling.mask must be 8 hex digits".into()),
+            );
+            return;
+        };
+        let mask = miner_mask & self.pool_version_mask;
+        if mask == 0 {
+            tracing::info!(
+                session = self.id,
+                miner_mask = %format_args!("{miner_mask:08x}"),
+                pool_mask = %format_args!("{:08x}", self.pool_version_mask),
+                "version rolling refused: the miner's mask shares no bits with the pool's"
+            );
+            self.version_mask = 0;
+            result.insert("version-rolling".into(), Value::Bool(false));
+            return;
+        }
+        // BIP310: min-bit-count is diagnostic. A miner offered fewer bits than it wants
+        // can still roll them (or not), so the shared mask is granted regardless.
+        let min_bits = option("version-rolling.min-bit-count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if u64::from(mask.count_ones()) < min_bits {
+            tracing::info!(
+                session = self.id,
+                mask = %format_args!("{mask:08x}"),
+                bits = mask.count_ones(),
+                min_bits,
+                "version rolling granted with fewer bits than the miner asked for"
+            );
+        }
+        self.version_mask = mask;
+        tracing::debug!(session = self.id, mask = %format_args!("{mask:08x}"), "version rolling");
+        result.insert("version-rolling".into(), Value::Bool(true));
+        result.insert(
+            "version-rolling.mask".into(),
+            Value::String(format!("{mask:08x}")),
+        );
     }
 
     fn authorize(&mut self, id: Value, params: &[Value], fx: &mut Effects) {
@@ -176,6 +271,11 @@ impl Session {
             tracing::warn!(session = self.id, username, coin = aux.coin, fallback = %aux.payout.address, "password holds no valid address; paying fallback");
         }
         let first = self.payout.is_none();
+        if first {
+            if let Some(d) = password_difficulty(password) {
+                self.difficulty = self.vardiff.clamp(d);
+            }
+        }
         if !self.workers.iter().any(|w| w == username) {
             self.workers.push(username.to_owned());
         }
@@ -229,10 +329,21 @@ impl Session {
             fx.respond(Response::err(id, RejectReason::Unauthorized.into()));
             return;
         }
-        let (Ok(extranonce2), Ok(ntime), Ok(nonce)) = (
+        // BIP310's sixth parameter. A lane without version rolling ignores it, as it
+        // always has, so a scrypt miner that sends one anyway behaves exactly as before.
+        let version_bits = match params.get(5) {
+            _ if self.pool_version_mask == 0 => Ok(None),
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(hex)) if !hex.is_empty() && hex.len() <= 8 => {
+                u32::from_str_radix(hex, 16).map(Some).map_err(drop)
+            }
+            Some(_) => Err(()),
+        };
+        let (Ok(extranonce2), Ok(ntime), Ok(nonce), Ok(version_bits)) = (
             hex::decode(en2),
             u32::from_str_radix(ntime, 16),
             u32::from_str_radix(nonce, 16),
+            version_bits,
         ) else {
             fx.respond(Response::err(id, StratumError::other("Malformed submit")));
             return;
@@ -251,6 +362,7 @@ impl Session {
             extranonce2,
             ntime,
             nonce,
+            version_bits,
         };
         let job_difficulty = job.difficulty;
         let coin = job.work.coin;
@@ -258,6 +370,7 @@ impl Session {
             job,
             &self.extranonce1,
             &submit,
+            self.version_mask,
             &payout.parent.address,
             now_unix,
         );
@@ -721,5 +834,272 @@ mod tests {
         );
         let newest = s.jobs.iter().max_by_key(|j| j.id.0).unwrap();
         assert_eq!(newest.difficulty, lowered);
+    }
+
+    fn btc_session(mask: u32) -> Session {
+        session().with_version_rolling(mask)
+    }
+
+    fn result(fx: &Effects) -> &Value {
+        let Outgoing::Response(r) = &fx.outgoing[0] else {
+            panic!("{:?}", fx.outgoing)
+        };
+        &r.result
+    }
+
+    #[test]
+    fn scrypt_lanes_still_refuse_version_rolling() {
+        let mut s = session();
+        let fx = s.handle(
+            req(
+                "mining.configure",
+                json!([["version-rolling", "minimum-difficulty"], {"version-rolling.mask": "1fffe000"}]),
+            ),
+            Instant::now(),
+            0,
+        );
+        assert_eq!(result(&fx), &json!({ "version-rolling": false }));
+        assert_eq!(s.version_mask(), 0);
+    }
+
+    #[test]
+    fn configure_negotiates_the_shared_mask_and_refuses_other_extensions() {
+        let mut s = btc_session(0x1fff_e000);
+        let fx = s.handle(
+            req(
+                "mining.configure",
+                json!([
+                    ["minimum-difficulty", "version-rolling", "subscribe-extranonce"],
+                    {"version-rolling.mask": "ffffffff", "version-rolling.min-bit-count": 2,
+                     "minimum-difficulty.value": 2048}
+                ]),
+            ),
+            Instant::now(),
+            0,
+        );
+        assert_eq!(
+            result(&fx),
+            &json!({
+                "minimum-difficulty": false,
+                "version-rolling": true,
+                "version-rolling.mask": "1fffe000",
+                "subscribe-extranonce": false,
+            })
+        );
+        assert_eq!(s.version_mask(), 0x1fff_e000);
+
+        // BIP310's own example: the result is the miner's mask AND the pool's.
+        let mut s = btc_session(0x1fff_e000);
+        let fx = s.handle(
+            req(
+                "mining.configure",
+                json!([["version-rolling"], {"version-rolling.mask": "18000000", "version-rolling.min-bit-count": 2}]),
+            ),
+            Instant::now(),
+            0,
+        );
+        assert_eq!(
+            result(&fx),
+            &json!({"version-rolling": true, "version-rolling.mask": "18000000"})
+        );
+
+        // No mask means the miner can roll anything (BIP310 default "ffffffff").
+        let mut s = btc_session(0x1fff_e000);
+        let fx = s.handle(
+            req("mining.configure", json!([["version-rolling"], {}])),
+            Instant::now(),
+            0,
+        );
+        assert_eq!(result(&fx)["version-rolling.mask"], "1fffe000");
+
+        // Fewer shared bits than the miner's min-bit-count: still granted (BIP310 treats
+        // the count as diagnostic).
+        let mut s = btc_session(0x1fff_e000);
+        let fx = s.handle(
+            req(
+                "mining.configure",
+                json!([["version-rolling"], {"version-rolling.mask": "00006000", "version-rolling.min-bit-count": 3}]),
+            ),
+            Instant::now(),
+            0,
+        );
+        assert_eq!(
+            result(&fx),
+            &json!({"version-rolling": true, "version-rolling.mask": "00006000"})
+        );
+        assert_eq!(s.version_mask(), 0x0000_6000);
+        // No shared bits at all: refused.
+        let mut s = btc_session(0x1fff_e000);
+        let fx = s.handle(
+            req(
+                "mining.configure",
+                json!([["version-rolling"], {"version-rolling.mask": "e0000000", "version-rolling.min-bit-count": 0}]),
+            ),
+            Instant::now(),
+            0,
+        );
+        assert_eq!(result(&fx), &json!({"version-rolling": false}));
+        assert_eq!(s.version_mask(), 0);
+        // A malformed mask gets an error string, as BIP310 allows.
+        let fx = s.handle(
+            req(
+                "mining.configure",
+                json!([["version-rolling"], {"version-rolling.mask": "xyz"}]),
+            ),
+            Instant::now(),
+            0,
+        );
+        assert!(result(&fx)["version-rolling"].is_string());
+    }
+
+    #[test]
+    fn configure_after_authorize_enables_the_sixth_submit_parameter() {
+        let mut s = btc_session(0x1fff_e000);
+        let a = addr(1);
+        s.handle(req("mining.authorize", json!([a, "x"])), Instant::now(), 0);
+        s.on_work(work(true));
+        // Before configure nothing may be rolled.
+        let submit = |bits: &str| {
+            req(
+                "mining.submit",
+                json!([a, "1", "00000001", "6553f100", "00000000", bits]),
+            )
+        };
+        let fx = s.handle(submit("00002000"), Instant::now(), 1_700_000_000);
+        assert_eq!(result_error(&fx), (20, "Invalid version bits"));
+        s.handle(
+            req(
+                "mining.configure",
+                json!([["version-rolling"], {"version-rolling.mask": "1fffe000"}]),
+            ),
+            Instant::now(),
+            0,
+        );
+        let fx = s.handle(submit("00002000"), Instant::now(), 1_700_000_000);
+        assert_ne!(result_error(&fx).1, "Invalid version bits");
+        let fx = s.handle(submit("00001000"), Instant::now(), 1_700_000_000);
+        assert_eq!(result_error(&fx), (20, "Invalid version bits"));
+        let fx = s.handle(submit("nothex"), Instant::now(), 1_700_000_000);
+        assert_eq!(result_error(&fx), (20, "Malformed submit"));
+    }
+
+    #[test]
+    fn a_scrypt_lane_ignores_a_sixth_submit_parameter() {
+        let mut s = session();
+        let a = addr(1);
+        s.handle(req("mining.authorize", json!([a, "x"])), Instant::now(), 0);
+        s.on_work(work(true));
+        let fx = s.handle(
+            req(
+                "mining.submit",
+                json!([a, "1", "00000001", "6553f100", "00000000", "ffffffff"]),
+            ),
+            Instant::now(),
+            1_700_000_000,
+        );
+        let (code, message) = result_error(&fx);
+        assert_eq!((code, message), (23, "Low difficulty share"));
+    }
+
+    fn result_error(fx: &Effects) -> (i32, &str) {
+        let Outgoing::Response(r) = &fx.outgoing[0] else {
+            panic!("{:?}", fx.outgoing)
+        };
+        let e = r.error.as_ref().expect("an error reply");
+        (e.code, e.message.as_str())
+    }
+
+    #[test]
+    fn d_in_the_password_sets_the_starting_difficulty_within_the_lane_limits() {
+        let cfg = VardiffConfig::default();
+        let start = |password: &str| {
+            let mut s = session();
+            let fx = s.handle(
+                req("mining.authorize", json!([addr(1), password])),
+                Instant::now(),
+                0,
+            );
+            let Some(Outgoing::Notification(n)) = fx.outgoing.get(1) else {
+                panic!("{:?}", fx.outgoing)
+            };
+            assert_eq!(n.method, "mining.set_difficulty");
+            n.params[0].as_f64().unwrap()
+        };
+        assert_eq!(start("d=4096"), 4096.0);
+        assert_eq!(start(&format!("doge={},d=4096", doge_addr(3))), 4096.0);
+        assert_eq!(start(&format!("{} d=4096", doge_addr(3))), 4096.0);
+        assert_eq!(start("d=1"), cfg.min_difficulty, "clamped to the minimum");
+        assert_eq!(
+            start("d=1e12"),
+            cfg.max_difficulty,
+            "clamped to the maximum"
+        );
+        assert_eq!(start("d=banana"), cfg.initial_difficulty);
+        assert_eq!(start("x"), cfg.initial_difficulty);
+
+        // The aux payout next to d= still resolves.
+        let mut s = session();
+        let fx = s.handle(
+            req(
+                "mining.authorize",
+                json!([addr(1), format!("{} d=4096", doge_addr(3))]),
+            ),
+            Instant::now(),
+            0,
+        );
+        assert!(
+            matches!(&fx.events[0], PoolEvent::Authorized { aux, .. } if aux[0].address == doge_addr(3) && !aux[0].fallback)
+        );
+    }
+
+    #[test]
+    fn fractional_difficulty_reaches_the_miner_and_the_job_target() {
+        // SHA-256d lanes start tiny devices at a thousandth of a share.
+        let cfg = VardiffConfig {
+            initial_difficulty: 1024.0,
+            min_difficulty: 0.001,
+            max_difficulty: 4_294_967_296.0,
+            ..VardiffConfig::default()
+        };
+        let mut s = Session::new(
+            9,
+            [1, 2, 3, 4],
+            cfg,
+            session().payouts.clone(),
+            Instant::now(),
+        );
+        let fx = s.handle(
+            req("mining.authorize", json!([addr(1), "d=0.001"])),
+            Instant::now(),
+            0,
+        );
+        let Outgoing::Notification(n) = &fx.outgoing[1] else {
+            panic!()
+        };
+        assert_eq!(serde_json::to_string(&n.params).unwrap(), "[0.001]");
+        let mut w = WorkTemplate::regtest_sample(5, None);
+        w.algorithm = alamo_core::Algorithm::Sha256d;
+        s.on_work(Arc::new(MergedWork::solo(Arc::new(w))));
+        let job = s.jobs.back().unwrap();
+        assert_eq!(job.difficulty, 0.001);
+        assert_eq!(
+            job.target,
+            alamo_core::target::Target::from_difficulty(0.001)
+        );
+        // 32 fractional bits: within a part in ten million of the asked difficulty.
+        assert!((job.target.difficulty() / 0.001 - 1.0).abs() < 1e-7);
+        // A thousandth of a share is a target a thousand times easier than difficulty 1.
+        assert!(job.target > alamo_core::Algorithm::Sha256d.share_target(1.0));
+        // Below the minimum it clamps to it.
+        let fx = s.handle(
+            req("mining.suggest_difficulty", json!([0.00001])),
+            Instant::now(),
+            0,
+        );
+        assert!(
+            fx.outgoing.len() == 1,
+            "already at the minimum: no set_difficulty, {:?}",
+            fx.outgoing
+        );
     }
 }

@@ -71,7 +71,7 @@ jobs:
           path: target/${{ matrix.target }}/release/alamo
 
   regtest:
-    name: Regtest end-to-end (Litecoin + Dogecoin)
+    name: Regtest end-to-end (Litecoin + Dogecoin, Bitcoin)
     needs: dashboard
     runs-on: ubuntu-latest
     steps:
@@ -84,7 +84,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: regtest
-      - name: Start litecoind and dogecoind (regtest)
+      - name: Start litecoind, dogecoind, and bitcoind (regtest)
         run: docker compose -f deploy/regtest/docker-compose.yml up -d --build
       - name: Build tests
         run: cargo test -p alamo --test regtest --no-run
@@ -102,6 +102,12 @@ jobs:
           ALAMO_REGTEST_RPC: http://alamo:alamo@127.0.0.1:19443
           ALAMO_REGTEST_DOGE_RPC: http://alamo:alamo@127.0.0.1:18332
         run: cargo test -p alamo --test regtest -- --nocapture
+      - name: Prepare bitcoind (mature coins, a segwit tx in the mempool)
+        run: ./deploy/regtest/prepare-bitcoin.sh
+      - name: Mine Bitcoin blocks with version rolling
+        env:
+          ALAMO_REGTEST_BTC_RPC: http://alamo:alamo@127.0.0.1:18443
+        run: cargo test -p alamo --test regtest mines_bitcoin_blocks_with_version_rolling -- --nocapture --exact
       - name: Node logs
         if: failure()
         run: docker compose -f deploy/regtest/docker-compose.yml logs --tail 100

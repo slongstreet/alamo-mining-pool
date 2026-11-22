@@ -38,3 +38,25 @@ rpc_password = "alamo"
 zmq_hashblock = "tcp://127.0.0.1:28333"
 # Any regtest Dogecoin address; miners supply their own in the stratum password field.
 fallback_address = "midSACfDe3qAxJZZXA9gkwBZgPqJJUpy1w"
+
+# Bitcoin regtest (bitcoind in the same compose file), a lane of its own on port 3334.
+# Regtest network difficulty is about 4.7e-10, so the vardiff floor is below the
+# built-in 0.001 and every CPU share is a block.
+[coins.btc]
+enabled = true
+rpc_url = "http://127.0.0.1:18443"
+rpc_user = "alamo"
+rpc_password = "alamo"
+zmq_hashblock = "tcp://127.0.0.1:28334"
+fallback_address = "bcrt1qyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zs4w3j0"
+
+[coins.btc.stratum]
+listen = "127.0.0.1:3334"
+
+[coins.btc.stratum.vardiff]
+initial_difficulty = 0.000000001
+min_difficulty = 0.000000001
+max_difficulty = 1000000
+target_share_seconds = 10
+retarget_seconds = 60
+variance_percent = 30

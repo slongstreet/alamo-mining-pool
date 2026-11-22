@@ -2,8 +2,10 @@
 #
 #   docker compose -f deploy/regtest/docker-compose.yml up -d
 #   ./deploy/regtest/prepare-dogecoin.sh
+#   ./deploy/regtest/prepare-bitcoin.sh
 #   ALAMO_REGTEST_RPC=http://alamo:alamo@127.0.0.1:19443 \
 #   ALAMO_REGTEST_DOGE_RPC=http://alamo:alamo@127.0.0.1:18332 \
+#   ALAMO_REGTEST_BTC_RPC=http://alamo:alamo@127.0.0.1:18443 \
 #     cargo test -p alamo --test regtest -- --nocapture
 #
 # Dogecoin Core refuses `getblocktemplate` without at least one peer, even on regtest,
@@ -69,7 +71,31 @@ services:
     volumes:
       - dogecoind-peer-regtest:/home/dogecoin/.dogecoin
 
+  # Bitcoin Core hands out block templates on regtest without peers.
+  bitcoind:
+    build:
+      context: .
+      dockerfile: bitcoind.Dockerfile
+    image: alamo-bitcoind-regtest:local
+    command:
+      - -regtest
+      - -server=1
+      - -printtoconsole
+      - -rpcuser=alamo
+      - -rpcpassword=alamo
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -txindex=1
+      - -fallbackfee=0.0001
+      - -zmqpubhashblock=tcp://0.0.0.0:28334
+    ports:
+      - "127.0.0.1:18443:18443"
+      - "127.0.0.1:28334:28334"
+    volumes:
+      - bitcoind-regtest:/home/bitcoin/.bitcoin
+
 volumes:
   litecoind-regtest:
   dogecoind-regtest:
   dogecoind-peer-regtest:
+  bitcoind-regtest:

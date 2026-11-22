@@ -68,7 +68,8 @@ impl PayoutTable {
 ///
 /// The parent address is the stratum username. Aux addresses come from the password field,
 /// either bare (`DAddress`) or tagged (`doge=DAddress`), separated by commas or spaces;
-/// anything else in the password (`x`, `d=1024`) is ignored.
+/// anything else in the password (`x`, or `d=1024`, which [`password_difficulty`] reads)
+/// is ignored here.
 #[derive(Clone, Debug)]
 pub struct PayoutSet {
     /// The parent chain.
@@ -137,6 +138,18 @@ impl PayoutSet {
             aux,
         }
     }
+}
+
+/// The starting difficulty a miner asks for in its stratum password (`d=<number>`,
+/// alongside anything else there, separated by commas or spaces), if it asks for a
+/// usable one. Zero, negative, and non-numeric values are ignored.
+pub fn password_difficulty(password: &str) -> Option<f64> {
+    password
+        .split([',', ' ', '\t'])
+        .filter_map(|token| token.trim().split_once('='))
+        .filter(|(key, _)| key.trim().eq_ignore_ascii_case("d"))
+        .filter_map(|(_, value)| value.trim().parse::<f64>().ok())
+        .find(|d| d.is_finite() && *d > 0.0)
 }
 
 /// Split a stratum username into its address part and worker suffix.
@@ -220,6 +233,23 @@ mod tests {
         // A parent-chain address in the password is not a Dogecoin address.
         let p = set.resolve(&mine, &mine);
         assert!(p.aux[0].payout.fallback);
+    }
+
+    #[test]
+    fn difficulty_comes_from_d_in_the_password() {
+        assert_eq!(password_difficulty("d=4096"), Some(4096.0));
+        assert_eq!(password_difficulty("x"), None);
+        assert_eq!(password_difficulty(""), None);
+        assert_eq!(password_difficulty("doge=DAddr,d=4096"), Some(4096.0));
+        assert_eq!(password_difficulty("DAddr d=0.001"), Some(0.001));
+        assert_eq!(password_difficulty("D=512, doge=DAddr"), Some(512.0));
+        assert_eq!(password_difficulty("d = 2e3"), None, "spaces split tokens");
+        assert_eq!(password_difficulty("d=2e3"), Some(2000.0));
+        // Garbage is ignored, and a later good value still counts.
+        for bad in ["d=", "d=abc", "d=0", "d=-5", "d=NaN", "d=inf", "dd=5", "d5"] {
+            assert_eq!(password_difficulty(bad), None, "{bad}");
+        }
+        assert_eq!(password_difficulty("d=abc,d=64"), Some(64.0));
     }
 
     #[test]

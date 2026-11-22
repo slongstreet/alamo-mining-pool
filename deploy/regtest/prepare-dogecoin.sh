@@ -14,10 +14,19 @@ rpc() {
     | python3 -c 'import sys,json; r=json.load(sys.stdin); sys.exit(1) if r["error"] else print(json.dumps(r["result"]))'
 }
 
+# Wait until the node answers getblockcount without an error. While it starts up it
+# answers with an error (-28, "Loading block index...") that still carries a "result" key,
+# so only a null error counts as ready.
+ready() {
+  curl -s --data '{"method":"getblockcount","params":[]}' "$RPC_URL" 2>/dev/null \
+    | python3 -c 'import sys,json; r=json.load(sys.stdin); sys.exit(0 if r.get("error") is None and "result" in r else 1)' \
+      2>/dev/null
+}
 for _ in $(seq 1 90); do
-  curl -s --data '{"method":"getblockcount","params":[]}' "$RPC_URL" | grep -q result && break
+  ready && break
   sleep 1
 done
+ready || { echo "dogecoind at $RPC_URL did not become ready" >&2; exit 1; }
 
 height=$(rpc getblockcount)
 if [ "$height" -ge "$TARGET_HEIGHT" ]; then

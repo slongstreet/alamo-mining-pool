@@ -39,6 +39,9 @@ pub enum RejectReason {
     InvalidExtranonce2,
     /// The worker has not been authorized.
     Unauthorized,
+    /// The submit's BIP310 version bits change header bits outside the mask negotiated
+    /// with `mining.configure`.
+    InvalidVersionBits,
 }
 
 impl RejectReason {
@@ -49,7 +52,9 @@ impl RejectReason {
             RejectReason::Duplicate => 22,
             RejectReason::LowDifficulty => 23,
             RejectReason::Unauthorized => 24,
-            RejectReason::InvalidNtime | RejectReason::InvalidExtranonce2 => 20,
+            RejectReason::InvalidNtime
+            | RejectReason::InvalidExtranonce2
+            | RejectReason::InvalidVersionBits => 20,
         }
     }
 
@@ -63,6 +68,7 @@ impl RejectReason {
             RejectReason::InvalidNtime => "Invalid ntime",
             RejectReason::InvalidExtranonce2 => "Invalid extranonce2",
             RejectReason::Unauthorized => "Unauthorized worker",
+            RejectReason::InvalidVersionBits => "Invalid version bits",
         }
     }
 
@@ -76,6 +82,7 @@ impl RejectReason {
             RejectReason::InvalidNtime => "invalid_ntime",
             RejectReason::InvalidExtranonce2 => "invalid_extranonce2",
             RejectReason::Unauthorized => "unauthorized",
+            RejectReason::InvalidVersionBits => "invalid_version_bits",
         }
     }
 }
@@ -106,5 +113,13 @@ mod tests {
         let id = JobId(0xdead_beef);
         assert_eq!(id.to_string(), "deadbeef");
         assert_eq!("deadbeef".parse::<JobId>().unwrap(), id);
+    }
+
+    #[test]
+    fn invalid_version_bits_reads_like_the_other_rejections() {
+        let r = RejectReason::InvalidVersionBits;
+        assert_eq!(r.stratum_code(), 20);
+        assert_eq!(r.message(), "Invalid version bits");
+        assert_eq!(r.as_str(), "invalid_version_bits");
     }
 }

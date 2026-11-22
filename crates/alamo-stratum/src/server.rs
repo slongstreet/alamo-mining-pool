@@ -52,6 +52,9 @@ pub struct StratumServer {
     pub events: mpsc::Sender<PoolEvent>,
     /// Where found blocks go.
     pub blocks: mpsc::Sender<BlockCandidate>,
+    /// Header version bits miners may roll under BIP310 (the lane coin's
+    /// `version_rolling_mask`); zero offers no version rolling.
+    pub version_mask: u32,
 }
 
 /// A bound listener, ready to run.
@@ -144,7 +147,8 @@ async fn handle_connection(
         server.vardiff.borrow().clone(),
         server.payouts.borrow().clone(),
         Instant::now(),
-    );
+    )
+    .with_version_rolling(server.version_mask);
     let mut work = server.work.clone();
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

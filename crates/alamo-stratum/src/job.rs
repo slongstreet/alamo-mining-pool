@@ -33,8 +33,9 @@ pub struct SessionJob {
     pub target: Target,
     /// Set once a newer template with `clean_jobs` has replaced it.
     pub stale: bool,
-    /// Shares already accepted, keyed by (extranonce2, ntime, nonce).
-    pub seen: HashSet<(u32, u32, u32)>,
+    /// Shares already accepted, keyed by (extranonce2, ntime, nonce, header version), so
+    /// one nonce found under two rolled versions counts twice, as it should.
+    pub seen: HashSet<(u32, u32, u32, u32)>,
 }
 
 /// An aux chain block ready to be proven by this job's parent header.

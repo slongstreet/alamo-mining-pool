@@ -59,6 +59,13 @@ impl BlockHeader {
     }
 }
 
+/// The header version a BIP310 (version-rolling) share was hashed with:
+/// `(job_version & !mask) | (version_bits & mask)`, where `mask` is the one negotiated with
+/// `mining.configure` and `version_bits` the submit's sixth parameter.
+pub fn rolled_version(job_version: i32, version_bits: u32, mask: u32) -> i32 {
+    ((job_version as u32 & !mask) | (version_bits & mask)) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +85,18 @@ mod tests {
             bits: 0x1e0f_fff0,
             nonce: 2_084_524_493,
         }
+    }
+
+    #[test]
+    fn rolled_version_replaces_only_the_masked_bits() {
+        let mask = 0x1fff_e000;
+        assert_eq!(rolled_version(0x2000_0000, 0, mask), 0x2000_0000);
+        assert_eq!(rolled_version(0x2000_0000, 0x0aaa_e000, mask), 0x2aaa_e000);
+        // Job bits inside the mask are replaced, not ORed: the miner sent them clear.
+        assert_eq!(rolled_version(0x3000_0004, 0x0000_2000, mask), 0x2000_2004);
+        // Bits the miner sets outside the mask never reach the header.
+        assert_eq!(rolled_version(0x2000_0000, 0xffff_ffff, mask), 0x3fff_e000);
+        assert_eq!(rolled_version(0x2000_0000, 0xffff_ffff, 0), 0x2000_0000);
     }
 
     #[test]

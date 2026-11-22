@@ -5,7 +5,9 @@ next to your own full nodes, and watch your odds of hitting the next block in re
 
 - **Solo only.** Every block pays the miner who found it, straight from the coinbase.
 - **Merge mining.** Litecoin (LTC) as the parent chain with Dogecoin (DOGE) as the aux chain
-  out of the box. More coins later.
+  out of the box.
+- **Bitcoin too.** Bitcoin (BTC) solo mining on a port of its own, with BIP310 version
+  rolling for modern SHA-256 ASICs.
 - **Single binary.** Rust daemon with the dashboard embedded. One executable, one config file.
 - **Small footprint.** Built to sit quietly beside `litecoind` and `dogecoind` on a mini PC or
   a Raspberry Pi.
@@ -13,7 +15,8 @@ next to your own full nodes, and watch your odds of hitting the next block in re
   time to block, and luck versus expectation, all live.
 
 > Status: Litecoin solo mining and Dogecoin merge mining work end to end on regtest,
-> including Litecoin MWEB blocks. Shares, workers, hashrate samples, and blocks persist
+> including Litecoin MWEB blocks, and so does Bitcoin solo mining with version rolling
+> (the dashboard does not yet have a per-lane view). Shares, workers, hashrate samples, and blocks persist
 > across restarts; the live dashboard covers odds, rounds and luck, hashrate, workers,
 > shares, and blocks; the daemon survives node outages, takes ZMQ block notifications,
 > and exposes Prometheus metrics. Releases ship static Linux binaries and a multi-arch
@@ -24,7 +27,7 @@ next to your own full nodes, and watch your odds of hitting the next block in re
 ```
 crates/
   alamo-core      Pure types and math: hashing, targets, difficulty, jobs, block odds
-  alamo-coins     Coin definitions, node RPC, block templates, auxpow (LTC, DOGE)
+  alamo-coins     Coin definitions, node RPC, block templates, auxpow (BTC, LTC, DOGE)
   alamo-stratum   Stratum v1 TCP server, sessions, vardiff, job broadcast
   alamo-store     SQLite persistence (shares, hashrate samples, blocks, workers)
   alamo-web       HTTP/WebSocket API and the embedded dashboard
@@ -59,12 +62,13 @@ cargo test --workspace
 
 ## Regtest
 
-Throwaway Litecoin and Dogecoin regtest nodes live in `deploy/regtest` (Dogecoin runs as a
-pair, because `dogecoind` refuses to hand out block templates without a peer):
+Throwaway Litecoin, Dogecoin, and Bitcoin regtest nodes live in `deploy/regtest` (Dogecoin
+runs as a pair, because `dogecoind` refuses to hand out block templates without a peer):
 
 ```bash
 docker compose -f deploy/regtest/docker-compose.yml up -d --build
 ./deploy/regtest/prepare-dogecoin.sh       # mine the 20 blocks Dogecoin needs before auxpow
+./deploy/regtest/prepare-bitcoin.sh        # mature coins, put a segwit tx in the mempool
 ./deploy/regtest/activate-mweb.sh          # optional: mine Litecoin past MWEB activation
 cargo run -p alamo -- --config config/alamo.regtest.toml
 ```
@@ -78,7 +82,9 @@ ALAMO_REGTEST_DOGE_RPC=http://alamo:alamo@127.0.0.1:18332 \
   cargo test -p alamo --test regtest -- --nocapture
 ```
 
-Leave `ALAMO_REGTEST_DOGE_RPC` unset to test Litecoin alone.
+Leave `ALAMO_REGTEST_DOGE_RPC` unset to test Litecoin alone. Set
+`ALAMO_REGTEST_BTC_RPC=http://alamo:alamo@127.0.0.1:18443` (after `prepare-bitcoin.sh`)
+to also mine two Bitcoin blocks through a BTC lane with rolled version bits.
 
 ## Running it for real
 
@@ -91,11 +97,12 @@ for x86-64 and arm64 Linux and publishes `ghcr.io/slongstreet/alamo-mining-pool`
 
 Copy `config/alamo.example.toml` to `alamo.toml` and edit it. Miners connect with their
 payout address as the stratum username (ckpool style), for example
-`ltc1q...` for Litecoin. A worker name can be appended after a dot: `ltc1q....rig1`.
+`ltc1q...` for Litecoin or `bc1q...`/`bc1p...` for Bitcoin (on the Bitcoin lane's port). A worker name can be appended after a dot: `ltc1q....rig1`.
 
 The Dogecoin payout address goes in the stratum password, either bare (`D...`) or tagged
-(`doge=D...`, alongside anything else the miner sends there such as `d=1024`). Workers that
-do not supply one are paid at the configured fallback address, and the dashboard says so.
+(`doge=D...`, alongside anything else the miner sends there such as `d=1024`, which sets
+the starting difficulty). Workers that do not supply one are paid at the configured
+fallback address, and the dashboard says so.
 
 ## License
 

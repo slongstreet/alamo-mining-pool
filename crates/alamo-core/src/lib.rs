@@ -23,6 +23,9 @@ pub mod target;
 pub mod time;
 pub mod work;
 
+#[cfg(test)]
+mod bitcoin_kat;
+
 pub use address::AddressParams;
 pub use algo::Algorithm;
 pub use coinbase::CoinbaseParts;
