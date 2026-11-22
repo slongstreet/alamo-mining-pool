@@ -45,7 +45,8 @@ pub struct RetentionReport {
 }
 
 impl Store {
-    /// Trim old shares and downsample hashrate samples.
+    /// Trim old shares and downsample hashrate samples. Deletes by age and the share row
+    /// cap apply across all lanes; downsampling never merges lanes.
     ///
     /// Every tier boundary is aligned down to its bucket width so only complete buckets are
     /// folded. A bucket that straddles a boundary is left alone until it has fully aged in,
@@ -109,20 +110,20 @@ impl Store {
         Ok(deleted)
     }
 
-    /// Average samples in `[lo, hi)` into `bucket`-second rows, then drop the originals.
-    /// `lo` and `hi` must be multiples of `bucket`.
+    /// Average samples in `[lo, hi)` into `bucket`-second rows per lane and worker, then
+    /// drop the originals. `lo` and `hi` must be multiples of `bucket`.
     async fn downsample_range(&self, lo: i64, hi: i64, bucket: i64) -> Result<u64, StoreError> {
         if hi <= lo || bucket <= 0 {
             return Ok(0);
         }
         debug_assert!(lo % bucket == 0 && hi % bucket == 0);
         sqlx::query(
-            "INSERT INTO hashrate_samples (ts, worker, hashrate)
-             SELECT (ts / ?) * ? AS bucket_ts, worker, AVG(hashrate)
+            "INSERT INTO hashrate_samples (ts, lane, worker, hashrate)
+             SELECT (ts / ?) * ? AS bucket_ts, lane, worker, AVG(hashrate)
              FROM hashrate_samples
              WHERE ts >= ? AND ts < ?
-             GROUP BY worker, bucket_ts
-             ON CONFLICT(ts, worker) DO UPDATE SET hashrate = excluded.hashrate",
+             GROUP BY lane, worker, bucket_ts
+             ON CONFLICT(ts, lane, worker) DO UPDATE SET hashrate = excluded.hashrate",
         )
         .bind(bucket)
         .bind(bucket)
@@ -157,6 +158,8 @@ mod tests {
     use super::*;
     use crate::{temp_path, HashrateSample, NewShare, Store};
 
+    const LTC: &str = "ltc";
+
     fn policy() -> RetentionPolicy {
         RetentionPolicy {
             share_secs: 100,
@@ -183,11 +186,11 @@ mod tests {
                 reject_reason: None,
             })
             .collect();
-        store.persist_batch(&[], &shares).await.unwrap();
+        store.persist_batch(LTC, &[], &shares).await.unwrap();
         // now=1110: share_secs=100 keeps ts>=1010, which is 4 rows, then cap to 3.
         let report = store.retain(&policy(), 1_110).await.unwrap();
         assert!(report.shares_deleted >= 2);
-        let left = store.recent_shares(10).await.unwrap();
+        let left = store.recent_shares(LTC, 10).await.unwrap();
         assert_eq!(left.len(), 3);
         assert!(left.iter().all(|s| s.ts >= 1_010));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -207,11 +210,11 @@ mod tests {
                 hashrate: ts as f64,
             })
             .collect();
-        store.insert_hashrate_samples(&samples).await.unwrap();
+        store.insert_hashrate_samples(LTC, &samples).await.unwrap();
         let report = store.retain(&policy(), 20_000).await.unwrap();
         assert_eq!(report.samples_deleted, 2);
         let left: Vec<i64> = store
-            .hashrate_samples_since(None, 0)
+            .hashrate_samples_since(LTC, None, 0)
             .await
             .unwrap()
             .into_iter()
@@ -235,13 +238,13 @@ mod tests {
                 hashrate,
             })
             .collect();
-        store.insert_hashrate_samples(&samples).await.unwrap();
+        store.insert_hashrate_samples(LTC, &samples).await.unwrap();
 
         // now=520, raw=100: the mid window ends at 420, mid-bucket, so nothing is folded.
         store.retain(&policy(), 520).await.unwrap();
         assert_eq!(
             store
-                .hashrate_samples_since(Some("rig"), 0)
+                .hashrate_samples_since(LTC, Some("rig"), 0)
                 .await
                 .unwrap()
                 .len(),
@@ -250,7 +253,10 @@ mod tests {
 
         // now=700: the mid window ends at 600 and the whole bucket has aged in.
         store.retain(&policy(), 700).await.unwrap();
-        let left = store.hashrate_samples_since(Some("rig"), 0).await.unwrap();
+        let left = store
+            .hashrate_samples_since(LTC, Some("rig"), 0)
+            .await
+            .unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].ts, 300);
         assert!(
@@ -261,7 +267,10 @@ mod tests {
 
         // Folding again is idempotent.
         store.retain(&policy(), 800).await.unwrap();
-        let again = store.hashrate_samples_since(Some("rig"), 0).await.unwrap();
+        let again = store
+            .hashrate_samples_since(LTC, Some("rig"), 0)
+            .await
+            .unwrap();
         assert_eq!(again, left);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -279,9 +288,12 @@ mod tests {
                 hashrate: ts as f64,
             })
             .collect();
-        store.insert_hashrate_samples(&samples).await.unwrap();
+        store.insert_hashrate_samples(LTC, &samples).await.unwrap();
         store.retain(&policy(), 1_000).await.unwrap();
-        let left = store.hashrate_samples_since(Some("rig"), 0).await.unwrap();
+        let left = store
+            .hashrate_samples_since(LTC, Some("rig"), 0)
+            .await
+            .unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].ts, 0);
         assert!(
@@ -289,6 +301,39 @@ mod tests {
             "{}",
             left[0].hashrate
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn downsampling_keeps_lanes_apart() {
+        let path = temp_path("retain-lanes");
+        let store = Store::open(&path).await.unwrap();
+        // Same worker name and timestamps in two lanes, with different rates.
+        for (lane, base) in [(LTC, 10.0), ("btc", 1_000.0)] {
+            let samples: Vec<HashrateSample> = [0, 60, 120]
+                .into_iter()
+                .map(|ts| HashrateSample {
+                    ts,
+                    worker: "rig".into(),
+                    hashrate: base + ts as f64,
+                })
+                .collect();
+            store.insert_hashrate_samples(lane, &samples).await.unwrap();
+        }
+        store.retain(&policy(), 1_000).await.unwrap();
+        for (lane, mean) in [(LTC, 70.0), ("btc", 1_060.0)] {
+            let left = store
+                .hashrate_samples_since(lane, Some("rig"), 0)
+                .await
+                .unwrap();
+            assert_eq!(left.len(), 1, "{lane}");
+            assert_eq!(left[0].ts, 0);
+            assert!(
+                (left[0].hashrate - mean).abs() < 1e-9,
+                "{lane}: {}",
+                left[0].hashrate
+            );
+        }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -75,6 +75,8 @@ export type BlockStatus = 'accepted' | 'rejected' | 'confirmed' | 'orphaned';
 
 export interface BlockRow {
   id: number;
+  /** Lane that found it: the parent coin's config key (a merge-mined aux block carries its parent's). */
+  lane: string;
   coin: string;
   height: number;
   hash: string;

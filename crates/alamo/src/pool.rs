@@ -312,12 +312,15 @@ fn write_spool(path: &Path, block_hex: &str) -> std::io::Result<()> {
 
 /// Submit a block candidate to the node and record the result. An unreachable node is
 /// retried for several minutes.
+///
+/// `lane` is the parent coin's config key, recorded with the block (also for an aux block).
 pub async fn submit_candidate(
     rpc: &RpcClient,
     store: &Store,
+    lane: &str,
     candidate: &BlockCandidate,
 ) -> anyhow::Result<SubmitOutcome> {
-    submit_candidate_spooled(rpc, store, candidate, None).await
+    submit_candidate_spooled(rpc, store, lane, candidate, None).await
 }
 
 /// [`submit_candidate`], keeping a copy of the block under `spool` until the node accepts
@@ -326,6 +329,7 @@ pub async fn submit_candidate(
 pub async fn submit_candidate_spooled(
     rpc: &RpcClient,
     store: &Store,
+    lane: &str,
     candidate: &BlockCandidate,
     spool: Option<&Path>,
 ) -> anyhow::Result<SubmitOutcome> {
@@ -373,6 +377,7 @@ pub async fn submit_candidate_spooled(
     }
     store
         .insert_block(&NewBlock {
+            lane: lane.to_string(),
             coin: candidate.coin.to_string(),
             height: candidate.height,
             hash: candidate.block_hash.clone(),
@@ -501,6 +506,10 @@ pub async fn run(
     let Some(chains) = connect_chains(&config, &shutdown).await? else {
         return Ok(());
     };
+    // The one lane for now: the parent coin's config key in lower case, as the store keys
+    // it (`builtin` accepts `[coins.LTC]`, and its history must still be found).
+    let lane = chains.parent.key.to_ascii_lowercase();
+    state.set_primary_lane(&lane);
     // Settings stored in the database override the file; the pool tasks below watch
     // the channels this owns, so a change from the dashboard reaches them live.
     let settings = LiveSettings::start(&config, &chains, store.clone(), state.clone(), log)
@@ -569,6 +578,7 @@ pub async fn run(
     tasks.spawn(submitter(
         rpcs,
         store.clone(),
+        lane.clone(),
         config.pool.data_dir.join(BLOCK_SPOOL_DIR),
         blocks_rx,
         shutdown.child_token(),
@@ -592,6 +602,7 @@ pub async fn run(
         store.clone(),
         state,
         commands,
+        lane,
         chains.parent.chain,
         chains.parent.coin.algorithm().share_multiplier(),
         shutdown.child_token(),
@@ -616,6 +627,7 @@ pub async fn run(
 async fn submitter(
     rpcs: HashMap<&'static str, RpcClient>,
     store: Store,
+    lane: String,
     spool: PathBuf,
     mut blocks: mpsc::Receiver<BlockCandidate>,
     shutdown: CancellationToken,
@@ -629,10 +641,11 @@ async fn submitter(
                     tracing::error!(coin = candidate.coin, "no node for block candidate");
                     continue;
                 };
-                let (store, spool) = (store.clone(), spool.clone());
+                let (store, lane, spool) = (store.clone(), lane.clone(), spool.clone());
                 pending.spawn(async move {
                     let submitted =
-                        submit_candidate_spooled(&rpc, &store, &candidate, Some(&spool)).await;
+                        submit_candidate_spooled(&rpc, &store, &lane, &candidate, Some(&spool))
+                            .await;
                     if let Err(err) = submitted {
                         tracing::error!(coin = candidate.coin, %err, "block submission failed");
                     }
@@ -691,12 +704,13 @@ async fn publisher(
     store: Store,
     state: AppState,
     mut commands: mpsc::Receiver<Command>,
+    lane: String,
     chain: Chain,
     share_multiplier: f64,
     shutdown: CancellationToken,
 ) -> &'static str {
     let now = now_unix();
-    let mut stats = match Stats::load(&store, now, share_multiplier).await {
+    let mut stats = match Stats::load(&store, &lane, now, share_multiplier).await {
         Ok(s) => {
             tracing::info!(
                 workers = s.workers(now).len(),
@@ -710,7 +724,7 @@ async fn publisher(
             Stats::new(share_multiplier)
         }
     };
-    let mut persist = Persistence::new(store.clone(), now);
+    let mut persist = Persistence::new(store.clone(), &lane, now);
     let mut blocks: Vec<BlockRow> = Vec::new();
     let mut rounds: Vec<CoinRounds> = Vec::new();
     // Last template seen per coin, so a coin whose template was withdrawn keeps its
@@ -737,7 +751,7 @@ async fn publisher(
                     // Queued shares must land before the zeroing or they would be
                     // counted on top of it.
                     flush_persist(&mut persist).await;
-                    match store.reset_share_counters().await {
+                    match store.reset_share_counters(&lane).await {
                         Ok(()) => {
                             stats.reset_counters();
                             tracing::info!("share counters and best share reset by operator");
@@ -762,7 +776,7 @@ async fn publisher(
                         continue;
                     }
                     flush_persist(&mut persist).await;
-                    match store.remove_worker(&name).await {
+                    match store.remove_worker(&lane, &name).await {
                         Ok(_) => {
                             stats.remove_worker(&name);
                             tracing::info!(worker = %name, "worker removed by operator");

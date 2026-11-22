@@ -120,7 +120,7 @@ pub async fn hashrate(
     let since = alamo_core::time::now_unix().saturating_sub(span) as i64;
     let samples = state
         .store()
-        .hashrate_samples_since(Some(q.worker.as_str()), since)
+        .hashrate_samples_since(&state.primary_lane(), Some(q.worker.as_str()), since)
         .await?;
     Ok(Json(samples))
 }
@@ -157,7 +157,10 @@ pub async fn shares(
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<ShareRow>>, ApiError> {
     let m = share_multiplier(&state);
-    let mut rows = state.store().recent_shares(q.clamp(100, 1000)).await?;
+    let mut rows = state
+        .store()
+        .recent_shares(&state.primary_lane(), q.clamp(100, 1000))
+        .await?;
     for r in &mut rows {
         r.share_diff /= m;
     }
@@ -768,6 +771,7 @@ mod tests {
         state
             .store()
             .persist_batch(
+                "ltc",
                 &[],
                 &(0..5)
                     .map(|i| NewShare {
@@ -784,23 +788,55 @@ mod tests {
             .unwrap();
         state
             .store()
-            .insert_hashrate_samples(&[
-                HashrateSample {
-                    ts: now - 60,
-                    worker: String::new(),
-                    hashrate: 5.0,
-                },
-                HashrateSample {
-                    ts: now - 60,
+            .insert_hashrate_samples(
+                "ltc",
+                &[
+                    HashrateSample {
+                        ts: now - 60,
+                        worker: String::new(),
+                        hashrate: 5.0,
+                    },
+                    HashrateSample {
+                        ts: now - 60,
+                        worker: "rig".into(),
+                        hashrate: 5.0,
+                    },
+                    HashrateSample {
+                        ts: now - 3 * 24 * 3600,
+                        worker: String::new(),
+                        hashrate: 1.0,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        // Another lane's history never shows up while the API serves the primary lane.
+        state
+            .store()
+            .persist_batch(
+                "btc",
+                &[],
+                &[NewShare {
+                    ts: now + 5,
                     worker: "rig".into(),
-                    hashrate: 5.0,
-                },
-                HashrateSample {
-                    ts: now - 3 * 24 * 3600,
+                    difficulty: 1.0,
+                    share_diff: 1.0,
+                    accepted: true,
+                    reject_reason: None,
+                }],
+            )
+            .await
+            .unwrap();
+        state
+            .store()
+            .insert_hashrate_samples(
+                "btc",
+                &[HashrateSample {
+                    ts: now - 60,
                     worker: String::new(),
-                    hashrate: 1.0,
-                },
-            ])
+                    hashrate: 777.0,
+                }],
+            )
             .await
             .unwrap();
 
@@ -823,6 +859,7 @@ mod tests {
         state
             .store()
             .insert_block(&alamo_store::NewBlock {
+                lane: "ltc".into(),
                 coin: "LTC".into(),
                 height: 1,
                 hash: "00ab".into(),
@@ -849,9 +886,12 @@ mod tests {
             "limit clamps to at least 1"
         );
 
+        let (_, json) = get_json(&state, "/api/shares?limit=1000").await;
+        assert_eq!(json.as_array().unwrap().len(), 5, "only the primary lane");
         let (_, json) = get_json(&state, "/api/hashrate").await;
         assert_eq!(json.as_array().unwrap().len(), 1, "default span is one day");
         assert_eq!(json[0]["worker"], "");
+        assert_eq!(json[0]["hashrate"], 5.0);
         let (_, json) = get_json(&state, "/api/hashrate?span=999999999").await;
         assert_eq!(json.as_array().unwrap().len(), 2, "span caps at 30 days");
         let (_, json) = get_json(&state, "/api/hashrate?worker=rig").await;
@@ -860,6 +900,15 @@ mod tests {
         let (status, json) = get_json(&state, "/api/blocks").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["lane"], "ltc");
+
+        // The pool names its lane at startup and the history endpoints follow it.
+        assert_eq!(state.primary_lane(), "ltc");
+        state.set_primary_lane("btc");
+        let (_, json) = get_json(&state, "/api/shares").await;
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        let (_, json) = get_json(&state, "/api/hashrate").await;
+        assert_eq!(json[0]["hashrate"], 777.0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

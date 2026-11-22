@@ -129,14 +129,19 @@ impl Stats {
         stats
     }
 
-    /// Load workers and recent accepted shares from the store.
-    pub async fn load(store: &Store, now: u64, share_multiplier: f64) -> Result<Self, StoreError> {
-        let workers = store.load_workers().await?;
+    /// Load one lane's workers and recent accepted shares from the store.
+    pub async fn load(
+        store: &Store,
+        lane: &str,
+        now: u64,
+        share_multiplier: f64,
+    ) -> Result<Self, StoreError> {
+        let workers = store.load_workers(lane).await?;
         let since = now.saturating_sub(HASHRATE_WINDOW_SECS) as i64;
-        let shares = store.accepted_shares_since(since).await?;
+        let shares = store.accepted_shares_since(lane, since).await?;
         let mut stats = Self::restore(&workers, &shares, now, share_multiplier);
         // Banked from worker rows, so stratum share units as well.
-        stats.retired_work = store.retired_work().await? / share_multiplier;
+        stats.retired_work = store.retired_work(lane).await? / share_multiplier;
         Ok(stats)
     }
 
@@ -484,14 +489,15 @@ mod tests {
         };
         store
             .persist_batch(
+                "ltc",
                 &[worker("rig1"), worker("rig2")],
                 &[share("rig1", 1), share("rig1", 2), share("rig2", 3)],
             )
             .await
             .unwrap();
-        store.remove_worker("rig2").await.unwrap();
+        store.remove_worker("ltc", "rig2").await.unwrap();
 
-        let restored = Stats::load(&store, (t0 + 10) as u64, 65_536.0)
+        let restored = Stats::load(&store, "ltc", (t0 + 10) as u64, 65_536.0)
             .await
             .unwrap();
         let w = &restored.workers((t0 + 10) as u64)[0];
@@ -635,6 +641,7 @@ mod tests {
         let t0 = 1_700_000_000i64;
         store
             .persist_batch(
+                "ltc",
                 &[WorkerWrite {
                     name: "rig1".into(),
                     payout_address: "ltc1qabc".into(),
@@ -660,7 +667,9 @@ mod tests {
             .await
             .unwrap();
 
-        let restored = Stats::load(&store, (t0 + 90) as u64, 1.0).await.unwrap();
+        let restored = Stats::load(&store, "ltc", (t0 + 90) as u64, 1.0)
+            .await
+            .unwrap();
         assert_eq!(restored.shares_accepted(), 10);
         let w = &restored.workers((t0 + 90) as u64)[0];
         assert_eq!(w.name, "rig1");

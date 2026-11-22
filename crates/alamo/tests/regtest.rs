@@ -268,7 +268,9 @@ async fn mines_a_block_on_regtest() {
     )
     .await
     .unwrap();
-    let outcome = submit_candidate(&rpc, &store, candidate).await.unwrap();
+    let outcome = submit_candidate(&rpc, &store, "ltc", candidate)
+        .await
+        .unwrap();
     assert_eq!(outcome, SubmitOutcome::Accepted, "node rejected our block");
 
     assert_eq!(rpc.get_block_count().await.unwrap(), template.height);
@@ -289,7 +291,9 @@ async fn mines_a_block_on_regtest() {
         let doge = candidates.iter().find(|c| c.coin == "DOGE").unwrap();
         assert_eq!(doge.height, doge_template.height);
         assert_eq!(doge.address, doge_address);
-        let outcome = submit_candidate(doge_rpc, &store, doge).await.unwrap();
+        let outcome = submit_candidate(doge_rpc, &store, "ltc", doge)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             SubmitOutcome::Accepted,

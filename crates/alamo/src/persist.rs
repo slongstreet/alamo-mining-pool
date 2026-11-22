@@ -13,9 +13,10 @@ const SAMPLE_INTERVAL: u64 = 60;
 /// Run retention every ten minutes.
 const RETAIN_INTERVAL: u64 = 600;
 
-/// Queued accounting writes and periodic sampling/retention.
+/// One lane's queued accounting writes and periodic sampling, plus retention.
 pub struct Persistence {
     store: Store,
+    lane: String,
     policy: RetentionPolicy,
     authorized: Vec<WorkerWrite>,
     shares: Vec<NewShare>,
@@ -24,10 +25,12 @@ pub struct Persistence {
 }
 
 impl Persistence {
-    /// Wrap a store. `now` is used so retention does not immediately re-run after a restart.
-    pub fn new(store: Store, now: u64) -> Self {
+    /// Wrap a store for `lane`, the parent coin's config key. `now` is used so retention
+    /// does not immediately re-run after a restart.
+    pub fn new(store: Store, lane: &str, now: u64) -> Self {
         Self {
             store,
+            lane: lane.to_owned(),
             policy: RetentionPolicy::default(),
             authorized: Vec::new(),
             shares: Vec::new(),
@@ -88,7 +91,7 @@ impl Persistence {
             return Ok(());
         }
         self.store
-            .persist_batch(&self.authorized, &self.shares)
+            .persist_batch(&self.lane, &self.authorized, &self.shares)
             .await?;
         tracing::debug!(
             workers = self.authorized.len(),
@@ -122,7 +125,9 @@ impl Persistence {
                 hashrate,
             })
             .collect();
-        self.store.insert_hashrate_samples(&samples).await?;
+        self.store
+            .insert_hashrate_samples(&self.lane, &samples)
+            .await?;
         self.last_sample_ts = ts;
         Ok(())
     }
@@ -172,7 +177,7 @@ mod tests {
     async fn flush_then_reload_matches_live_counters() {
         let path = temp_db();
         let store = Store::open(&path).await.unwrap();
-        let mut persist = Persistence::new(store.clone(), 1_000);
+        let mut persist = Persistence::new(store.clone(), "ltc", 1_000);
         let mut stats = Stats::default();
         let auth = PoolEvent::Authorized {
             session: 1,
@@ -207,7 +212,7 @@ mod tests {
         }
         persist.flush().await.unwrap();
 
-        let restored = Stats::load(&store, 1_010, 1.0).await.unwrap();
+        let restored = Stats::load(&store, "ltc", 1_010, 1.0).await.unwrap();
         assert_eq!(restored.shares_accepted(), 1);
         assert_eq!(restored.shares_rejected(), 1);
         let w = &restored.workers(1_010)[0];
@@ -216,7 +221,10 @@ mod tests {
         assert_eq!(w.best_difficulty, 8.0);
 
         persist.on_tick(&stats, SAMPLE_INTERVAL).await.unwrap();
-        let samples = store.hashrate_samples_since(Some(""), 0).await.unwrap();
+        let samples = store
+            .hashrate_samples_since("ltc", Some(""), 0)
+            .await
+            .unwrap();
         assert_eq!(samples.len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

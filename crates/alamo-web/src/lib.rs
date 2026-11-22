@@ -48,8 +48,14 @@ pub struct AppState {
     inner: Arc<Inner>,
 }
 
+/// Lane the history endpoints read until the pool says otherwise: every database from
+/// before lanes existed holds only this one.
+const DEFAULT_LANE: &str = "ltc";
+
 struct Inner {
     pool_name: RwLock<String>,
+    /// The lane (parent coin config key) whose shares and hashrate history the API serves.
+    primary_lane: RwLock<String>,
     stratum_port: u16,
     /// `[web] read_only`: every mutating endpoint answers 403.
     read_only: AtomicBool,
@@ -74,6 +80,7 @@ impl AppState {
         Self {
             inner: Arc::new(Inner {
                 pool_name: RwLock::new(pool_name.into()),
+                primary_lane: RwLock::new(DEFAULT_LANE.to_string()),
                 stratum_port,
                 read_only: AtomicBool::new(false),
                 logs: OnceLock::new(),
@@ -122,6 +129,23 @@ impl AppState {
             *current = name.to_string();
         }
         self.inner.snapshot.send_modify(|_| {});
+    }
+
+    /// The lane whose shares and hashrate history the API serves; `ltc` until the pool
+    /// sets it.
+    pub fn primary_lane(&self) -> String {
+        self.inner
+            .primary_lane
+            .read()
+            .map(|l| l.clone())
+            .unwrap_or_else(|_| DEFAULT_LANE.to_string())
+    }
+
+    /// Set the lane the history endpoints read. The pool calls this once at startup.
+    pub fn set_primary_lane(&self, lane: &str) {
+        if let Ok(mut current) = self.inner.primary_lane.write() {
+            *current = lane.to_string();
+        }
     }
 
     /// Refuse every mutating request from now on (or accept them again).
