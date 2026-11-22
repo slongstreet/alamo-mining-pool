@@ -263,6 +263,12 @@ shares, or a miner with a wrong clock.
 **A block shows as rejected.** The node refused it. The log line carries the node's
 reason; the usual one is `stale` or `inconclusive` when another block arrived first.
 `orphaned` appears later if the chain reorganized past a block that was accepted.
+A reason starting with `rpc:` means the node never gave a verdict: the pool retries an
+unreachable node for several minutes before giving up. Whenever a block is not accepted,
+its hex stays in `<data_dir>/blocks/<COIN>-<height>-<hash>.hex` (also if the daemon stops
+while still retrying), so it can be handed to the node by hand while the tip has not
+moved: `<coin>-cli submitblock "$(cat <file>)"`. The pool does not resubmit these files
+itself and never deletes them; clear them out once they are of no use.
 
 **Dashboard says `polling` instead of `live`.** The WebSocket at `/api/ws` could not be
 kept open, typically because a reverse proxy does not forward upgrades. The dashboard
