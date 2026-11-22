@@ -145,12 +145,18 @@ fn aux_address(aux: &[AuxPayoutRecord]) -> Option<&str> {
     aux.first().map(|a| a.address.as_str())
 }
 
+/// The `pool_counters` key holding a lane's retired work.
+pub(crate) fn retired_work_key(lane: &str) -> String {
+    format!("retired_work:{lane}")
+}
+
 impl Store {
-    /// Persist a batch of authorizations and shares in one transaction.
+    /// Persist a batch of one lane's authorizations and shares in one transaction.
     ///
     /// Authorizations are applied first so a share in the same batch sees the worker row.
     pub async fn persist_batch(
         &self,
+        lane: &str,
         authorized: &[WorkerWrite],
         shares: &[NewShare],
     ) -> Result<(), StoreError> {
@@ -162,16 +168,17 @@ impl Store {
             let aux = aux_json(&w.aux_payouts);
             sqlx::query(
                 "INSERT INTO workers (
-                    name, payout_address, aux_address, aux_payouts, fallback,
+                    lane, name, payout_address, aux_address, aux_payouts, fallback,
                     first_seen, last_seen, shares_accepted, shares_rejected, best_difficulty
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0)
-                 ON CONFLICT(name) DO UPDATE SET
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)
+                 ON CONFLICT(lane, name) DO UPDATE SET
                     payout_address = excluded.payout_address,
                     aux_address = excluded.aux_address,
                     aux_payouts = excluded.aux_payouts,
                     fallback = excluded.fallback,
                     last_seen = MAX(last_seen, excluded.last_seen)",
             )
+            .bind(lane)
             .bind(&w.name)
             .bind(&w.payout_address)
             .bind(aux_address(&w.aux_payouts))
@@ -185,19 +192,22 @@ impl Store {
         for s in shares {
             sqlx::query(
                 "INSERT INTO workers (
-                    name, payout_address, aux_payouts, fallback, first_seen, last_seen
-                 ) VALUES (?, '', '[]', 0, ?, ?)
-                 ON CONFLICT(name) DO NOTHING",
+                    lane, name, payout_address, aux_payouts, fallback, first_seen, last_seen
+                 ) VALUES (?, ?, '', '[]', 0, ?, ?)
+                 ON CONFLICT(lane, name) DO NOTHING",
             )
+            .bind(lane)
             .bind(&s.worker)
             .bind(s.ts)
             .bind(s.ts)
             .execute(&mut *tx)
             .await?;
             sqlx::query(
-                "INSERT INTO shares (ts, worker, difficulty, share_diff, accepted, reject_reason)
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO shares (
+                    lane, ts, worker, difficulty, share_diff, accepted, reject_reason
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
+            .bind(lane)
             .bind(s.ts)
             .bind(&s.worker)
             .bind(s.difficulty)
@@ -218,7 +228,7 @@ impl Store {
                     best_at = CASE WHEN ? > best_difficulty THEN ? ELSE best_at END,
                     best_difficulty = MAX(best_difficulty, ?),
                     work_accepted = work_accepted + ?
-                 WHERE name = ?",
+                 WHERE lane = ? AND name = ?",
             )
             .bind(s.ts)
             .bind(accepted)
@@ -227,6 +237,7 @@ impl Store {
             .bind(s.ts)
             .bind(best)
             .bind(work)
+            .bind(lane)
             .bind(&s.worker)
             .execute(&mut *tx)
             .await?;
@@ -235,87 +246,108 @@ impl Store {
         Ok(())
     }
 
-    /// Zero every worker's accepted/rejected counts and best share. Share history,
-    /// accepted work, and blocks are kept.
-    pub async fn reset_share_counters(&self) -> Result<(), StoreError> {
+    /// Zero the accepted/rejected counts and best share of every worker in `lane`. Share
+    /// history, accepted work, and blocks are kept.
+    pub async fn reset_share_counters(&self, lane: &str) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE workers SET
-                shares_accepted = 0, shares_rejected = 0, best_difficulty = 0, best_at = NULL",
+                shares_accepted = 0, shares_rejected = 0, best_difficulty = 0, best_at = NULL
+             WHERE lane = ?",
         )
+        .bind(lane)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Forget a worker: its row, share log entries, and hashrate samples. Its accepted
-    /// work is banked in `retired_work` so pool-wide totals and rounds do not move; blocks
-    /// it found are kept. Returns the work retired, or `None` if there was no such worker.
-    pub async fn remove_worker(&self, name: &str) -> Result<Option<f64>, StoreError> {
+    /// Forget a worker in `lane`: its row, share log entries, and hashrate samples. Its
+    /// accepted work is banked in the lane's retired work so the lane's totals and rounds do
+    /// not move; blocks it found are kept. Returns the work retired, or `None` if the lane
+    /// had no such worker.
+    pub async fn remove_worker(&self, lane: &str, name: &str) -> Result<Option<f64>, StoreError> {
         let mut tx = self.pool.begin().await?;
         let row: Option<(f64,)> =
-            sqlx::query_as("SELECT work_accepted FROM workers WHERE name = ?")
+            sqlx::query_as("SELECT work_accepted FROM workers WHERE lane = ? AND name = ?")
+                .bind(lane)
                 .bind(name)
                 .fetch_optional(&mut *tx)
                 .await?;
         let Some((work,)) = row else {
             return Ok(None);
         };
-        sqlx::query("UPDATE pool_counters SET value = value + ? WHERE key = 'retired_work'")
-            .bind(work)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO pool_counters (key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = value + excluded.value",
+        )
+        .bind(retired_work_key(lane))
+        .bind(work)
+        .execute(&mut *tx)
+        .await?;
         for sql in [
-            "DELETE FROM workers WHERE name = ?",
-            "DELETE FROM shares WHERE worker = ?",
-            "DELETE FROM hashrate_samples WHERE worker = ?",
+            "DELETE FROM workers WHERE lane = ? AND name = ?",
+            "DELETE FROM shares WHERE lane = ? AND worker = ?",
+            "DELETE FROM hashrate_samples WHERE lane = ? AND worker = ?",
         ] {
-            sqlx::query(sql).bind(name).execute(&mut *tx).await?;
+            sqlx::query(sql)
+                .bind(lane)
+                .bind(name)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(Some(work))
     }
 
-    /// Accepted work of workers that have been removed, in difficulty units.
-    pub async fn retired_work(&self) -> Result<f64, StoreError> {
-        let (work,): (f64,) =
-            sqlx::query_as("SELECT value FROM pool_counters WHERE key = 'retired_work'")
-                .fetch_one(&self.pool)
-                .await?;
-        Ok(work)
+    /// Accepted work of workers removed from `lane`, in difficulty units. Zero for a lane
+    /// that has never removed one.
+    pub async fn retired_work(&self, lane: &str) -> Result<f64, StoreError> {
+        let row: Option<(f64,)> = sqlx::query_as("SELECT value FROM pool_counters WHERE key = ?")
+            .bind(retired_work_key(lane))
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map_or(0.0, |(work,)| work))
     }
 
-    /// Every worker the pool has seen, ordered by name.
-    pub async fn load_workers(&self) -> Result<Vec<WorkerRow>, StoreError> {
+    /// Every worker `lane` has seen, ordered by name.
+    pub async fn load_workers(&self, lane: &str) -> Result<Vec<WorkerRow>, StoreError> {
         let rows: Vec<WorkerSql> = sqlx::query_as(
             "SELECT name, payout_address, aux_payouts, fallback, first_seen, last_seen,
                     shares_accepted, shares_rejected, best_difficulty, best_at, work_accepted
-             FROM workers ORDER BY name",
+             FROM workers WHERE lane = ? ORDER BY name",
         )
+        .bind(lane)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(WorkerRow::from).collect())
     }
 
-    /// Pool-wide accepted work in difficulty units: every worker's plus the work of
+    /// A lane's accepted work in difficulty units: every worker's plus the work of
     /// workers since removed.
-    pub async fn total_work(&self) -> Result<f64, StoreError> {
+    pub async fn total_work(&self, lane: &str) -> Result<f64, StoreError> {
         let (work,): (f64,) =
-            sqlx::query_as("SELECT COALESCE(SUM(work_accepted), 0.0) FROM workers")
+            sqlx::query_as("SELECT COALESCE(SUM(work_accepted), 0.0) FROM workers WHERE lane = ?")
+                .bind(lane)
                 .fetch_one(&self.pool)
                 .await?;
-        Ok(work + self.retired_work().await?)
+        Ok(work + self.retired_work(lane).await?)
     }
 
-    /// Accepted shares at or after `since`, oldest first, capped so a restart stays bounded.
-    pub async fn accepted_shares_since(&self, since: i64) -> Result<Vec<ShareRow>, StoreError> {
+    /// A lane's accepted shares at or after `since`, oldest first, capped so a restart
+    /// stays bounded.
+    pub async fn accepted_shares_since(
+        &self,
+        lane: &str,
+        since: i64,
+    ) -> Result<Vec<ShareRow>, StoreError> {
         const CAP: i64 = 50_000;
         let mut rows: Vec<ShareRow> = sqlx::query_as(
             "SELECT id, ts, worker, difficulty, share_diff, accepted, reject_reason
              FROM shares
-             WHERE accepted = 1 AND ts >= ?
+             WHERE lane = ? AND accepted = 1 AND ts >= ?
              ORDER BY ts DESC, id DESC
              LIMIT ?",
         )
+        .bind(lane)
         .bind(since)
         .bind(CAP)
         .fetch_all(&self.pool)
@@ -324,22 +356,25 @@ impl Store {
         Ok(rows)
     }
 
-    /// Most recent shares, newest first, for the live log.
-    pub async fn recent_shares(&self, limit: i64) -> Result<Vec<ShareRow>, StoreError> {
+    /// A lane's most recent shares, newest first, for the live log.
+    pub async fn recent_shares(&self, lane: &str, limit: i64) -> Result<Vec<ShareRow>, StoreError> {
         Ok(sqlx::query_as(
             "SELECT id, ts, worker, difficulty, share_diff, accepted, reject_reason
              FROM shares
+             WHERE lane = ?
              ORDER BY ts DESC, id DESC
              LIMIT ?",
         )
+        .bind(lane)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?)
     }
 
-    /// Record aligned hashrate samples. Empty `worker` is the pool total.
+    /// Record a lane's aligned hashrate samples. Empty `worker` is the lane total.
     pub async fn insert_hashrate_samples(
         &self,
+        lane: &str,
         samples: &[HashrateSample],
     ) -> Result<(), StoreError> {
         if samples.is_empty() {
@@ -348,10 +383,11 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         for s in samples {
             sqlx::query(
-                "INSERT INTO hashrate_samples (ts, worker, hashrate) VALUES (?, ?, ?)
-                 ON CONFLICT(ts, worker) DO UPDATE SET hashrate = excluded.hashrate",
+                "INSERT INTO hashrate_samples (ts, lane, worker, hashrate) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(ts, lane, worker) DO UPDATE SET hashrate = excluded.hashrate",
             )
             .bind(s.ts)
+            .bind(lane)
             .bind(&s.worker)
             .bind(s.hashrate)
             .execute(&mut *tx)
@@ -361,25 +397,29 @@ impl Store {
         Ok(())
     }
 
-    /// Samples at or after `since`, oldest first.
+    /// A lane's samples at or after `since`, oldest first. `worker` narrows to one worker
+    /// (`Some("")` is the lane total); `None` returns every series in the lane.
     pub async fn hashrate_samples_since(
         &self,
+        lane: &str,
         worker: Option<&str>,
         since: i64,
     ) -> Result<Vec<HashrateSample>, StoreError> {
         match worker {
             Some(name) => Ok(sqlx::query_as(
                 "SELECT ts, worker, hashrate FROM hashrate_samples
-                 WHERE worker = ? AND ts >= ? ORDER BY ts",
+                 WHERE lane = ? AND worker = ? AND ts >= ? ORDER BY ts",
             )
+            .bind(lane)
             .bind(name)
             .bind(since)
             .fetch_all(&self.pool)
             .await?),
             None => Ok(sqlx::query_as(
                 "SELECT ts, worker, hashrate FROM hashrate_samples
-                 WHERE ts >= ? ORDER BY ts, worker",
+                 WHERE lane = ? AND ts >= ? ORDER BY ts, worker",
             )
+            .bind(lane)
             .bind(since)
             .fetch_all(&self.pool)
             .await?),
@@ -391,6 +431,8 @@ impl Store {
 mod tests {
     use super::*;
     use crate::{temp_path, Store};
+
+    const LTC: &str = "ltc";
 
     fn worker(name: &str, ts: i64) -> WorkerWrite {
         WorkerWrite {
@@ -423,6 +465,7 @@ mod tests {
         let store = Store::open(&path).await.unwrap();
         store
             .persist_batch(
+                LTC,
                 &[worker("rig1", 1000)],
                 &[share("rig1", 1010, true), share("rig1", 1020, false)],
             )
@@ -431,7 +474,7 @@ mod tests {
         drop(store);
 
         let store = Store::open(&path).await.unwrap();
-        let workers = store.load_workers().await.unwrap();
+        let workers = store.load_workers(LTC).await.unwrap();
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].name, "rig1");
         assert_eq!(workers[0].payout_address, "ltc1qtest");
@@ -449,13 +492,13 @@ mod tests {
             "best_at follows the best share"
         );
         assert_eq!(workers[0].work_accepted, 16.0);
-        assert_eq!(store.total_work().await.unwrap(), 16.0);
+        assert_eq!(store.total_work(LTC).await.unwrap(), 16.0);
 
-        let accepted = store.accepted_shares_since(0).await.unwrap();
+        let accepted = store.accepted_shares_since(LTC, 0).await.unwrap();
         assert!(accepted[0].accepted);
         assert_eq!(accepted.len(), 1);
         assert_eq!(accepted[0].difficulty, 16.0);
-        let recent = store.recent_shares(10).await.unwrap();
+        let recent = store.recent_shares(LTC, 10).await.unwrap();
         assert_eq!(recent.len(), 2);
         assert!(recent[0].ts >= recent[1].ts);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -467,37 +510,41 @@ mod tests {
         let store = Store::open(&path).await.unwrap();
         store
             .persist_batch(
+                LTC,
                 &[worker("rig1", 1000), worker("rig2", 1000)],
                 &[share("rig1", 1010, true), share("rig2", 1020, true)],
             )
             .await
             .unwrap();
         store
-            .insert_hashrate_samples(&[HashrateSample {
-                ts: 1080,
-                worker: "rig1".into(),
-                hashrate: 5.0,
-            }])
+            .insert_hashrate_samples(
+                LTC,
+                &[HashrateSample {
+                    ts: 1080,
+                    worker: "rig1".into(),
+                    hashrate: 5.0,
+                }],
+            )
             .await
             .unwrap();
-        assert_eq!(store.total_work().await.unwrap(), 32.0);
+        assert_eq!(store.total_work(LTC).await.unwrap(), 32.0);
 
-        assert_eq!(store.remove_worker("rig1").await.unwrap(), Some(16.0));
-        assert_eq!(store.remove_worker("rig1").await.unwrap(), None);
+        assert_eq!(store.remove_worker(LTC, "rig1").await.unwrap(), Some(16.0));
+        assert_eq!(store.remove_worker(LTC, "rig1").await.unwrap(), None);
 
-        let workers = store.load_workers().await.unwrap();
+        let workers = store.load_workers(LTC).await.unwrap();
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].name, "rig2");
-        assert_eq!(store.retired_work().await.unwrap(), 16.0);
-        assert_eq!(store.total_work().await.unwrap(), 32.0);
+        assert_eq!(store.retired_work(LTC).await.unwrap(), 16.0);
+        assert_eq!(store.total_work(LTC).await.unwrap(), 32.0);
         assert!(store
-            .recent_shares(10)
+            .recent_shares(LTC, 10)
             .await
             .unwrap()
             .iter()
             .all(|s| s.worker == "rig2"));
         assert!(store
-            .hashrate_samples_since(Some("rig1"), 0)
+            .hashrate_samples_since(LTC, Some("rig1"), 0)
             .await
             .unwrap()
             .is_empty());
@@ -509,10 +556,10 @@ mod tests {
         let path = temp_path("stub");
         let store = Store::open(&path).await.unwrap();
         store
-            .persist_batch(&[], &[share("ghost", 5, true)])
+            .persist_batch(LTC, &[], &[share("ghost", 5, true)])
             .await
             .unwrap();
-        let workers = store.load_workers().await.unwrap();
+        let workers = store.load_workers(LTC).await.unwrap();
         assert_eq!(workers[0].name, "ghost");
         assert_eq!(workers[0].shares_accepted, 1);
         assert_eq!(workers[0].payout_address, "");
@@ -524,32 +571,159 @@ mod tests {
         let path = temp_path("samples");
         let store = Store::open(&path).await.unwrap();
         store
-            .insert_hashrate_samples(&[
-                HashrateSample {
-                    ts: 60,
-                    worker: String::new(),
-                    hashrate: 100.0,
-                },
-                HashrateSample {
-                    ts: 60,
-                    worker: "rig1".into(),
-                    hashrate: 40.0,
-                },
-            ])
+            .insert_hashrate_samples(
+                LTC,
+                &[
+                    HashrateSample {
+                        ts: 60,
+                        worker: String::new(),
+                        hashrate: 100.0,
+                    },
+                    HashrateSample {
+                        ts: 60,
+                        worker: "rig1".into(),
+                        hashrate: 40.0,
+                    },
+                ],
+            )
             .await
             .unwrap();
         store
-            .insert_hashrate_samples(&[HashrateSample {
-                ts: 60,
-                worker: "rig1".into(),
-                hashrate: 50.0,
-            }])
+            .insert_hashrate_samples(
+                LTC,
+                &[HashrateSample {
+                    ts: 60,
+                    worker: "rig1".into(),
+                    hashrate: 50.0,
+                }],
+            )
             .await
             .unwrap();
-        let pool = store.hashrate_samples_since(Some(""), 0).await.unwrap();
+        let pool = store
+            .hashrate_samples_since(LTC, Some(""), 0)
+            .await
+            .unwrap();
         assert_eq!(pool[0].hashrate, 100.0);
-        let rig = store.hashrate_samples_since(Some("rig1"), 0).await.unwrap();
+        let rig = store
+            .hashrate_samples_since(LTC, Some("rig1"), 0)
+            .await
+            .unwrap();
         assert_eq!(rig[0].hashrate, 50.0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn lanes_keep_same_named_workers_apart() {
+        const BTC: &str = "btc";
+        let path = temp_path("lanes");
+        let store = Store::open(&path).await.unwrap();
+        store
+            .persist_batch(
+                LTC,
+                &[worker("rig", 1000)],
+                &[share("rig", 1010, true), share("rig", 1020, false)],
+            )
+            .await
+            .unwrap();
+        let mut big = share("rig", 1030, true);
+        big.difficulty = 100.0;
+        big.share_diff = 400.0;
+        let mut btc_worker = worker("rig", 1001);
+        btc_worker.payout_address = "bc1qtest".into();
+        store
+            .persist_batch(BTC, &[btc_worker], &[big])
+            .await
+            .unwrap();
+        for (lane, hashrate) in [(LTC, 5.0), (BTC, 900.0)] {
+            store
+                .insert_hashrate_samples(
+                    lane,
+                    &[
+                        HashrateSample {
+                            ts: 60,
+                            worker: "rig".into(),
+                            hashrate,
+                        },
+                        HashrateSample {
+                            ts: 60,
+                            worker: String::new(),
+                            hashrate,
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        let ltc = store.load_workers(LTC).await.unwrap();
+        let btc = store.load_workers(BTC).await.unwrap();
+        assert_eq!((ltc.len(), btc.len()), (1, 1));
+        assert_eq!(ltc[0].payout_address, "ltc1qtest");
+        assert_eq!(btc[0].payout_address, "bc1qtest");
+        assert_eq!((ltc[0].shares_accepted, ltc[0].shares_rejected), (1, 1));
+        assert_eq!((btc[0].shares_accepted, btc[0].shares_rejected), (1, 0));
+        assert_eq!(
+            (ltc[0].best_difficulty, btc[0].best_difficulty),
+            (32.0, 400.0)
+        );
+        assert_eq!(store.total_work(LTC).await.unwrap(), 16.0);
+        assert_eq!(store.total_work(BTC).await.unwrap(), 100.0);
+        assert_eq!(store.recent_shares(LTC, 10).await.unwrap().len(), 2);
+        let btc_shares = store.recent_shares(BTC, 10).await.unwrap();
+        assert_eq!(btc_shares.len(), 1);
+        assert_eq!(btc_shares[0].share_diff, 400.0);
+        assert_eq!(store.accepted_shares_since(LTC, 0).await.unwrap().len(), 1);
+        assert_eq!(
+            store.accepted_shares_since(BTC, 0).await.unwrap()[0].difficulty,
+            100.0
+        );
+        let ltc_samples = store.hashrate_samples_since(LTC, None, 0).await.unwrap();
+        assert_eq!(ltc_samples.len(), 2);
+        assert!(ltc_samples.iter().all(|s| s.hashrate == 5.0));
+        let btc_total = store
+            .hashrate_samples_since(BTC, Some(""), 0)
+            .await
+            .unwrap();
+        assert_eq!(btc_total.len(), 1);
+        assert_eq!(btc_total[0].hashrate, 900.0);
+
+        // Resetting one lane's counters leaves the other's alone.
+        store.reset_share_counters(LTC).await.unwrap();
+        let ltc = store.load_workers(LTC).await.unwrap();
+        let btc = store.load_workers(BTC).await.unwrap();
+        assert_eq!((ltc[0].shares_accepted, ltc[0].best_at), (0, None));
+        assert_eq!((btc[0].shares_accepted, btc[0].best_at), (1, Some(1030)));
+        assert_eq!(btc[0].best_difficulty, 400.0);
+
+        // Removing the worker from one lane banks its work there and nowhere else.
+        assert_eq!(store.remove_worker(BTC, "rig").await.unwrap(), Some(100.0));
+        assert_eq!(store.remove_worker(BTC, "rig").await.unwrap(), None);
+        assert!(store.load_workers(BTC).await.unwrap().is_empty());
+        assert_eq!(store.load_workers(LTC).await.unwrap().len(), 1);
+        assert_eq!(store.retired_work(BTC).await.unwrap(), 100.0);
+        assert_eq!(store.retired_work(LTC).await.unwrap(), 0.0);
+        assert_eq!(store.total_work(BTC).await.unwrap(), 100.0);
+        assert_eq!(store.total_work(LTC).await.unwrap(), 16.0);
+        assert!(store.recent_shares(BTC, 10).await.unwrap().is_empty());
+        assert_eq!(store.recent_shares(LTC, 10).await.unwrap().len(), 2);
+        assert!(store
+            .hashrate_samples_since(BTC, Some("rig"), 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .hashrate_samples_since(LTC, Some("rig"), 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A second removal in the same lane adds to the existing counter.
+        assert_eq!(store.remove_worker(LTC, "rig").await.unwrap(), Some(16.0));
+        assert_eq!(store.retired_work(LTC).await.unwrap(), 16.0);
+        assert_eq!(store.retired_work(BTC).await.unwrap(), 100.0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -5,6 +5,11 @@ use alamo_store::BlockRow;
 use serde::Serialize;
 
 /// Everything the dashboard shows, refreshed by the daemon every couple of seconds.
+///
+/// Per-lane figures live in `lanes`. The top-level `coins`, `hashrate`, share counts,
+/// work, share multiplier, best share, `scoring_since`, and `workers` are deprecated: for
+/// one release they mirror the primary lane (`lanes[0]`) while it is running and hold
+/// their defaults otherwise.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct PoolSnapshot {
     /// Configured pool name.
@@ -13,13 +18,118 @@ pub struct PoolSnapshot {
     pub version: String,
     /// Seconds since start.
     pub uptime_seconds: u64,
-    /// TCP port miners connect to. The host is wherever the dashboard was reached.
+    /// TCP port miners of the primary lane connect to. The host is wherever the dashboard
+    /// was reached. Each lane's port is in `lanes`.
     pub stratum_port: u16,
     /// Unix time the snapshot was built.
     pub now: u64,
-    /// Chains being mined, parent first.
+    /// Every configured lane, primary first, then by key.
+    pub lanes: Vec<LaneStatus>,
+    /// Deprecated: `lanes[0].coins`.
     pub coins: Vec<CoinStatus>,
-    /// Pool hashrate estimate over the recent window, hashes per second.
+    /// Deprecated: `lanes[0].hashrate`.
+    pub hashrate: f64,
+    /// Deprecated: `lanes[0].shares_accepted`.
+    pub shares_accepted: u64,
+    /// Deprecated: `lanes[0].shares_rejected`.
+    pub shares_rejected: u64,
+    /// Deprecated: `lanes[0].total_work`.
+    pub total_work: f64,
+    /// Deprecated: `lanes[0].share_multiplier`.
+    pub share_multiplier: f64,
+    /// Deprecated: `lanes[0].best_share_difficulty`.
+    pub best_share_difficulty: f64,
+    /// Deprecated: `lanes[0].best_share_worker`.
+    pub best_share_worker: Option<String>,
+    /// Deprecated: `lanes[0].best_share_at`.
+    pub best_share_at: Option<u64>,
+    /// Deprecated: `lanes[0].scoring_since`.
+    pub scoring_since: Option<u64>,
+    /// Deprecated: `lanes[0].workers`.
+    pub workers: Vec<WorkerStatus>,
+    /// Recent blocks of every lane, newest first. Each row's `share_diff` is in its own
+    /// lane's network units.
+    pub blocks: Vec<BlockRow>,
+}
+
+impl PoolSnapshot {
+    /// A snapshot of `lanes` (primary first) and `blocks`, with the deprecated top-level
+    /// fields mirroring the primary lane while it is running.
+    pub fn from_lanes(now: u64, lanes: Vec<LaneStatus>, blocks: Vec<BlockRow>) -> Self {
+        let mut s = Self {
+            now,
+            blocks,
+            ..Default::default()
+        };
+        if let Some(p) = lanes.first().filter(|l| l.state == LaneState::Running) {
+            s.coins = p.coins.clone();
+            s.hashrate = p.hashrate;
+            s.shares_accepted = p.shares_accepted;
+            s.shares_rejected = p.shares_rejected;
+            s.total_work = p.total_work;
+            s.share_multiplier = p.share_multiplier;
+            s.best_share_difficulty = p.best_share_difficulty;
+            s.best_share_worker = p.best_share_worker.clone();
+            s.best_share_at = p.best_share_at;
+            s.scoring_since = p.scoring_since;
+            s.workers = p.workers.clone();
+        }
+        s.lanes = lanes;
+        s
+    }
+
+    /// The lane with config key `key`.
+    pub fn lane(&self, key: &str) -> Option<&LaneStatus> {
+        self.lanes.iter().find(|l| l.key == key)
+    }
+}
+
+/// Where a lane is in its life.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LaneState {
+    /// Waiting for its nodes; its listener is not open yet.
+    #[default]
+    Connecting,
+    /// Nodes connected and listener open.
+    Running,
+    /// Gave up starting because of a configuration problem; see `error`.
+    Failed,
+}
+
+impl LaneState {
+    /// The JSON spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LaneState::Connecting => "connecting",
+            LaneState::Running => "running",
+            LaneState::Failed => "failed",
+        }
+    }
+}
+
+/// One lane: a parent coin, its aux coins, its listener, and its own statistics.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct LaneStatus {
+    /// The parent coin's config key, which is the lane id.
+    pub key: String,
+    /// Proof-of-work algorithm: `scrypt` or `sha256d`.
+    pub algorithm: String,
+    /// TCP port this lane's miners connect to.
+    pub stratum_port: u16,
+    /// `connecting`, `running`, or `failed`.
+    pub state: LaneState,
+    /// Why the lane failed to start; `null` unless `state` is `failed`.
+    pub error: Option<String>,
+    /// `main`, `test`, or `regtest`; `null` until the parent's node has answered.
+    pub chain: Option<String>,
+    /// Stratum share difficulty per unit of network difficulty on this lane's parent
+    /// chain (65536 for scrypt, 1 for sha256d). Job difficulties (`WorkerStatus::
+    /// difficulty`, the share log's `difficulty`) are in stratum units, as the miner sees
+    /// them; every other difficulty the API reports, including `share_diff`, is in
+    /// network units.
+    pub share_multiplier: f64,
+    /// Lane hashrate estimate over the recent window, hashes per second.
     pub hashrate: f64,
     /// Accepted shares recorded (lifetime).
     pub shares_accepted: u64,
@@ -27,23 +137,18 @@ pub struct PoolSnapshot {
     pub shares_rejected: u64,
     /// Lifetime accepted work in difficulty units.
     pub total_work: f64,
-    /// Stratum share difficulty per unit of network difficulty on the parent chain
-    /// (65536 for scrypt). Job difficulties (`WorkerStatus::difficulty`, the share log's
-    /// `difficulty`) are in stratum units, as the miner sees them; every other difficulty
-    /// the API reports, including `share_diff`, is in network units.
-    pub share_multiplier: f64,
-    /// Best share difficulty any worker has found.
+    /// Best share difficulty any worker in the lane has found.
     pub best_share_difficulty: f64,
     /// Worker that found the best share.
     pub best_share_worker: Option<String>,
     /// Unix time the best share arrived, when known.
     pub best_share_at: Option<u64>,
-    /// Unix time the pool first saw a worker: when it started keeping score.
+    /// Unix time the lane first saw a worker: when it started keeping score.
     pub scoring_since: Option<u64>,
-    /// Workers seen, connected first.
+    /// Chains mined in this lane, parent first, once they have had a template.
+    pub coins: Vec<CoinStatus>,
+    /// Workers seen in this lane, connected first.
     pub workers: Vec<WorkerStatus>,
-    /// Recent blocks, newest first.
-    pub blocks: Vec<BlockRow>,
 }
 
 /// Status of one chain.
@@ -146,4 +251,56 @@ pub struct AuxPayoutStatus {
     pub address: String,
     /// Whether the fallback address is being paid.
     pub fallback: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lane(key: &str, state: LaneState, shares: u64) -> LaneStatus {
+        LaneStatus {
+            key: key.into(),
+            algorithm: "scrypt".into(),
+            state,
+            share_multiplier: 65536.0,
+            shares_accepted: shares,
+            hashrate: shares as f64,
+            best_share_worker: Some(format!("{key}-rig")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn legacy_fields_mirror_a_running_primary_lane_only() {
+        let s = PoolSnapshot::from_lanes(
+            7,
+            vec![
+                lane("ltc", LaneState::Running, 3),
+                lane("doge", LaneState::Failed, 9),
+            ],
+            vec![],
+        );
+        assert_eq!(s.now, 7);
+        assert_eq!(s.shares_accepted, 3);
+        assert_eq!(s.hashrate, 3.0);
+        assert_eq!(s.share_multiplier, 65536.0);
+        assert_eq!(s.best_share_worker.as_deref(), Some("ltc-rig"));
+        assert_eq!(s.lane("doge").unwrap().shares_accepted, 9);
+
+        let s = PoolSnapshot::from_lanes(
+            7,
+            vec![
+                lane("ltc", LaneState::Connecting, 3),
+                lane("doge", LaneState::Running, 9),
+            ],
+            vec![],
+        );
+        assert_eq!(s.shares_accepted, 0, "defaults until the primary lane runs");
+        assert_eq!(s.share_multiplier, 0.0);
+        assert!(s.best_share_worker.is_none());
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["lanes"][0]["state"], "connecting");
+        assert_eq!(json["lanes"][0]["error"], serde_json::Value::Null);
+        assert_eq!(json["lanes"][1]["state"], "running");
+    }
 }

@@ -149,9 +149,11 @@ The dashboard is embedded at build time, so build `web/dist` first.
 | `pool.data_dir` | Where `alamo.db` lives. Must be writable. |
 | `stratum.listen` | Where miners connect. `0.0.0.0:3333` to accept from the LAN. |
 | `stratum.vardiff.*` | Share difficulty range and target share interval, in the units miners display: for scrypt a share of difficulty 65536 equals one unit of network difficulty, as in cgminer and every Litecoin pool. |
+| `coins.<coin>.stratum.listen`, `.vardiff.*` | A parent coin's own listener and vardiff, instead of `[stratum]`. Each parent coin is its own lane; two parents cannot share an address. Not allowed on a merge-mined coin. |
 | `web.listen` | Dashboard and API. Bind to `127.0.0.1` and put a reverse proxy in front if the box is reachable from the internet; the API has no authentication. |
 | `web.read_only` | Refuse every change from the dashboard (settings, share-count reset, worker removal). |
 | `coins.<coin>.rpc_url`, `rpc_user`, `rpc_password` | Node RPC. The password is never logged. |
+| `[coins.<coin>]` keys | Case does not matter (`[coins.LTC]` is `ltc`); two keys that differ only by case are refused. |
 | `${NAME}` in any value | Replaced with the environment variable `NAME` when the file is read; startup fails naming the variable if it is unset. Comment lines are not expanded. |
 | `coins.<coin>.zmq_hashblock` | The node's `zmqpubhashblock` endpoint, `tcp://host:port`. |
 | `coins.<coin>.fallback_address` | Paid when a miner's username is not a valid address. |
@@ -166,9 +168,13 @@ restart: the pool name, the coinbase tag, each coin's fallback payout address, t
 settings, and the log level. It also shows each node's endpoint and health with a "Test
 connection" button, downloads the recent log and a consistent copy of the database, and
 resets share counts. Changes are stored in `alamo.db` and override the file; each one is
-marked on the page and can be reverted to the file's value. A stored value that no longer
-validates on startup (say, after switching a node to another network) is dropped with a
-warning in the log.
+marked on the page and can be reverted to the file's value. Overrides are stored under
+the config path they override: `stratum.vardiff.<field>` for lanes on `[stratum]`,
+`coins.<coin>.stratum.vardiff.<field>` for a parent with its own section. A stored value
+that no longer validates (say, after switching a node to another network) is dropped with
+a warning in the log. A coin's fallback address is checked once that coin's node has
+answered, so until then its stored override is kept and the page does not list the coin;
+other values are checked at startup.
 
 Node endpoints and credentials are deliberately not editable there: the API has no
 authentication, so anyone who can open the dashboard could otherwise repoint the pool at
@@ -211,21 +217,40 @@ payouts.
   blocks, and a badge per coin when its node is unreachable or its template is stale.
 - **`GET /api/health`** returns `{"status":"ok"}` while the daemon runs. Suitable for a
   liveness probe.
-- **`GET /api/status`** is the full status document as JSON.
-- **`POST /api/stats/reset`** zeroes share counts and best share for every worker (the
-  dashboard's `reset` button). **`DELETE /api/workers/{name}`** forgets an offline worker:
-  its row, share log, and hashrate history go; blocks it found stay, and its accepted
-  work is retired into the pool total so rounds and luck do not move. A connected worker
-  is refused with 409. Both are applied by the pool task within one publish interval.
-- **`GET /metrics`** is a Prometheus text endpoint. Useful alerts:
+- **`GET /api/status`** is the full status document as JSON. `lanes` has one entry per
+  parent coin, primary lane first (the parent on `[stratum]`, else the first by key), with
+  its `state` (`connecting`, `running`, or `failed` with an `error`), port, chain,
+  hashrate, share counts, best share, coins, and workers. The older top-level fields
+  (`coins`, `hashrate`, `workers`, ...) mirror the primary lane for one more release and
+  then go; `blocks` lists every lane's blocks.
+- **`GET /api/hashrate`** and **`GET /api/shares`** read one lane's history: the primary
+  lane's unless `?lane=<key>` names another. An unknown lane is a 400 that lists the
+  lanes there are.
+- **`POST /api/stats/reset`** zeroes share counts and best share for every worker of a
+  lane (the dashboard's `reset` button). **`DELETE /api/workers/{name}`** forgets an
+  offline worker of a lane: its row, share log, and hashrate history go; blocks it found
+  stay, and its accepted work is retired into the lane total so rounds and luck do not
+  move. A worker connected in that lane is refused with 409. Both take `?lane=<key>`
+  (default the primary lane) and are applied by the pool task within one publish
+  interval.
+- **`GET /metrics`** is a Prometheus text endpoint. Every series about a lane carries a
+  `lane` label (`lane="ltc"`), next to `worker` or `coin` where those apply;
+  `alamo_lane_state{lane,state}` is 1 for the state each lane is in. Useful alerts:
+  - `alamo_lane_state{state="failed"} == 1`: a lane could not start (see below).
   - `alamo_node_up == 0` for more than a minute: a node is down.
   - `alamo_node_stale == 1`: a node has been down long enough that its template was
     withdrawn.
-  - `alamo_workers{state="connected"} == 0`: nobody is mining.
+  - `alamo_workers{state="connected"} == 0`: nobody is mining in that lane; use
+    `sum(alamo_workers{state="connected"}) == 0` for nobody in the whole pool.
   - `alamo_node_zmq_connected == 0` where ZMQ is configured: notifications are off and
     the pool is polling every 10 seconds.
-  - `increase(alamo_shares_total{result="rejected"}[10m])` climbing: check miner clocks
-    and network.
+  - `sum by (lane) (increase(alamo_shares_total{result="rejected"}[10m]))` climbing:
+    check miner clocks and network.
+
+  Expressions that compare a pool-level series with a constant fire once per lane. Any
+  that matched a series without labels before (`alamo_work_total`, `alamo_hashrate_
+  hashes_per_second`, ...) needs `sum(...)` or a `lane` matcher now. Do not sum hashrate
+  across lanes of different algorithms.
 
 Logs go to stdout in a structured format. `RUST_LOG=debug` is verbose;
 `RUST_LOG=info,alamo_coins::zmq=debug` shows each block notification.
@@ -239,9 +264,21 @@ timeout and Docker's `stop_grace_period` in the compose file both allow for that
 
 ## When something looks wrong
 
-**`node unreachable` at startup.** The daemon keeps retrying with backoff and starts as
-soon as the node answers, so this is normal while nodes boot. If it never connects, check
+**`node unreachable` at startup.** The daemon keeps retrying with backoff and opens that
+coin's stratum listener as soon as its nodes answer, so this is normal while nodes boot.
+Each parent coin starts on its own: one coin's node being down does not keep another
+coin's miners out. If it never connects, check
 `rpc_url`, `rpc_user`, `rpc_password`, and the node's `rpcallowip`.
+
+**A lane shows `failed`.** The lane gave up starting because of a configuration
+problem it found once its node answered: the node is on another network than its
+fallback address is for, the address is not valid for that coin, or the lane's stratum
+listener could not bind (address in use, or a port below 1024 without the privilege).
+The reason is in the lane's `error` on the dashboard and in `/api/status`, and logged as
+`lane failed to start`. The other lanes keep running; the daemon exits only if no lane is
+left running or connecting, so a single-coin pool stops as before. Fix the config (or the
+node) and restart the daemon; a stored fallback-address override for that coin stays in
+the database and is checked again then.
 
 **`template fetch failed` while running.** The node stopped answering. The pool keeps
 serving the last job to miners. After `template_stale_secs` it withdraws the template: an

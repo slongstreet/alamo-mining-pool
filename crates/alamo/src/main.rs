@@ -68,11 +68,16 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(blocks_found = store.block_count().await?, "loaded state");
 
     let shutdown = CancellationToken::new();
+    // The single-lane API surface describes the primary lane: its port and its history.
+    let primary = config
+        .primary_lane()
+        .context("no enabled parent coin configured")?;
     let state = alamo_web::AppState::new(
         config.pool.name.clone(),
-        config.stratum.listen.port(),
+        primary.stratum.listen.port(),
         store.clone(),
     );
+    state.set_primary_lane(&primary.key);
     state.install_logs(logs);
     state.set_read_only(config.web.read_only);
     if config.web.read_only {

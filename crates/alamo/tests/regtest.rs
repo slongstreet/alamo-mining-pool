@@ -8,6 +8,9 @@
 //! Starts the template sources and stratum server in-process, connects a miniature stratum
 //! client that mines a share with scrypt on the CPU, and checks that the resulting blocks
 //! are accepted by the nodes and pay the addresses the client authorized with.
+//!
+//! `a_lane_mines_while_another_lane_waits_for_its_node` runs the whole pool with a second
+//! lane whose node is down and checks the LTC lane still listens and hands out a job.
 
 use alamo::pool::{submit_candidate, SubmitOutcome};
 use alamo_coins::{merge, Chain, Coin, Dogecoin, Litecoin, RpcClient, TemplateSource};
@@ -268,7 +271,9 @@ async fn mines_a_block_on_regtest() {
     )
     .await
     .unwrap();
-    let outcome = submit_candidate(&rpc, &store, candidate).await.unwrap();
+    let outcome = submit_candidate(&rpc, &store, "ltc", candidate)
+        .await
+        .unwrap();
     assert_eq!(outcome, SubmitOutcome::Accepted, "node rejected our block");
 
     assert_eq!(rpc.get_block_count().await.unwrap(), template.height);
@@ -289,7 +294,9 @@ async fn mines_a_block_on_regtest() {
         let doge = candidates.iter().find(|c| c.coin == "DOGE").unwrap();
         assert_eq!(doge.height, doge_template.height);
         assert_eq!(doge.address, doge_address);
-        let outcome = submit_candidate(doge_rpc, &store, doge).await.unwrap();
+        let outcome = submit_candidate(doge_rpc, &store, "ltc", doge)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             SubmitOutcome::Accepted,
@@ -332,6 +339,139 @@ async fn mines_a_block_on_regtest() {
     );
 
     shutdown.cancel();
+}
+
+/// The whole pool with two lanes: LTC on the regtest node and a second lane (DOGE as a
+/// parent) whose node is a closed port. The LTC lane must listen and hand out a job while
+/// the other lane is still retrying. Only `ALAMO_REGTEST_RPC` is needed; the second lane
+/// never reaches a node.
+#[tokio::test]
+async fn a_lane_mines_while_another_lane_waits_for_its_node() {
+    let Ok(url) = std::env::var("ALAMO_REGTEST_RPC") else {
+        eprintln!("ALAMO_REGTEST_RPC not set; skipping the lane independence regtest");
+        return;
+    };
+    let rpc = RpcClient::from_url_with_userinfo(&url).expect("ALAMO_REGTEST_RPC must be a URL");
+    let info = rpc.get_blockchain_info().await.expect("node reachable");
+    assert_eq!(info.chain, "regtest", "this test only runs against regtest");
+    let parsed = split_credentials(&url);
+
+    let free_port = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let (ltc_port, doge_port) = (free_port(), free_port());
+    let data_dir = std::env::temp_dir().join(format!("alamo-regtest-lanes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let address = encode_segwit("rltc", 0, &[0x11; 20]).unwrap();
+    let fallback = encode_segwit("rltc", 0, &[0x22; 20]).unwrap();
+    let config = alamo::Config::parse(&format!(
+        r#"
+[pool]
+name = "regtest lanes"
+data_dir = "{data_dir}"
+[stratum]
+listen = "127.0.0.1:{ltc_port}"
+[web]
+listen = "127.0.0.1:0"
+[coins.ltc]
+rpc_url = "{rpc_url}"
+rpc_user = "{rpc_user}"
+rpc_password = "{rpc_password}"
+fallback_address = "{fallback}"
+poll_interval_ms = 200
+[coins.doge]
+rpc_url = "http://127.0.0.1:1"
+rpc_user = "u"
+rpc_password = "p"
+fallback_address = "nUnreachable"
+[coins.doge.stratum]
+listen = "127.0.0.1:{doge_port}"
+"#,
+        data_dir = data_dir.display(),
+        rpc_url = parsed.0,
+        rpc_user = parsed.1,
+        rpc_password = parsed.2,
+    ))
+    .unwrap();
+    let store = Store::open(&config.database_path()).await.unwrap();
+    let state = alamo_web::AppState::new("regtest lanes", ltc_port, store.clone());
+    let log = alamo::settings::LogSetup {
+        filter: "info".into(),
+        control: Arc::new(|_: &str| Ok(())),
+    };
+    let shutdown = CancellationToken::new();
+    let pool = tokio::spawn(alamo::pool::run(
+        config,
+        store,
+        state,
+        log,
+        shutdown.clone(),
+    ));
+
+    let stream = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(stream) = TcpStream::connect(("127.0.0.1", ltc_port)).await {
+                return stream;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the LTC lane never opened its listener");
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    send(
+        &mut writer,
+        json!({"id": 1, "method": "mining.subscribe", "params": ["alamo-test/0.1"]}),
+    )
+    .await;
+    read_until(&mut lines, |m| m["id"] == 1).await;
+    send(
+        &mut writer,
+        json!({"id": 2, "method": "mining.authorize", "params": [format!("{address}.lanes"), "x"]}),
+    )
+    .await;
+    let auth = read_until(&mut lines, |m| m["id"] == 2).await;
+    assert_eq!(auth["result"], json!(true), "{auth}");
+    let notify = read_until(&mut lines, |m| m["method"] == "mining.notify").await;
+    let prev_hash = prevhash_from_stratum(notify["params"][1].as_str().unwrap()).unwrap();
+    let tip = rpc.get_blockchain_info().await.unwrap();
+    assert!(
+        prev_hash == from_display_hex(&tip.bestblockhash).unwrap()
+            || prev_hash == from_display_hex(&info.bestblockhash).unwrap(),
+        "the job builds on the node's tip"
+    );
+
+    assert!(
+        TcpStream::connect(("127.0.0.1", doge_port)).await.is_err(),
+        "the second lane must not listen before its node answers"
+    );
+    assert!(!pool.is_finished(), "a down node must not stop the pool");
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), pool)
+        .await
+        .expect("the pool did not stop")
+        .unwrap()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// Split `http://user:pass@host:port/` into the URL without credentials, the user, and
+/// the password, the way the config file wants them.
+fn split_credentials(url: &str) -> (String, String, String) {
+    let (scheme, rest) = url.split_once("://").expect("URL has a scheme");
+    let (userinfo, host) = rest.rsplit_once('@').expect("URL carries user:password@");
+    let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+    (
+        format!("{scheme}://{host}"),
+        user.to_string(),
+        password.to_string(),
+    )
 }
 
 /// The address a decoded scriptPubKey pays, across node versions.

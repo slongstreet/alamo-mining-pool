@@ -4,7 +4,7 @@
 //! costs no database reads. The format is written by hand: a handful of gauges does not
 //! justify a metrics crate.
 
-use crate::snapshot::{CoinStatus, PoolSnapshot, WorkerStatus};
+use crate::snapshot::{CoinStatus, LaneState, PoolSnapshot, WorkerStatus};
 use crate::AppState;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -20,7 +20,8 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     ([(CONTENT_TYPE, CONTENT_TYPE_TEXT)], body).into_response()
 }
 
-/// Render a snapshot in the Prometheus text format.
+/// Render a snapshot in the Prometheus text format. Every per-lane series carries a
+/// `lane` label; per-worker and per-coin series carry it beside `worker` or `coin`.
 pub fn render(s: &PoolSnapshot) -> String {
     let mut out = String::with_capacity(4096);
     let mut w = Writer(&mut out);
@@ -33,52 +34,88 @@ pub fn render(s: &PoolSnapshot) -> String {
     );
     w.gauge("alamo_uptime_seconds", "Seconds since the daemon started.");
     w.sample("alamo_uptime_seconds", &[], s.uptime_seconds as f64);
+
+    w.gauge(
+        "alamo_lane_state",
+        "1 for the state each lane is in (connecting, running, failed), 0 for the others.",
+    );
+    for lane in &s.lanes {
+        for state in [LaneState::Connecting, LaneState::Running, LaneState::Failed] {
+            w.sample(
+                "alamo_lane_state",
+                &[("lane", &lane.key), ("state", state.as_str())],
+                f64::from(lane.state == state),
+            );
+        }
+    }
     w.gauge(
         "alamo_hashrate_hashes_per_second",
-        "Pool hashrate estimate over the recent window.",
+        "Lane hashrate estimate over the recent window.",
     );
-    w.sample("alamo_hashrate_hashes_per_second", &[], s.hashrate);
+    for lane in &s.lanes {
+        w.sample(
+            "alamo_hashrate_hashes_per_second",
+            &[("lane", &lane.key)],
+            lane.hashrate,
+        );
+    }
     w.counter(
         "alamo_shares_total",
         "Shares recorded since the pool was created.",
     );
-    w.sample(
-        "alamo_shares_total",
-        &[("result", "accepted")],
-        s.shares_accepted as f64,
-    );
-    w.sample(
-        "alamo_shares_total",
-        &[("result", "rejected")],
-        s.shares_rejected as f64,
-    );
+    for lane in &s.lanes {
+        for (result, n) in [
+            ("accepted", lane.shares_accepted),
+            ("rejected", lane.shares_rejected),
+        ] {
+            w.sample(
+                "alamo_shares_total",
+                &[("lane", &lane.key), ("result", result)],
+                n as f64,
+            );
+        }
+    }
     w.counter(
         "alamo_work_total",
         "Accepted work in difficulty units since the pool was created.",
     );
-    w.sample("alamo_work_total", &[], s.total_work);
+    for lane in &s.lanes {
+        w.sample("alamo_work_total", &[("lane", &lane.key)], lane.total_work);
+    }
     w.gauge(
         "alamo_best_share_difficulty",
-        "Highest share difficulty any worker has found.",
+        "Highest share difficulty any worker in the lane has found.",
     );
-    w.sample("alamo_best_share_difficulty", &[], s.best_share_difficulty);
+    for lane in &s.lanes {
+        w.sample(
+            "alamo_best_share_difficulty",
+            &[("lane", &lane.key)],
+            lane.best_share_difficulty,
+        );
+    }
     w.gauge("alamo_workers", "Workers by state.");
-    let connected = s.workers.iter().filter(|w| w.connections > 0).count();
-    w.sample("alamo_workers", &[("state", "connected")], connected as f64);
-    w.sample(
-        "alamo_workers",
-        &[("state", "seen")],
-        s.workers.len() as f64,
-    );
+    for lane in &s.lanes {
+        let connected = lane.workers.iter().filter(|w| w.connections > 0).count();
+        w.sample(
+            "alamo_workers",
+            &[("lane", &lane.key), ("state", "connected")],
+            connected as f64,
+        );
+        w.sample(
+            "alamo_workers",
+            &[("lane", &lane.key), ("state", "seen")],
+            lane.workers.len() as f64,
+        );
+    }
 
     w.gauge(
         "alamo_worker_hashrate_hashes_per_second",
         "Per-worker hashrate estimate.",
     );
-    for worker in &s.workers {
+    for (lane, worker) in workers(s) {
         w.sample(
             "alamo_worker_hashrate_hashes_per_second",
-            &[("worker", &worker.name)],
+            &[("lane", lane), ("worker", &worker.name)],
             worker.hashrate,
         );
     }
@@ -86,10 +123,10 @@ pub fn render(s: &PoolSnapshot) -> String {
         "alamo_worker_connections",
         "Live stratum sessions per worker.",
     );
-    for worker in &s.workers {
+    for (lane, worker) in workers(s) {
         w.sample(
             "alamo_worker_connections",
-            &[("worker", &worker.name)],
+            &[("lane", lane), ("worker", &worker.name)],
             worker.connections as f64,
         );
     }
@@ -97,10 +134,10 @@ pub fn render(s: &PoolSnapshot) -> String {
         "alamo_worker_difficulty",
         "Current share difficulty per worker.",
     );
-    for worker in &s.workers {
+    for (lane, worker) in workers(s) {
         w.sample(
             "alamo_worker_difficulty",
-            &[("worker", &worker.name)],
+            &[("lane", lane), ("worker", &worker.name)],
             worker.difficulty,
         );
     }
@@ -108,8 +145,8 @@ pub fn render(s: &PoolSnapshot) -> String {
         "alamo_worker_shares_total",
         "Shares per worker since first seen.",
     );
-    for worker in &s.workers {
-        worker_shares(&mut w, worker);
+    for (lane, worker) in workers(s) {
+        worker_shares(&mut w, lane, worker);
     }
 
     w.gauge("alamo_coin_height", "Height of the block being mined.");
@@ -140,7 +177,7 @@ pub fn render(s: &PoolSnapshot) -> String {
     );
     w.gauge(
         "alamo_coin_expected_blocks",
-        "Blocks the pool's lifetime work would find on average at the current difficulty.",
+        "Blocks the lane's lifetime work would find on average at the current difficulty.",
     );
     w.gauge(
         "alamo_coin_block_probability",
@@ -163,27 +200,44 @@ pub fn render(s: &PoolSnapshot) -> String {
         "alamo_node_zmq_connected",
         "1 when subscribed to the node's ZMQ hashblock notifications.",
     );
-    for coin in &s.coins {
-        coin_samples(&mut w, coin);
+    for lane in &s.lanes {
+        for coin in &lane.coins {
+            coin_samples(&mut w, &lane.key, coin);
+        }
     }
     out
 }
 
-fn worker_shares(w: &mut Writer<'_>, worker: &WorkerStatus) {
+/// Every worker of every lane, with its lane key.
+fn workers(s: &PoolSnapshot) -> impl Iterator<Item = (&str, &WorkerStatus)> {
+    s.lanes
+        .iter()
+        .flat_map(|l| l.workers.iter().map(move |w| (l.key.as_str(), w)))
+}
+
+fn worker_shares(w: &mut Writer<'_>, lane: &str, worker: &WorkerStatus) {
     w.sample(
         "alamo_worker_shares_total",
-        &[("worker", &worker.name), ("result", "accepted")],
+        &[
+            ("lane", lane),
+            ("worker", &worker.name),
+            ("result", "accepted"),
+        ],
         worker.shares_accepted as f64,
     );
     w.sample(
         "alamo_worker_shares_total",
-        &[("worker", &worker.name), ("result", "rejected")],
+        &[
+            ("lane", lane),
+            ("worker", &worker.name),
+            ("result", "rejected"),
+        ],
         worker.shares_rejected as f64,
     );
 }
 
-fn coin_samples(w: &mut Writer<'_>, coin: &CoinStatus) {
-    let labels: &[(&str, &str)] = &[("coin", &coin.symbol)];
+fn coin_samples(w: &mut Writer<'_>, lane: &str, coin: &CoinStatus) {
+    let labels: &[(&str, &str)] = &[("lane", lane), ("coin", &coin.symbol)];
     w.sample("alamo_coin_height", labels, coin.height as f64);
     w.sample(
         "alamo_coin_network_difficulty",
@@ -224,7 +278,7 @@ fn coin_samples(w: &mut Writer<'_>, coin: &CoinStatus) {
     ] {
         w.sample(
             "alamo_coin_block_probability",
-            &[("coin", &coin.symbol), ("horizon", horizon)],
+            &[("lane", lane), ("coin", &coin.symbol), ("horizon", horizon)],
             p,
         );
     }
@@ -302,15 +356,36 @@ impl std::fmt::Display for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::{NodeStatus, RoundStatus};
+    use crate::snapshot::{LaneStatus, NodeStatus, RoundStatus};
     use alamo_core::odds::OddsSummary;
+
+    fn coin(symbol: &str, luck: Option<f64>, zmq: Option<bool>, connected: bool) -> CoinStatus {
+        CoinStatus {
+            symbol: symbol.into(),
+            chain: "main".into(),
+            height: 2_900_000,
+            network_difficulty: 3.0e7,
+            template_age_seconds: 4,
+            coinbase_value: 625_000_000,
+            odds: OddsSummary::compute(1.5e6, 3.0e7),
+            round: RoundStatus {
+                blocks_found: 2,
+                luck_percent: luck,
+                ..Default::default()
+            },
+            node: NodeStatus {
+                connected,
+                zmq,
+                ..Default::default()
+            },
+        }
+    }
 
     #[test]
     fn renders_gauges_with_escaped_labels() {
-        let snapshot = PoolSnapshot {
-            pool_name: "Alamo \"Test\"".into(),
-            version: "0.1.0".into(),
-            uptime_seconds: 42,
+        let ltc = LaneStatus {
+            key: "ltc".into(),
+            state: crate::LaneState::Running,
             hashrate: 1.5e6,
             shares_accepted: 10,
             shares_rejected: 1,
@@ -329,62 +404,65 @@ mod tests {
                 work_accepted: 80.0,
                 last_share_seconds: Some(1),
             }],
-            coins: vec![CoinStatus {
-                symbol: "LTC".into(),
-                chain: "main".into(),
-                height: 2_900_000,
-                network_difficulty: 3.0e7,
-                template_age_seconds: 4,
-                coinbase_value: 625_000_000,
-                odds: OddsSummary::compute(1.5e6, 3.0e7),
-                round: RoundStatus {
-                    blocks_found: 2,
-                    luck_percent: Some(95.5),
-                    ..Default::default()
-                },
-                node: NodeStatus {
-                    connected: true,
-                    zmq: Some(false),
-                    ..Default::default()
-                },
-            }],
+            coins: vec![coin("LTC", Some(95.5), Some(false), true)],
             ..Default::default()
+        };
+        let doge = LaneStatus {
+            key: "doge".into(),
+            state: crate::LaneState::Failed,
+            error: Some("wrong network".into()),
+            ..Default::default()
+        };
+        let snapshot = PoolSnapshot {
+            pool_name: "Alamo \"Test\"".into(),
+            version: "0.1.0".into(),
+            uptime_seconds: 42,
+            ..PoolSnapshot::from_lanes(0, vec![ltc, doge], vec![])
         };
         let text = render(&snapshot);
         assert!(text.contains("# TYPE alamo_hashrate_hashes_per_second gauge\n"));
-        assert!(text.contains("alamo_hashrate_hashes_per_second 1500000\n"));
+        assert!(text.contains("alamo_hashrate_hashes_per_second{lane=\"ltc\"} 1500000\n"));
+        assert!(text.contains("alamo_hashrate_hashes_per_second{lane=\"doge\"} 0\n"));
         assert!(text.contains("alamo_info{version=\"0.1.0\",pool=\"Alamo \\\"Test\\\"\"} 1\n"));
-        assert!(text.contains("alamo_shares_total{result=\"rejected\"} 1\n"));
-        assert!(text.contains("alamo_work_total 12345.5\n"));
+        assert!(text.contains("alamo_shares_total{lane=\"ltc\",result=\"rejected\"} 1\n"));
+        assert!(text.contains("alamo_work_total{lane=\"ltc\"} 12345.5\n"));
+        assert!(text.contains(
+            "alamo_worker_shares_total{lane=\"ltc\",worker=\"rig\\\\1\",result=\"accepted\"} 10\n"
+        ));
+        assert!(text.contains("alamo_coin_height{lane=\"ltc\",coin=\"LTC\"} 2900000\n"));
+        assert!(text.contains("alamo_coin_luck_percent{lane=\"ltc\",coin=\"LTC\"} 95.5\n"));
         assert!(text
-            .contains("alamo_worker_shares_total{worker=\"rig\\\\1\",result=\"accepted\"} 10\n"));
-        assert!(text.contains("alamo_coin_height{coin=\"LTC\"} 2900000\n"));
-        assert!(text.contains("alamo_coin_luck_percent{coin=\"LTC\"} 95.5\n"));
-        assert!(text.contains("alamo_coin_block_probability{coin=\"LTC\",horizon=\"day\"} "));
-        assert!(text.contains("alamo_node_up{coin=\"LTC\"} 1\n"));
-        assert!(text.contains("alamo_node_zmq_connected{coin=\"LTC\"} 0\n"));
-        assert!(text.contains("alamo_workers{state=\"connected\"} 1\n"));
+            .contains("alamo_coin_block_probability{lane=\"ltc\",coin=\"LTC\",horizon=\"day\"} "));
+        assert!(text.contains("alamo_node_up{lane=\"ltc\",coin=\"LTC\"} 1\n"));
+        assert!(text.contains("alamo_node_zmq_connected{lane=\"ltc\",coin=\"LTC\"} 0\n"));
+        assert!(text.contains("alamo_workers{lane=\"ltc\",state=\"connected\"} 1\n"));
+        assert!(text.contains("alamo_workers{lane=\"doge\",state=\"seen\"} 0\n"));
+        assert!(text.contains("alamo_lane_state{lane=\"ltc\",state=\"running\"} 1\n"));
+        assert!(text.contains("alamo_lane_state{lane=\"ltc\",state=\"failed\"} 0\n"));
+        assert!(text.contains("alamo_lane_state{lane=\"doge\",state=\"failed\"} 1\n"));
+        // Nothing per lane is left without its label.
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            if !line.starts_with("alamo_info") && !line.starts_with("alamo_uptime") {
+                assert!(line.contains("lane=\""), "{line}");
+            }
+        }
     }
 
     #[test]
     fn optional_values_are_omitted_rather_than_faked() {
-        let snapshot = PoolSnapshot {
+        let lane = LaneStatus {
+            key: "ltc".into(),
             coins: vec![CoinStatus {
-                symbol: "DOGE".into(),
-                chain: "main".into(),
-                height: 1,
                 network_difficulty: 0.0,
-                template_age_seconds: 0,
-                coinbase_value: 0,
                 odds: OddsSummary::compute(0.0, 0.0),
                 round: RoundStatus::default(),
-                node: NodeStatus::default(),
+                ..coin("DOGE", None, None, false)
             }],
             ..Default::default()
         };
-        let text = render(&snapshot);
+        let text = render(&PoolSnapshot::from_lanes(0, vec![lane], vec![]));
         assert!(!text.contains("alamo_coin_luck_percent{"));
         assert!(!text.contains("alamo_node_zmq_connected{"));
-        assert!(text.contains("alamo_node_up{coin=\"DOGE\"} 0\n"));
+        assert!(text.contains("alamo_node_up{lane=\"ltc\",coin=\"DOGE\"} 0\n"));
     }
 }

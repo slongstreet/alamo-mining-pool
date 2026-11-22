@@ -19,14 +19,13 @@ a vardiff that copes with ASIC-scale hashrate.
   unchanged against a `bitcoind`.
 
 ### What blocks Bitcoin today
-- **One parent only.** `connect_chains` bails with "only one parent chain is supported"
-  (`crates/alamo/src/pool.rs`). The config has one `[stratum]` listener and one vardiff.
+- ~~**One parent only.**~~ Done: every enabled parent is a lane with its own listener and
+  vardiff (`[coins.<key>.stratum]`), started independently.
 - **No version rolling.** `mining.configure` answers `version-rolling: false`
   (`crates/alamo-stratum/src/session.rs`). Modern SHA-256 ASICs expect BIP310.
-- **Stats are global.** One `Stats` with one `share_multiplier`, one pool hashrate, one
-  best share. Scrypt and SHA-256 hashrate cannot be summed.
-- **Storage has no lane.** `workers` is keyed by name alone; `shares`, `hashrate_samples`
-  (`worker = ''` is the pool total), and `retired_work` are pool-wide.
+- ~~**Stats are global.**~~ Done: one `Stats` per lane, each with its own
+  `share_multiplier`, and the API and metrics show every lane (section 7).
+- ~~**Storage has no lane.**~~ Done: migration 0008 (section 6).
 
 ### Prework before real BTC hashrate is pointed at it
 - [x] **Block submission retries.** An unreachable node is retried for several minutes
@@ -37,8 +36,8 @@ a vardiff that copes with ASIC-scale hashrate.
 - [x] **Vardiff fast start.** A worker measured at 8x the target share rate or more jumps
   straight to its measured difficulty after five seconds instead of doubling once a
   minute.
-- [ ] **Startup is all-or-nothing.** Stratum does not listen until every node answers, so
-  a syncing `bitcoind` would hold LTC miners off. Fixed by starting lanes independently
+- [x] **Startup is all-or-nothing.** Stratum did not listen until every node answered, so
+  a syncing `bitcoind` would have held LTC miners off. Lanes now start independently
   (below).
 
 ## Technical design
@@ -68,16 +67,24 @@ fallback_address = "bc1q..."
 [coins.btc.stratum]
 listen = "0.0.0.0:3334"
 
-[coins.btc.stratum.vardiff]
+[coins.btc.stratum.vardiff]   # optional; if present, every field
 initial_difficulty = 2048
 min_difficulty = 0.001
 max_difficulty = 1073741824
+target_share_seconds = 10
+retarget_seconds = 60
+variance_percent = 30
 ```
 
 - `[stratum]` stays as the default for a parent without its own `[coins.<key>.stratum]`
   section, so existing files and a BTC-only file both work.
 - Two parents resolving to the same listen address is a startup error with a message that
   names both coins.
+- Coin keys are lower-cased when the file is loaded; keys differing only by case are an
+  error. A `stratum` section on a merge-mined coin is an error.
+- Stored vardiff overrides mirror the config path: `stratum.vardiff.<field>` applies to
+  every lane on `[stratum]`, `coins.<key>.stratum.vardiff.<field>` to a lane with its own
+  section, so existing rows keep working.
 - Separate ports rather than routing one port by address prefix: a username that is not a
   valid address would have no unambiguous fallback lane.
 
@@ -118,15 +125,25 @@ Signet needs the extra `signet` template rule and is left out of the first cut.
   `hashrate_samples`; key `retired_work` per lane in `pool_counters`.
 - Existing rows default to `ltc`. That is safe because no other parent has ever existed.
 
-### 7. API and metrics
-- The snapshot gains `lanes[]`. Each entry carries the lane key, algorithm, stratum port,
-  share multiplier, hashrate, share counts, best share, coins, and workers.
-- The current top-level fields keep mirroring the first lane for one release and are
-  marked deprecated.
-- `/api/hashrate`, `/api/shares`, the stats reset, and worker removal take a `lane`
-  parameter. Pool-level Prometheus series gain a `lane` label.
-- Settings: vardiff becomes per lane. The coinbase tag stays global, with the byte budget
+### 7. API and metrics (done)
+- ~~The snapshot gains `lanes[]`.~~ Done: one entry per configured lane, primary first,
+  with key, algorithm, stratum port, `state` (`connecting`/`running`/`failed`) and
+  `error`, chain, share multiplier, hashrate, share counts, work, best share,
+  `scoring_since`, coins, and workers. It is published from startup.
+- ~~Top-level fields mirror the first lane.~~ Done: they mirror the primary lane while it
+  runs (defaults otherwise), for one release, marked deprecated. `blocks` stays global,
+  each row converted with its own lane's share multiplier; rounds are keyed by lane and
+  coin.
+- ~~`lane` parameters.~~ Done: `/api/hashrate`, `/api/shares`, the stats reset, and
+  worker removal take `?lane=` (default the primary lane; unknown is a 400).
+- ~~Prometheus `lane` label.~~ Done on every per-lane series, plus
+  `alamo_lane_state{lane,state}`.
+- ~~Per-lane settings.~~ Done: `SettingsDoc.lanes[]` with each lane's listener and
+  vardiff, `SettingsPatch.lanes.<key>.vardiff`, and every configured coin listed with its
+  lane and whether it has connected. The coinbase tag stays global, with the byte budget
   taken from the tightest lane (41 bytes when a lane merge-mines).
+- A lane that cannot start fails alone and is shown as failed; the daemon exits only when
+  no lane is left running or connecting.
 
 ### 8. Proof
 Block construction must be byte-exact (see `CLAUDE.md`), so:

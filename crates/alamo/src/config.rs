@@ -1,7 +1,7 @@
 //! Top-level configuration file.
 
 use alamo_coins::CoinConfig;
-use alamo_stratum::StratumConfig;
+use alamo_stratum::{StratumConfig, VardiffConfig};
 use alamo_web::WebConfig;
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
@@ -14,11 +14,12 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     /// Pool identity and storage.
     pub pool: PoolConfig,
-    /// Stratum server.
+    /// Stratum listener and vardiff for every parent coin without its own
+    /// `[coins.<key>.stratum]` section.
     pub stratum: StratumConfig,
     /// Dashboard and API server.
     pub web: WebConfig,
-    /// Coins keyed by short name (`ltc`, `doge`).
+    /// Coins keyed by short name (`ltc`, `doge`), lower case once loaded.
     #[serde(default)]
     pub coins: BTreeMap<String, CoinConfig>,
 }
@@ -43,10 +44,73 @@ impl Config {
             .with_context(|| format!("reading config {}", path.display()))?;
         let text = expand_env(&raw, |name| std::env::var(name).ok())
             .with_context(|| format!("expanding config {}", path.display()))?;
-        let config: Config =
-            toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+        Self::parse(&text).with_context(|| format!("config {}", path.display()))
+    }
+
+    /// Parse, normalize, and validate config text (after `${NAME}` expansion).
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let mut config: Config = toml::from_str(text).context("parsing")?;
+        config.normalize()?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Lower-case every coin key and `merge_mined_with` reference, once, so everything
+    /// downstream (lane ids, stored setting keys, database rows) sees one spelling.
+    fn normalize(&mut self) -> anyhow::Result<()> {
+        let mut coins = BTreeMap::new();
+        let mut spelled: BTreeMap<String, String> = BTreeMap::new();
+        for (key, mut coin) in std::mem::take(&mut self.coins) {
+            let lower = key.to_ascii_lowercase();
+            if let Some(parent) = &mut coin.merge_mined_with {
+                *parent = parent.to_ascii_lowercase();
+            }
+            if let Some(first) = spelled.get(&lower) {
+                bail!("coins '{first}' and '{key}' differ only by case; configure each coin once");
+            }
+            spelled.insert(lower.clone(), key);
+            coins.insert(lower, coin);
+        }
+        self.coins = coins;
+        Ok(())
+    }
+
+    /// One lane per enabled parent coin, ordered by key.
+    pub fn lanes(&self) -> Vec<LaneConfig> {
+        self.coins
+            .iter()
+            .filter(|(_, c)| c.enabled && c.merge_mined_with.is_none())
+            .map(|(key, coin)| LaneConfig {
+                key: key.clone(),
+                aux: self
+                    .coins
+                    .iter()
+                    .filter(|(_, c)| c.enabled && c.merge_mined_with.as_deref() == Some(key))
+                    .map(|(k, _)| k.clone())
+                    .collect(),
+                own_stratum: coin.stratum.is_some(),
+                stratum: coin.stratum.clone().unwrap_or_else(|| self.stratum.clone()),
+            })
+            .collect()
+    }
+
+    /// Index into [`lanes`](Self::lanes) of the primary lane: the one parent that uses the
+    /// default `[stratum]` section, or, if none or several do, the first by key. The
+    /// primary lane is what the single-lane API surface describes.
+    pub fn primary_lane_index(lanes: &[LaneConfig]) -> usize {
+        let mut default = lanes.iter().enumerate().filter(|(_, l)| !l.own_stratum);
+        match (default.next(), default.next()) {
+            (Some((i, _)), None) => i,
+            _ => 0,
+        }
+    }
+
+    /// The primary lane (see [`primary_lane_index`](Self::primary_lane_index)). A
+    /// validated config always has one.
+    pub fn primary_lane(&self) -> Option<LaneConfig> {
+        let lanes = self.lanes();
+        let i = Self::primary_lane_index(&lanes);
+        lanes.into_iter().nth(i)
     }
 
     /// Path of the SQLite database.
@@ -83,6 +147,12 @@ impl Config {
             if alamo_coins::builtin(key).is_none() {
                 bail!("unknown coin '{key}' under [coins]; supported: ltc, doge");
             }
+            if let (Some(parent), Some(_)) = (&coin.merge_mined_with, &coin.stratum) {
+                bail!(
+                    "coin '{key}' is merge-mined with '{parent}' and cannot have its own \
+                     [coins.{key}.stratum] section; its miners connect to '{parent}'"
+                );
+            }
             if let Some(parent) = &coin.merge_mined_with {
                 let Some(parent_cfg) = self.coins.get(parent) else {
                     bail!("coin '{key}' is merge-mined with '{parent}', which is not configured");
@@ -98,8 +168,81 @@ impl Config {
                 bail!("coin '{key}' needs rpc_url and fallback_address");
             }
         }
+
+        let lanes = self.lanes();
+        if lanes.is_empty() {
+            bail!("no enabled parent coin configured: at least one enabled coin must not be merge-mined");
+        }
+        for lane in &lanes {
+            if lane.own_stratum {
+                lane.stratum
+                    .vardiff
+                    .validate_at(&lane.vardiff_path())
+                    .map_err(anyhow::Error::msg)?;
+            }
+        }
+        for (i, a) in lanes.iter().enumerate() {
+            for b in &lanes[i + 1..] {
+                if listeners_collide(a.stratum.listen, b.stratum.listen) {
+                    bail!(
+                        "coins '{}' and '{}' would both listen for stratum on {}; give one \
+                         its own [coins.<key>.stratum] listen address",
+                        a.key,
+                        b.key,
+                        b.stratum.listen
+                    );
+                }
+            }
+        }
         Ok(())
     }
+}
+
+/// One lane as configured: a parent coin, the aux coins merge-mined with it, and the
+/// stratum listener and vardiff it serves miners with.
+#[derive(Clone, Debug)]
+pub struct LaneConfig {
+    /// The parent coin's config key, which is also the lane id.
+    pub key: String,
+    /// Enabled coins merge-mined with the parent, by key.
+    pub aux: Vec<String>,
+    /// Whether the parent has its own `[coins.<key>.stratum]` section; otherwise
+    /// `stratum` is a copy of the pool-wide `[stratum]`.
+    pub own_stratum: bool,
+    /// The stratum section in force for this lane.
+    pub stratum: StratumConfig,
+}
+
+impl LaneConfig {
+    /// Config path of the vardiff table this lane uses; stored overrides of it are keyed
+    /// `<path>.<field>`.
+    pub fn vardiff_path(&self) -> String {
+        if self.own_stratum {
+            format!("coins.{}.stratum.vardiff", self.key)
+        } else {
+            "stratum.vardiff".to_string()
+        }
+    }
+
+    /// Whether the lane merge-mines, which costs coinbase bytes for the aux commitment.
+    pub fn merge_mines(&self) -> bool {
+        !self.aux.is_empty()
+    }
+
+    /// The lane's file vardiff.
+    pub fn vardiff(&self) -> &VardiffConfig {
+        &self.stratum.vardiff
+    }
+}
+
+/// Whether two listen addresses would fight over one port. Port 0 asks the OS for a free
+/// port, so it never collides; an unspecified address (`0.0.0.0`, `::`) overlaps every
+/// address of its family.
+fn listeners_collide(a: std::net::SocketAddr, b: std::net::SocketAddr) -> bool {
+    a.port() != 0
+        && a.port() == b.port()
+        && a.is_ipv4() == b.is_ipv4()
+        && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
 }
 
 /// Replace every `${NAME}` with `lookup(NAME)`. Names are `[A-Za-z0-9_]+`; anything else
@@ -190,6 +333,204 @@ mod tests {
         assert!(text.contains("[coins.doge]"), "{text}");
         let again: Config = toml::from_str(&text).unwrap();
         assert_eq!(again.coins["ltc"].rpc_url, cfg.coins["ltc"].rpc_url);
+    }
+
+    const HEAD: &str = r#"
+[pool]
+name = "x"
+data_dir = "./data"
+[stratum]
+listen = "0.0.0.0:3333"
+[web]
+listen = "127.0.0.1:8080"
+"#;
+
+    fn coin(key: &str, extra: &str) -> String {
+        format!(
+            "[coins.{key}]\nrpc_url = \"http://x\"\nrpc_user = \"u\"\nrpc_password = \"p\"\n\
+             fallback_address = \"a\"\n{extra}\n"
+        )
+    }
+
+    fn parse(coins: &[String]) -> anyhow::Result<Config> {
+        Config::parse(&format!("{HEAD}{}", coins.concat()))
+    }
+
+    fn err(coins: &[String]) -> String {
+        format!("{:#}", parse(coins).unwrap_err())
+    }
+
+    #[test]
+    fn a_parent_without_a_section_uses_the_default_stratum() {
+        let cfg = parse(&[coin("ltc", ""), coin("doge", "merge_mined_with = \"ltc\"")]).unwrap();
+        let lanes = cfg.lanes();
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].key, "ltc");
+        assert_eq!(lanes[0].aux, vec!["doge".to_string()]);
+        assert!(!lanes[0].own_stratum);
+        assert!(lanes[0].merge_mines());
+        assert_eq!(lanes[0].stratum.listen.port(), 3333);
+        assert_eq!(lanes[0].vardiff(), &VardiffConfig::default());
+        assert_eq!(lanes[0].vardiff_path(), "stratum.vardiff");
+        assert_eq!(cfg.primary_lane().unwrap().key, "ltc");
+    }
+
+    #[test]
+    fn a_parent_with_its_own_section_gets_its_own_listener_and_vardiff() {
+        let doge = coin(
+            "doge",
+            r#"[coins.doge.stratum]
+listen = "0.0.0.0:3334"
+[coins.doge.stratum.vardiff]
+initial_difficulty = 8
+min_difficulty = 1
+max_difficulty = 64
+target_share_seconds = 5
+retarget_seconds = 30
+variance_percent = 20"#,
+        );
+        let cfg = parse(&[coin("ltc", ""), doge]).unwrap();
+        let lanes = cfg.lanes();
+        assert_eq!(
+            lanes.iter().map(|l| l.key.as_str()).collect::<Vec<_>>(),
+            vec!["doge", "ltc"]
+        );
+        let (doge, ltc) = (&lanes[0], &lanes[1]);
+        assert!(doge.own_stratum && !doge.merge_mines());
+        assert_eq!(doge.stratum.listen.port(), 3334);
+        assert_eq!(doge.vardiff().initial_difficulty, 8.0);
+        assert_eq!(doge.vardiff_path(), "coins.doge.stratum.vardiff");
+        assert_eq!(ltc.stratum.listen.port(), 3333);
+        assert_eq!(ltc.vardiff(), &VardiffConfig::default());
+        assert_eq!(
+            cfg.primary_lane().unwrap().key,
+            "ltc",
+            "the lane on the default section is primary even when it is not first"
+        );
+
+        // Without a vardiff table the section gets the built-in defaults, like [stratum].
+        let cfg = parse(&[
+            coin("ltc", ""),
+            coin("doge", "[coins.doge.stratum]\nlisten = \"0.0.0.0:3334\""),
+        ])
+        .unwrap();
+        assert_eq!(cfg.lanes()[0].vardiff(), &VardiffConfig::default());
+
+        // A partial vardiff table is refused.
+        let e = err(&[
+            coin("ltc", ""),
+            coin(
+                "doge",
+                "[coins.doge.stratum]\nlisten = \"0.0.0.0:3334\"\n[coins.doge.stratum.vardiff]\nmin_difficulty = 1",
+            ),
+        ]);
+        assert!(e.contains("missing field"), "{e}");
+    }
+
+    #[test]
+    fn primary_lane_falls_back_to_the_first_key() {
+        let cfg = parse(&[
+            coin("ltc", "[coins.ltc.stratum]\nlisten = \"0.0.0.0:3335\""),
+            coin("doge", "[coins.doge.stratum]\nlisten = \"0.0.0.0:3334\""),
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.primary_lane().unwrap().key,
+            "doge",
+            "none on the default"
+        );
+        // Several on the default section cannot pass validation unless they ask for
+        // port 0, but the rule still picks the first.
+        let lanes = vec![
+            LaneConfig {
+                key: "doge".into(),
+                aux: vec![],
+                own_stratum: false,
+                stratum: cfg.stratum.clone(),
+            },
+            LaneConfig {
+                key: "ltc".into(),
+                aux: vec![],
+                own_stratum: false,
+                stratum: cfg.stratum.clone(),
+            },
+        ];
+        assert_eq!(Config::primary_lane_index(&lanes), 0);
+    }
+
+    #[test]
+    fn coin_keys_are_lower_cased_once() {
+        let cfg = parse(&[coin("LTC", ""), coin("Doge", "merge_mined_with = \"Ltc\"")]).unwrap();
+        assert_eq!(cfg.coins.keys().collect::<Vec<_>>(), vec!["doge", "ltc"]);
+        assert_eq!(cfg.coins["doge"].merge_mined_with.as_deref(), Some("ltc"));
+        assert_eq!(cfg.lanes()[0].key, "ltc");
+        assert_eq!(cfg.lanes()[0].aux, vec!["doge".to_string()]);
+
+        let e = err(&[coin("LTC", ""), coin("ltc", "")]);
+        assert!(e.contains("'LTC' and 'ltc' differ only by case"), "{e}");
+    }
+
+    #[test]
+    fn lane_validation_errors_name_the_coins() {
+        // No parent at all.
+        let e = err(&[
+            coin("doge", "merge_mined_with = \"ltc\""),
+            coin("ltc", "enabled = false"),
+        ]);
+        assert!(e.contains("disabled"), "{e}");
+        let e = err(&[coin("ltc", "enabled = false")]);
+        assert!(e.contains("at least one coin must be enabled"), "{e}");
+
+        // A stratum section on an aux coin.
+        let e = err(&[
+            coin("ltc", ""),
+            coin(
+                "doge",
+                "merge_mined_with = \"ltc\"\n[coins.doge.stratum]\nlisten = \"0.0.0.0:3334\"",
+            ),
+        ]);
+        assert!(e.contains("coin 'doge' is merge-mined with 'ltc'"), "{e}");
+        assert!(e.contains("[coins.doge.stratum]"), "{e}");
+
+        // Two parents on the default section.
+        let e = err(&[coin("ltc", ""), coin("doge", "")]);
+        assert!(
+            e.contains("coins 'doge' and 'ltc' would both listen for stratum on 0.0.0.0:3333"),
+            "{e}"
+        );
+        // An explicit section that lands on the default address, or overlaps it.
+        let e = err(&[
+            coin("ltc", ""),
+            coin("doge", "[coins.doge.stratum]\nlisten = \"127.0.0.1:3333\""),
+        ]);
+        assert!(e.contains("coins 'doge' and 'ltc'"), "{e}");
+        // Port 0 never collides.
+        parse(&[
+            coin("ltc", "[coins.ltc.stratum]\nlisten = \"127.0.0.1:0\""),
+            coin("doge", "[coins.doge.stratum]\nlisten = \"127.0.0.1:0\""),
+        ])
+        .unwrap();
+
+        // Every lane's vardiff validates, and the message names its table.
+        let e = err(&[
+            coin("ltc", ""),
+            coin(
+                "doge",
+                r#"[coins.doge.stratum]
+listen = "0.0.0.0:3334"
+[coins.doge.stratum.vardiff]
+initial_difficulty = 8
+min_difficulty = 16
+max_difficulty = 64
+target_share_seconds = 5
+retarget_seconds = 30
+variance_percent = 20"#,
+            ),
+        ]);
+        assert!(
+            e.contains("coins.doge.stratum.vardiff.initial_difficulty must lie within"),
+            "{e}"
+        );
     }
 
     #[test]

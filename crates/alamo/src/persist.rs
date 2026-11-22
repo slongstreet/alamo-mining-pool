@@ -13,26 +13,54 @@ const SAMPLE_INTERVAL: u64 = 60;
 /// Run retention every ten minutes.
 const RETAIN_INTERVAL: u64 = 600;
 
-/// Queued accounting writes and periodic sampling/retention.
+/// One lane's queued accounting writes and periodic hashrate sampling.
 pub struct Persistence {
     store: Store,
-    policy: RetentionPolicy,
+    lane: String,
     authorized: Vec<WorkerWrite>,
     shares: Vec<NewShare>,
     last_sample_ts: u64,
+}
+
+/// Retention for the whole database, run once per interval however many lanes there are.
+pub struct Retention {
+    store: Store,
+    policy: RetentionPolicy,
     last_retain_at: u64,
 }
 
-impl Persistence {
-    /// Wrap a store. `now` is used so retention does not immediately re-run after a restart.
+impl Retention {
+    /// Wrap a store. `now` is used so retention does not immediately re-run after a
+    /// restart.
     pub fn new(store: Store, now: u64) -> Self {
         Self {
             store,
             policy: RetentionPolicy::default(),
+            last_retain_at: now,
+        }
+    }
+
+    /// Trim and downsample if the interval has passed. Called on the publisher tick.
+    pub async fn maybe_retain(&mut self, now: u64) -> Result<(), StoreError> {
+        if now.saturating_sub(self.last_retain_at) < RETAIN_INTERVAL {
+            return Ok(());
+        }
+        let report = self.store.retain(&self.policy, now as i64).await?;
+        self.last_retain_at = now;
+        log_retention(report);
+        Ok(())
+    }
+}
+
+impl Persistence {
+    /// Wrap a store for `lane`, the parent coin's config key.
+    pub fn new(store: Store, lane: &str) -> Self {
+        Self {
+            store,
+            lane: lane.to_owned(),
             authorized: Vec::new(),
             shares: Vec::new(),
             last_sample_ts: 0,
-            last_retain_at: now,
         }
     }
 
@@ -88,7 +116,7 @@ impl Persistence {
             return Ok(());
         }
         self.store
-            .persist_batch(&self.authorized, &self.shares)
+            .persist_batch(&self.lane, &self.authorized, &self.shares)
             .await?;
         tracing::debug!(
             workers = self.authorized.len(),
@@ -100,11 +128,11 @@ impl Persistence {
         Ok(())
     }
 
-    /// Flush, maybe sample hashrate, maybe retain. Called on the publisher tick.
+    /// Flush and maybe sample hashrate. Called on the publisher tick for a lane that has
+    /// connected.
     pub async fn on_tick(&mut self, stats: &Stats, now: u64) -> Result<(), StoreError> {
         self.flush().await?;
         self.maybe_sample(stats, now).await?;
-        self.maybe_retain(now).await?;
         Ok(())
     }
 
@@ -122,18 +150,10 @@ impl Persistence {
                 hashrate,
             })
             .collect();
-        self.store.insert_hashrate_samples(&samples).await?;
+        self.store
+            .insert_hashrate_samples(&self.lane, &samples)
+            .await?;
         self.last_sample_ts = ts;
-        Ok(())
-    }
-
-    async fn maybe_retain(&mut self, now: u64) -> Result<(), StoreError> {
-        if now.saturating_sub(self.last_retain_at) < RETAIN_INTERVAL {
-            return Ok(());
-        }
-        let report = self.store.retain(&self.policy, now as i64).await?;
-        self.last_retain_at = now;
-        log_retention(report);
         Ok(())
     }
 }
@@ -172,7 +192,7 @@ mod tests {
     async fn flush_then_reload_matches_live_counters() {
         let path = temp_db();
         let store = Store::open(&path).await.unwrap();
-        let mut persist = Persistence::new(store.clone(), 1_000);
+        let mut persist = Persistence::new(store.clone(), "ltc");
         let mut stats = Stats::default();
         let auth = PoolEvent::Authorized {
             session: 1,
@@ -207,7 +227,7 @@ mod tests {
         }
         persist.flush().await.unwrap();
 
-        let restored = Stats::load(&store, 1_010, 1.0).await.unwrap();
+        let restored = Stats::load(&store, "ltc", 1_010, 1.0).await.unwrap();
         assert_eq!(restored.shares_accepted(), 1);
         assert_eq!(restored.shares_rejected(), 1);
         let w = &restored.workers(1_010)[0];
@@ -216,7 +236,10 @@ mod tests {
         assert_eq!(w.best_difficulty, 8.0);
 
         persist.on_tick(&stats, SAMPLE_INTERVAL).await.unwrap();
-        let samples = store.hashrate_samples_since(Some(""), 0).await.unwrap();
+        let samples = store
+            .hashrate_samples_since("ltc", Some(""), 0)
+            .await
+            .unwrap();
         assert_eq!(samples.len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
