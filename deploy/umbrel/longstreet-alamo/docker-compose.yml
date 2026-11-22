@@ -11,7 +11,7 @@ services:
 
   pool:
     # Pin by digest; update the tag and digest together on each release.
-    image: ghcr.io/slongstreet/alamo-mining-pool:0.1.14@sha256:219f5cc4c8a535b46d6e7e683485269836fc591d214559ac41d4c3876b55fdf5
+    image: ghcr.io/slongstreet/alamo-mining-pool:0.1.14@sha256:d21cb374b2205b573ac38216f3fb545d32020fdbbf2b2a99626897b08523e9f4
     restart: on-failure
     stop_grace_period: 15s
     # The image is distroless; run as the umbrel user so the bind-mounted data dir is writable.
