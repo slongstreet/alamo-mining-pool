@@ -3,6 +3,7 @@
   import type { Connection } from '../live.svelte';
   import type { ThemePreference } from '../theme.svelte';
   import { formatDuration } from '../format';
+  import { laneName, laneSymbols } from '../lanes';
 
   let {
     status,
@@ -24,7 +25,23 @@
     polling: 'polling',
     offline: 'offline',
   };
-  const down = $derived(status?.coins.filter((c) => !c.node.connected) ?? []);
+  const lanes = $derived(status?.lanes ?? []);
+  /** Each lane's chains and networks: "LTC regtest + DOGE regtest", or its state before it has any. */
+  const networks = $derived(
+    lanes
+      .map((l) =>
+        l.coins.length
+          ? l.coins.map((c) => `${c.symbol} ${c.chain}`).join(' + ')
+          : l.state === 'running'
+            ? ''
+            : `${laneSymbols(l).join(' + ')} ${l.state}`,
+      )
+      .filter(Boolean),
+  );
+  const down = $derived(
+    lanes.flatMap((l) => l.coins.filter((c) => !c.node.connected).map((c) => ({ lane: l.key, coin: c }))),
+  );
+  const failed = $derived(lanes.filter((l) => l.state === 'failed'));
   const themeLabel = $derived(
     theme.theme === 'system' ? 'Auto theme' : theme.theme === 'dark' ? 'Dark theme' : 'Light theme',
   );
@@ -36,11 +53,14 @@
     <p class="muted">
       {#if status}
         v{status.version} · up {formatDuration(status.uptime_seconds)}
-        {#if status.coins.length}
-          · {status.coins.map((c) => `${c.symbol} ${c.chain}`).join(' + ')}
+        {#if networks.length}
+          · {networks.join(' · ')}
         {/if}
-        {#each down as c (c.symbol)}
+        {#each down as { lane, coin: c } (`${lane}/${c.symbol}`)}
           <span class="badge bad" title={c.node.last_error ?? ''}>{c.symbol} node {c.node.stale ? 'stale' : 'unreachable'}</span>
+        {/each}
+        {#each failed as l (l.key)}
+          <span class="badge bad" title={l.error ?? ''}>{laneName(l)} lane failed</span>
         {/each}
       {:else if error}
         {error}

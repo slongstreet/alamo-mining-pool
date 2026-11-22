@@ -3,7 +3,13 @@
   import { api, type HashrateSample } from '../api';
   import { formatClock, formatHashrate, shortWorker } from '../format';
 
-  let { live, workers }: { live: number; workers: string[] } = $props();
+  /** One lane's hashrate history: scrypt and SHA-256 rates do not add up. */
+  let {
+    live,
+    workers,
+    lane,
+    allLabel = 'Pool',
+  }: { live: number; workers: string[]; lane: string; allLabel?: string } = $props();
 
   const spans = [
     { label: '1h', secs: 3600 },
@@ -19,13 +25,28 @@
   const height = 190;
   const pad = { top: 12, right: 12, bottom: 24, left: 56 };
 
+  // Answers can arrive out of order after a lane or span change; only the latest counts.
+  let request = 0;
   async function load() {
+    const mine = ++request;
     try {
-      samples = await api.hashrate(span, worker);
+      const next = await api.hashrate(span, worker, lane);
+      if (mine === request) samples = next;
     } catch {
       // Keep the last good series; the header shows the connection state.
     }
   }
+
+  // Another lane has other workers and another series: start from its whole-lane view.
+  let shownLane: string | undefined;
+  $effect.pre(() => {
+    if (shownLane !== undefined && lane !== shownLane) {
+      worker = '';
+      samples = [];
+      hover = null;
+    }
+    shownLane = lane;
+  });
 
   onMount(() => {
     load();
@@ -36,6 +57,7 @@
     // Re-fetch when the selection changes.
     void span;
     void worker;
+    void lane;
     load();
   });
 
@@ -84,7 +106,7 @@
     <div class="controls">
       {#if workers.length}
         <select bind:value={worker} class="ghost">
-          <option value="">Pool</option>
+          <option value="">{allLabel}</option>
           {#each workers as w (w)}
             <option value={w}>{shortWorker(w)}</option>
           {/each}

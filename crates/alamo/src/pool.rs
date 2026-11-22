@@ -19,7 +19,8 @@ use alamo_store::{BlockRow, BlockStatus, CoinRounds, NewBlock, Store};
 use alamo_stratum::server::Bound;
 use alamo_stratum::{BlockCandidate, PoolEvent, StratumServer, WorkReceiver};
 use alamo_web::{
-    AppState, CoinStatus, Command, LaneState, LaneStatus, NodeStatus, PoolSnapshot, RoundStatus,
+    AppState, CoinStatus, Command, LaneCoin, LaneState, LaneStatus, NodeStatus, PoolSnapshot,
+    RoundStatus,
 };
 use anyhow::{bail, Context};
 use std::collections::HashMap;
@@ -920,6 +921,8 @@ struct LaneAccount {
     key: String,
     algorithm: Algorithm,
     stratum_port: u16,
+    /// The lane's coins as configured, parent first, for the dashboard before they connect.
+    configured_coins: Vec<LaneCoin>,
     stats: Stats,
     persist: Persistence,
     /// `None` until the lane's nodes have connected.
@@ -956,6 +959,24 @@ fn lane_algorithm(key: &str) -> Algorithm {
     alamo_coins::builtin(key).map_or(Algorithm::Scrypt, |c| c.algorithm())
 }
 
+/// A lane's configured coins, parent first. Validation refuses unknown keys, so every
+/// key has a built-in coin; the key stands in for the names otherwise.
+fn lane_coins(lane: &LaneConfig) -> Vec<LaneCoin> {
+    std::iter::once(&lane.key)
+        .chain(&lane.aux)
+        .map(|key| {
+            let coin = alamo_coins::builtin(key);
+            LaneCoin {
+                key: key.clone(),
+                symbol: coin
+                    .as_ref()
+                    .map_or_else(|| key.to_uppercase(), |c| c.symbol().to_string()),
+                name: coin.map_or_else(|| key.clone(), |c| c.name().to_string()),
+            }
+        })
+        .collect()
+}
+
 impl Publisher {
     /// Restore every configured lane's statistics. A lane's share multiplier follows
     /// from its parent coin's algorithm, so this needs no node.
@@ -983,6 +1004,7 @@ impl Publisher {
                 key: lane.key.clone(),
                 algorithm,
                 stratum_port: lane.stratum.listen.port(),
+                configured_coins: lane_coins(lane),
                 stats,
                 persist: Persistence::new(store.clone(), &lane.key),
                 view: None,
@@ -1380,6 +1402,7 @@ fn lane_status(l: &LaneAccount, rounds: &[CoinRounds], now: u64) -> LaneStatus {
         best_share_worker: best.as_ref().map(|b| b.worker.clone()),
         best_share_at: best.and_then(|b| b.at),
         scoring_since: stats.scoring_since(),
+        configured_coins: l.configured_coins.clone(),
         coins,
         workers,
     }
@@ -1546,6 +1569,25 @@ mod tests {
             coin("doge", "[coins.doge.stratum]\nlisten = \"127.0.0.1:0\""),
         );
         Config::parse(&text).unwrap().lanes()
+    }
+
+    #[test]
+    fn lane_coins_name_the_parent_first_then_its_aux_coins() {
+        let text = "[pool]\nname = \"x\"\ndata_dir = \"./data\"\n[stratum]\nlisten = \"127.0.0.1:0\"\n\
+             [web]\nlisten = \"127.0.0.1:0\"\n\
+             [coins.ltc]\nrpc_url = \"http://127.0.0.1:1\"\nrpc_user = \"u\"\nrpc_password = \"p\"\nfallback_address = \"a\"\n\
+             [coins.doge]\nmerge_mined_with = \"ltc\"\nrpc_url = \"http://127.0.0.1:1\"\nrpc_user = \"u\"\nrpc_password = \"p\"\nfallback_address = \"a\"\n";
+        let lanes = Config::parse(text).unwrap().lanes();
+        assert_eq!(lanes.len(), 1);
+        let coins = lane_coins(&lanes[0]);
+        let named: Vec<_> = coins
+            .iter()
+            .map(|c| (c.key.as_str(), c.symbol.as_str(), c.name.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![("ltc", "LTC", "Litecoin"), ("doge", "DOGE", "Dogecoin")]
+        );
     }
 
     #[tokio::test]

@@ -1,17 +1,21 @@
 <script lang="ts">
-  import type { CoinStatus } from '../api';
+  import type { LaneStatus } from '../api';
+  import { addressExample } from '../lanes';
 
-  /** Stratum connection instructions: URL, username, and password for this pool. */
-  let { port, coins }: { port: number; coins: CoinStatus[] } = $props();
+  /** Stratum connection instructions for one lane: URL, username, and password. */
+  let { lane }: { lane: LaneStatus } = $props();
 
-  // The parent chain comes first; the aux chains take their address from the password.
-  // Before the first template the coin list is empty, so fall back to the pool's defaults.
-  const parent = $derived(coins[0]?.symbol ?? 'LTC');
-  const aux = $derived(coins.slice(1).map((c) => c.symbol));
-  const auxLabel = $derived(aux.length > 0 ? aux.join(' / ') : 'DOGE');
-  const auxTag = $derived((aux[0] ?? 'DOGE').toLowerCase());
+  // The parent pays from the username; aux chains take their address from the password.
+  // Configured coins are known before the lane's nodes answer.
+  const parent = $derived(lane.configured_coins[0]?.symbol ?? lane.key.toUpperCase());
+  const aux = $derived(lane.configured_coins.slice(1).map((c) => c.symbol));
+  const auxLabel = $derived(aux.join(' / '));
+  const auxTag = $derived((aux[0] ?? '').toLowerCase());
+  const auxExample = $derived(addressExample(aux[0] ?? '', lane.chain));
   const host = $derived(location.hostname || 'pool-host');
+  const port = $derived(lane.stratum_port);
   const url = $derived(`stratum+tcp://${host}:${port}`);
+  const sha256 = $derived(lane.algorithm === 'sha256d');
 </script>
 
 <div class="setup">
@@ -21,16 +25,35 @@
     <dt>Username</dt>
     <dd>
       <code>&lt;{parent} address&gt;</code>
-      <span class="hint">Add a worker name after a dot, e.g. <code>ltc1q….rig1</code>. Blocks pay this address.</span>
+      <span class="hint">
+        Add a worker name after a dot, e.g. <code>{addressExample(parent, lane.chain)}.rig1</code>. Blocks pay this
+        address.
+      </span>
     </dd>
     <dt>Password</dt>
     <dd>
-      <code>&lt;{auxLabel} address&gt;</code>
+      {#if aux.length}
+        <code>&lt;{auxLabel} address&gt;</code>
+        <span class="hint">
+          Bare, or tagged as <code>{auxTag}={auxExample}</code> next to other options such as <code>d=1024</code>.
+          Leave it out and {auxLabel} goes to the configured fallback address.
+        </span>
+      {:else}
+        <code>anything</code>
+        <span class="hint">Any password works; this lane has no merge-mined coins.</span>
+      {/if}
       <span class="hint">
-        Bare, or tagged as <code>{auxTag}=D…</code> next to other options such as <code>d=1024</code>.
-        Leave it out and {auxLabel} goes to the configured fallback address.
+        Optional: <code>d=&lt;difficulty&gt;</code> sets the starting share difficulty, within the lane's vardiff
+        limits.
       </span>
     </dd>
+    {#if sha256}
+      <dt>Version rolling</dt>
+      <dd>
+        Supported
+        <span class="hint">ASICBoost miners can roll version bits (BIP310 <code>mining.configure</code>).</span>
+      </dd>
+    {/if}
   </dl>
   <p class="hint">
     Shows the host this page was loaded from. If miners reach the pool by another name or IP, use that

@@ -4,13 +4,17 @@
     api,
     ApiError,
     downloads,
+    type CoinSettings,
+    type LaneSettings,
     type SettingsDoc,
     type SettingsPatch,
     type Status,
-    type VardiffField,
   } from '../../api';
   import Field from './Field.svelte';
   import NodeCard from './NodeCard.svelte';
+  import VardiffCard from './VardiffCard.svelte';
+  import { algorithmLabel, laneName } from '../../lanes';
+  import { formatInteger } from '../../format';
 
   /**
    * Operator settings. Every change goes to the daemon as a patch; the daemon validates
@@ -27,24 +31,7 @@
   let poolName = $state('');
   let tag = $state('');
   let fallback = $state<Record<string, string>>({});
-  // Number inputs hand back a number (or null when cleared); compare and send as text.
-  let vardiff = $state<Record<VardiffField, string | number | null>>({
-    initial_difficulty: '',
-    min_difficulty: '',
-    max_difficulty: '',
-    target_share_seconds: '',
-    retarget_seconds: '',
-    variance_percent: '',
-  });
 
-  const vardiffFields: { key: VardiffField; label: string; hint: string }[] = [
-    { key: 'initial_difficulty', label: 'Starting difficulty', hint: 'Share difficulty a new connection begins at.' },
-    { key: 'min_difficulty', label: 'Minimum difficulty', hint: 'Vardiff never goes below this.' },
-    { key: 'max_difficulty', label: 'Maximum difficulty', hint: 'Vardiff never goes above this.' },
-    { key: 'target_share_seconds', label: 'Target seconds per share', hint: 'Difficulty is tuned so each worker submits about one share per this many seconds.' },
-    { key: 'retarget_seconds', label: 'Retarget interval (s)', hint: 'Minimum time between difficulty changes; each change is based on the last four intervals.' },
-    { key: 'variance_percent', label: 'Variance (%)', hint: 'Only retarget when the observed rate is off by more than this.' },
-  ];
   const logLevels = ['error', 'warn', 'info', 'debug', 'trace'];
 
   function adopt(d: SettingsDoc) {
@@ -52,9 +39,6 @@
     poolName = d.pool_name.value;
     tag = d.coinbase_tag.value;
     fallback = Object.fromEntries(d.coins.map((c) => [c.key, c.fallback_address.value]));
-    for (const f of vardiffFields) {
-      vardiff[f.key] = String(d.vardiff[f.key].value);
-    }
   }
 
   async function load() {
@@ -81,9 +65,10 @@
     return () => clearInterval(timer);
   });
 
-  type Section = 'pool' | 'payouts' | 'mining' | 'logs' | 'data';
+  /** 'pool', 'payouts', 'logs', 'data', or `mining:<lane>`. */
+  type Section = string;
   let busy = $state<Section | null>(null);
-  let notice = $state<Partial<Record<Section, { kind: 'ok' | 'bad'; text: string }>>>({});
+  let notice = $state<Record<Section, { kind: 'ok' | 'bad'; text: string } | undefined>>({});
 
   async function apply(section: Section, patch: SettingsPatch, okText = 'Saved') {
     busy = section;
@@ -101,6 +86,26 @@
   const readOnly = $derived(doc?.read_only ?? false);
   const locked = $derived(readOnly || busy !== null);
   const tagBytes = $derived(new TextEncoder().encode(tag).length);
+  const multiLane = $derived((doc?.lanes.length ?? 0) > 1);
+
+  // Lane names and algorithms come from the live status; the settings document has the
+  // listener and vardiff.
+  function liveLane(key: string) {
+    return status?.lanes.find((l) => l.key === key);
+  }
+  function laneTitle(key: string): string {
+    const l = liveLane(key);
+    return l ? laneName(l) : key.toUpperCase();
+  }
+  function portOf(listen: string): string {
+    return listen.slice(listen.lastIndexOf(':') + 1);
+  }
+  function liveCoin(lane: string, symbol: string) {
+    return liveLane(lane)?.coins.find((c) => c.symbol === symbol);
+  }
+  const groups = $derived(
+    (doc?.lanes ?? []).map((l) => ({ lane: l, coins: doc!.coins.filter((c) => c.lane === l.key) })),
+  );
 
   const poolDirty = $derived(!!doc && (poolName !== doc.pool_name.value || tag !== doc.coinbase_tag.value));
   function savePool() {
@@ -111,52 +116,85 @@
     apply('pool', patch);
   }
 
-  const payoutsDirty = $derived(!!doc && doc.coins.some((c) => fallback[c.key] !== c.fallback_address.value));
+  // A coin whose lane has not connected cannot take a fallback change: the daemon checks
+  // the address against the node's network, which is not known yet.
+  const payoutsDirty = $derived(
+    !!doc && doc.coins.some((c) => c.connected && fallback[c.key] !== c.fallback_address.value),
+  );
   function savePayouts() {
     if (!doc) return;
-    const changed = doc.coins.filter((c) => fallback[c.key] !== c.fallback_address.value);
+    const changed = doc.coins.filter((c) => c.connected && fallback[c.key] !== c.fallback_address.value);
     apply('payouts', { fallback_addresses: Object.fromEntries(changed.map((c) => [c.key, fallback[c.key]])) });
   }
-
-  const draftText = (f: VardiffField) => String(vardiff[f] ?? '').trim();
-  const miningDirty = $derived(!!doc && vardiffFields.some((f) => draftText(f.key) !== String(doc!.vardiff[f.key].value)));
-  function saveMining() {
-    if (!doc) return;
-    const patch: SettingsPatch = { vardiff: {} };
-    for (const f of vardiffFields) {
-      const text = draftText(f.key);
-      if (text === String(doc.vardiff[f.key].value)) continue;
-      const n = Number(text);
-      if (text === '' || !Number.isFinite(n)) {
-        notice.mining = { kind: 'bad', text: `${f.label} must be a number` };
-        return;
-      }
-      patch.vardiff![f.key] = n;
+  function fallbackHint(c: CoinSettings): string {
+    const role = c.merge_mined_with
+      ? `Paid when the stratum password carries no valid ${c.symbol} address.`
+      : `Paid when the stratum username is not a valid ${c.symbol} address.`;
+    if (!c.connected && liveLane(c.lane)?.state === 'failed') {
+      return `${role} The ${laneTitle(c.lane)} lane failed to start, so this cannot be changed here (the address is checked against the node's network); fix the config file and restart.`;
     }
-    apply('mining', patch, 'Saved; applies to miners that connect from now on');
+    if (!c.connected) {
+      return `${role} It can be changed once the ${laneTitle(c.lane)} lane has connected: the address is checked against the node's network, which is not known yet.`;
+    }
+    return `${role} Must be a ${c.chain} address.`;
   }
 
-  let resetting = $state(false);
-  async function resetStats() {
-    if (!confirm('Reset accepted/rejected share counts and best share for every worker?\n\nHashrate history, accepted work, rounds, and blocks are kept.')) return;
-    resetting = true;
+  /** Lanes on the default [stratum] section share its vardiff overrides. */
+  const sharedLanes = $derived((doc?.lanes ?? []).filter((l) => !l.own_stratum_section));
+  function vardiffTitle(l: LaneSettings): string {
+    const live = liveLane(l.key);
+    const who = live ? `${algorithmLabel(live.algorithm)} miners` : `${l.key.toUpperCase()} miners`;
+    return `Vardiff — ${who}, port ${portOf(l.stratum_listen)}`;
+  }
+  function vardiffLead(l: LaneSettings): string {
+    const live = liveLane(l.key);
+    const m = live?.share_multiplier ?? 0;
+    const units =
+      m === 1
+        ? `Variable difficulty, in the units ${algorithmLabel(live!.algorithm)} miners display: the same as network difficulty.`
+        : m > 1
+          ? `Variable difficulty, in the units ${algorithmLabel(live!.algorithm)} miners display: difficulty ${formatInteger(m)} is one unit of network difficulty.`
+          : 'Variable difficulty, in the units miners display.';
+    let text = `${units} Changes apply to miners that connect from now on.`;
+    if (!l.own_stratum_section && sharedLanes.length > 1) {
+      const others = sharedLanes.filter((o) => o.key !== l.key).map((o) => `${laneTitle(o.key)} lane`);
+      text += ` This lane uses the default [stratum] section together with the ${others.join(' and ')}: a change here changes ${others.length === 1 ? 'both' : 'all of them'}.`;
+    }
+    return text;
+  }
+
+  let resetting = $state<string | null>(null);
+  async function resetStats(lane: string) {
+    const which = multiLane ? ` in the ${laneTitle(lane)} lane` : '';
+    if (!confirm(`Reset accepted/rejected share counts and best share for every worker${which}?\n\nHashrate history, accepted work, rounds, and blocks are kept.`)) return;
+    resetting = lane;
     notice.data = undefined;
     try {
-      await api.resetStats();
-      notice.data = { kind: 'ok', text: 'Share counts and best share reset' };
+      await api.resetStats(lane);
+      notice.data = { kind: 'ok', text: multiLane ? `${laneTitle(lane)} lane: share counts and best share reset` : 'Share counts and best share reset' };
     } catch (err) {
       notice.data = { kind: 'bad', text: err instanceof Error ? err.message : String(err) };
     } finally {
-      resetting = false;
+      resetting = null;
     }
   }
 
-  function liveCoin(symbol: string) {
-    return status?.coins.find((c) => c.symbol === symbol);
-  }
+  const btcConfigured = $derived(doc?.coins.some((c) => c.key === 'btc') ?? true);
+  const btcSnippet = [
+    '[coins.btc]',
+    'enabled = true',
+    'rpc_url = "http://127.0.0.1:8332"',
+    'rpc_user = "alamo"',
+    'rpc_password = "${BTC_RPC_PASSWORD}"',
+    'zmq_hashblock = "tcp://127.0.0.1:28334"',
+    'fallback_address = "bc1q..."',
+    '',
+    '[coins.btc.stratum]',
+    'listen = "0.0.0.0:3334"',
+  ].join('\n');
 </script>
 
-{#snippet note(section: Section)}
+{#snippet noteFor(section: Section)}
   {#if notice[section]}
     <span class="notice {notice[section]!.kind}" role="status">{notice[section]!.text}</span>
   {/if}
@@ -216,7 +254,7 @@
         <button class="primary" onclick={savePool} disabled={locked || !poolDirty || tagBytes > doc.coinbase_tag_max_bytes}>
           {busy === 'pool' ? 'Saving…' : 'Save'}
         </button>
-        {@render note('pool')}
+        {@render noteFor('pool')}
       </div>
     </section>
 
@@ -226,78 +264,116 @@
         Miners are paid at the address they mine with. These addresses are paid instead when a miner gives
         none that is valid for the chain. Set them to addresses you control.
       </p>
-      {#each doc.coins as coin (coin.key)}
-        <Field
-          label="{coin.symbol} fallback address"
-          hint={coin.merge_mined_with
-            ? `Paid when the stratum password carries no valid ${coin.symbol} address. Must be a ${coin.chain} address.`
-            : `Paid when the stratum username is not a valid ${coin.symbol} address. Must be a ${coin.chain} address.`}
-          setting={coin.fallback_address}
-          disabled={locked}
-          onrevert={() => apply('payouts', { fallback_addresses: { [coin.key]: null } }, 'Reverted')}
-        >
-          <input class="field mono" type="text" bind:value={fallback[coin.key]} disabled={locked} spellcheck="false" />
-        </Field>
+      {#each groups as g (g.lane.key)}
+        {#if multiLane}<h3>{laneTitle(g.lane.key)} lane</h3>{/if}
+        {#each g.coins as coin (coin.key)}
+          <Field
+            label="{coin.symbol} fallback address"
+            hint={fallbackHint(coin)}
+            setting={coin.fallback_address}
+            disabled={locked || !coin.connected}
+            onrevert={() => apply('payouts', { fallback_addresses: { [coin.key]: null } }, 'Reverted')}
+          >
+            <input
+              class="field mono"
+              type="text"
+              bind:value={fallback[coin.key]}
+              disabled={locked || !coin.connected}
+              spellcheck="false"
+            />
+          </Field>
+        {/each}
       {/each}
       <div class="actions">
         <button class="primary" onclick={savePayouts} disabled={locked || !payoutsDirty}>
           {busy === 'payouts' ? 'Saving…' : 'Save'}
         </button>
-        {@render note('payouts')}
+        {@render noteFor('payouts')}
       </div>
     </section>
 
     <section class="panel">
       <h2>Nodes</h2>
       <p class="lead muted">
-        Endpoints and credentials come from <code>alamo.toml</code>; on Umbrel the Litecoin and Dogecoin
-        apps supply them. They are not editable here because the dashboard has no login of its own.
+        Endpoints and credentials come from <code>alamo.toml</code>; on Umbrel the node apps supply them.
+        They are not editable here because the dashboard has no login of its own.
       </p>
-      <div class="cards">
-        {#each doc.coins as coin (coin.key)}
-          <NodeCard {coin} live={liveCoin(coin.symbol)} />
-        {/each}
-      </div>
+      {#each groups as g (g.lane.key)}
+        {#if multiLane}
+          {@const live = liveLane(g.lane.key)}
+          <h3>
+            {laneTitle(g.lane.key)} lane
+            <span class="muted">
+              {live ? `${algorithmLabel(live.algorithm)} · ` : ''}port {portOf(g.lane.stratum_listen)}
+            </span>
+          </h3>
+        {/if}
+        <div class="cards">
+          {#each g.coins as coin (coin.key)}
+            <NodeCard {coin} live={liveCoin(coin.lane, coin.symbol)} laneState={liveLane(coin.lane)?.state} />
+          {/each}
+        </div>
+      {/each}
     </section>
 
-    <section class="panel">
-      <h2>Mining</h2>
-      <p class="lead muted">
-        Variable difficulty, in the units miners display (for scrypt, difficulty 65536 is one unit of
-        network difficulty). Changes apply to miners that connect from now on.
-      </p>
-      <div class="two-col">
-        {#each vardiffFields as f (f.key)}
-          <Field
-            label={f.label}
-            hint={f.hint}
-            setting={doc.vardiff[f.key]}
-            disabled={locked}
-            onrevert={() => apply('mining', { vardiff: { [f.key]: null } }, 'Reverted')}
-          >
-            <input class="field num" type="number" inputmode="decimal" step="any" bind:value={vardiff[f.key]} disabled={locked} />
-          </Field>
-        {/each}
-      </div>
-      <div class="actions">
-        <button class="primary" onclick={saveMining} disabled={locked || !miningDirty}>
-          {busy === 'mining' ? 'Saving…' : 'Save'}
-        </button>
-        {@render note('mining')}
-      </div>
-    </section>
+    {#if !btcConfigured}
+      <section class="panel">
+        <h2>Bitcoin is not configured</h2>
+        <p class="lead muted">
+          To solo-mine Bitcoin on its own SHA-256 port, add this to <code>alamo.toml</code> (see
+          <code>config/alamo.example.toml</code> for the optional vardiff table) and restart the pool. Node
+          endpoints and credentials can only be set in the file, because the dashboard's API has no
+          authentication.
+        </p>
+        <pre class="config">{btcSnippet}</pre>
+      </section>
+    {/if}
+
+    {#each doc.lanes as l (l.key)}
+      {@const section = `mining:${l.key}`}
+      <VardiffCard
+        title={vardiffTitle(l)}
+        lead={vardiffLead(l)}
+        vardiff={l.vardiff}
+        disabled={locked}
+        busy={busy === section}
+        onsave={(changes) =>
+          apply(section, { lanes: { [l.key]: { vardiff: changes } } }, 'Saved; applies to miners that connect from now on')}
+        onrevert={(field) => apply(section, { lanes: { [l.key]: { vardiff: { [field]: null } } } }, 'Reverted')}
+        oninvalid={(text) => (notice[section] = { kind: 'bad', text })}
+      >
+        {#snippet note()}
+          {@render noteFor(section)}
+        {/snippet}
+      </VardiffCard>
+    {/each}
 
     <section class="panel">
       <h2>Data</h2>
-      <div class="row">
-        <div>
-          <strong>Share counts and best share</strong>
-          <p class="hint">Zero every worker's accepted and rejected counts and the best share. Hashrate history, accepted work, rounds, and blocks are kept.</p>
+      {#each doc.lanes as l (l.key)}
+        <div class="row">
+          <div>
+            <strong>Share counts and best share{multiLane ? ` — ${laneTitle(l.key)} lane` : ''}</strong>
+            <p class="hint">
+              {#if multiLane}
+                Zero the accepted and rejected counts of every worker in this lane, and the lane's best share; other
+                lanes are untouched. Hashrate history, accepted work, rounds, and blocks are kept.
+              {:else}
+                Zero every worker's accepted and rejected counts and the best share. Hashrate history, accepted work,
+                rounds, and blocks are kept.
+              {/if}
+            </p>
+          </div>
+          <button
+            class="danger"
+            onclick={() => resetStats(l.key)}
+            disabled={readOnly || resetting !== null}
+            aria-label={multiLane ? `Reset share counts of the ${laneTitle(l.key)} lane` : undefined}
+          >
+            {resetting === l.key ? 'Resetting…' : 'Reset'}
+          </button>
         </div>
-        <button class="danger" onclick={resetStats} disabled={readOnly || resetting}>
-          {resetting ? 'Resetting…' : 'Reset'}
-        </button>
-      </div>
+      {/each}
       <div class="row">
         <div>
           <strong>Database backup</strong>
@@ -305,7 +381,7 @@
         </div>
         <a class="ghost" href={downloads.backup} download>Download</a>
       </div>
-      {@render note('data')}
+      {@render noteFor('data')}
     </section>
 
     <section class="panel">
@@ -331,7 +407,7 @@
           {/each}
         </select>
       </Field>
-      {@render note('logs')}
+      {@render noteFor('logs')}
       <div class="row">
         <div>
           <strong>Log</strong>
@@ -404,10 +480,18 @@
     display: grid;
     gap: 0.75rem;
   }
-  .two-col {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
-    column-gap: 1.25rem;
+  h3 {
+    margin: 1.1rem 0 0.6rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+  }
+  h3:first-of-type {
+    margin-top: 0;
+  }
+  h3 .muted {
+    font-weight: 400;
+    font-size: 0.82rem;
+    margin-left: 0.35rem;
   }
   .row {
     display: flex;

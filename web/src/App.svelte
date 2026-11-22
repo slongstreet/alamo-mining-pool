@@ -2,7 +2,10 @@
   import { onMount } from 'svelte';
   import { LiveStatus } from './lib/live.svelte';
   import { ThemePreference } from './lib/theme.svelte';
+  import { parseHash, pickLane, rememberLane, rememberedLane } from './lib/lanes';
   import Header from './lib/components/Header.svelte';
+  import LaneCards from './lib/components/LaneCards.svelte';
+  import LaneNotice from './lib/components/LaneNotice.svelte';
   import StatTiles from './lib/components/StatTiles.svelte';
   import OddsPanel from './lib/components/OddsPanel.svelte';
   import HashrateChart from './lib/components/HashrateChart.svelte';
@@ -15,9 +18,11 @@
   const theme = new ThemePreference();
   theme.apply();
 
-  // Two pages, told apart by the hash so the daemon serves one document for both.
+  // Pages and lanes are told apart by the hash, so the daemon serves one document for all
+  // of them and back/forward move between lanes.
   let hash = $state(location.hash);
-  const page = $derived(hash.startsWith('#/settings') ? 'settings' : 'dashboard');
+  const route = $derived(parseHash(hash));
+  const page = $derived(route.page);
 
   onMount(() => {
     live.start();
@@ -31,7 +36,21 @@
 
   const status = $derived(live.status);
   const now = $derived(status?.now ?? Math.floor(Date.now() / 1000));
-  const workerNames = $derived(status?.workers.map((w) => w.name) ?? []);
+  const lanes = $derived(status?.lanes ?? []);
+  const multiLane = $derived(lanes.length > 1);
+  const lane = $derived(
+    pickLane(lanes, route.page === 'dashboard' ? route.lane : null, rememberedLane()),
+  );
+  const workerNames = $derived(lane?.workers.map((w) => w.name) ?? []);
+
+  // A lane named in the hash is the one to come back to.
+  $effect(() => {
+    if (route.page === 'dashboard' && route.lane && lane?.key === route.lane) rememberLane(lane.key);
+  });
+
+  function select(key: string) {
+    location.hash = `#/${encodeURIComponent(key)}`;
+  }
 </script>
 
 <main>
@@ -39,28 +58,44 @@
 
   {#if page === 'settings'}
     <SettingsPage {status} />
-  {:else if status}
+  {:else if status && lane}
     <div class="grid">
-      <StatTiles {status} />
+      {#if multiLane}
+        <LaneCards {lanes} selected={lane.key} onselect={select} />
+      {/if}
+      {#if lane.state === 'failed'}
+        <LaneNotice {lane} />
+      {/if}
+
+      <StatTiles {lane} {now} {multiLane} />
+
+      {#if lane.state === 'connecting'}
+        <LaneNotice {lane} />
+      {:else if lane.state === 'running'}
+        <div class="grid two">
+          {#each lane.coins as coin (coin.symbol)}
+            <OddsPanel {coin} bestShare={lane.best_share_difficulty} {now} scoringSince={lane.scoring_since} />
+          {/each}
+          {#if lane.coins.length === 0}
+            <section class="panel">
+              <h2>Block odds</h2>
+              <div class="empty">Waiting for the first block template from the node.</div>
+            </section>
+          {/if}
+        </div>
+      {/if}
+
+      <HashrateChart
+        live={lane.hashrate}
+        workers={workerNames}
+        lane={lane.key}
+        allLabel={multiLane ? 'Lane' : 'Pool'}
+      />
+      <WorkerTable {lane} />
 
       <div class="grid two">
-        {#each status.coins as coin (coin.symbol)}
-          <OddsPanel {coin} bestShare={status.best_share_difficulty} {now} scoringSince={status.scoring_since} />
-        {/each}
-        {#if status.coins.length === 0}
-          <section class="panel">
-            <h2>Block odds</h2>
-            <div class="empty">Waiting for the first block template from the node.</div>
-          </section>
-        {/if}
-      </div>
-
-      <HashrateChart live={status.hashrate} workers={workerNames} />
-      <WorkerTable workers={status.workers} stratumPort={status.stratum_port} coins={status.coins} />
-
-      <div class="grid two">
-        <ShareLog {now} shareMultiplier={status.share_multiplier} />
-        <BlockHistory blocks={status.blocks} coins={status.coins} {now} />
+        <ShareLog {now} lane={lane.key} shareMultiplier={lane.share_multiplier} />
+        <BlockHistory blocks={status.blocks} {lanes} {now} />
       </div>
     </div>
   {:else}

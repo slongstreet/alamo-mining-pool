@@ -29,12 +29,15 @@ pub fn block_rate(hashrate: f64, difficulty: f64) -> f64 {
 }
 
 /// Probability of finding at least one block within `seconds`.
+///
+/// `-expm1(-x)` rather than `1 - exp(-x)`: a home miner on Bitcoin has chances far below
+/// `f64::EPSILON` per hour, which the subtraction would round to exactly zero.
 pub fn probability_within(hashrate: f64, difficulty: f64, seconds: f64) -> f64 {
     let rate = block_rate(hashrate, difficulty);
     if rate == 0.0 || seconds <= 0.0 {
         return 0.0;
     }
-    1.0 - (-rate * seconds).exp()
+    -(-rate * seconds).exp_m1()
 }
 
 /// Expected seconds until the next block. Infinite when hashrate is zero.
@@ -117,6 +120,16 @@ mod tests {
             1.0 - (-1.0f64).exp(),
             1e-12
         ));
+    }
+
+    #[test]
+    fn long_shots_keep_their_precision() {
+        // 1 MH/s against a Bitcoin-sized difficulty: about 8e-15 blocks an hour.
+        let (hashrate, difficulty) = (1e6, 1e14);
+        let rate = block_rate(hashrate, difficulty);
+        let p = probability_within(hashrate, difficulty, HOUR);
+        assert!(p > 0.0);
+        assert!(approx(p / (rate * HOUR), 1.0, 1e-9), "{p}");
     }
 
     #[test]

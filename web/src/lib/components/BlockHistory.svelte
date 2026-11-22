@@ -1,8 +1,16 @@
 <script lang="ts">
-  import type { BlockRow, CoinStatus } from '../api';
+  import type { BlockRow, LaneStatus } from '../api';
   import { formatAgo, formatClock, formatCoins, formatDifficulty, shortHash, shortWorker } from '../format';
 
-  let { blocks, coins, now }: { blocks: BlockRow[]; coins: CoinStatus[]; now: number } = $props();
+  /** Every lane's blocks: they are rare, so the history stays global with a coin column. */
+  let { blocks, lanes, now }: { blocks: BlockRow[]; lanes: LaneStatus[]; now: number } = $props();
+
+  /** Each lane's parent chain with a template, for what the next block pays. */
+  const parents = $derived(lanes.flatMap((l) => l.coins.slice(0, 1)));
+  /** Coin names by lane and ticker, from every lane. */
+  const names = $derived(
+    new Map(lanes.flatMap((l) => l.configured_coins.map((c) => [`${l.key}/${c.symbol}`, c.name] as const))),
+  );
 
   const classes: Record<BlockRow['status'], string> = {
     accepted: 'warn',
@@ -23,9 +31,9 @@
   {#if blocks.length === 0}
     <div class="empty">
       No blocks yet. When a share beats the network target it lands here with its confirmations.
-      {#if coins.length}
-        The next {coins[0].symbol} block pays {formatCoins(coins[0].coinbase_value, coins[0].symbol)}.
-      {/if}
+      {#each parents as c (c.symbol)}
+        The next {c.symbol} block pays {formatCoins(c.coinbase_value, c.symbol)}.
+      {/each}
     </div>
   {:else}
     <div class="scroll">
@@ -46,7 +54,7 @@
           {#each blocks as b (b.id)}
             <tr>
               <td class="muted num" title={formatClock(b.found_at)}>{formatAgo(b.found_at, now)}</td>
-              <td><span class="badge accent">{b.coin}</span></td>
+              <td><span class="badge accent" title={names.get(`${b.lane}/${b.coin}`) ?? b.coin}>{b.coin}</span></td>
               <td class="r num">{b.height.toLocaleString()}</td>
               <td class="mono" title={b.hash}>{shortHash(b.hash)}</td>
               <td class="mono worker" title={b.worker}>{shortWorker(b.worker)}</td>
