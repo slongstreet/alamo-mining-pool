@@ -22,7 +22,11 @@ listener, vardiff, payout tables, block submitter, confirmation trackers, statis
 accounting. Every enabled coin without `merge_mined_with` is a lane, keyed by its
 (lower-case) config key; the key also scopes the lane's rows in the database. A parent
 listens on `[stratum]` unless it has a `[coins.<key>.stratum]` section; two lanes may not
-resolve to the same address.
+resolve to the same address. A lane's vardiff is the table in the section it uses, or,
+when that section has none, the built-in default for the parent's algorithm (scrypt or
+SHA-256d, whose share units differ by 2^16); a lane with its own section never inherits
+`[stratum.vardiff]`. The lane hands its stratum server the parent coin's version-rolling
+mask, so only a SHA-256d lane offers BIP310.
 
 Lanes start independently. Each connects its own nodes with retry and backoff and opens
 its listener once all of them answer, so a lane whose node is down or syncing never holds
@@ -65,9 +69,12 @@ odds math used by the dashboard. This crate is where the byte-exact code lives a
 known-answer tests are.
 
 ### alamo-coins
-The `Coin` abstraction and its implementations. A coin knows its PoW algorithm, its address
-formats, the `getblocktemplate` rules and block version it needs, its coinbase maturity,
-and any bytes its blocks carry after the transactions (Litecoin MWEB). One `TemplateSource`
+The `Coin` abstraction and its implementations: Bitcoin (`btc`), Litecoin (`ltc`), and
+Dogecoin (`doge`). A coin knows its PoW algorithm, its address formats, the
+`getblocktemplate` rules and block version it needs, its coinbase maturity, any bytes its
+blocks carry after the transactions (Litecoin MWEB), the header version bits miners may
+roll (Bitcoin: BIP320's `0x1fffe000`; none for the scrypt coins), and any network it
+cannot mine (Bitcoin refuses signet, whose templates need a rule the pool does not send). One `TemplateSource`
 per node polls the tip and publishes `Arc<WorkTemplate>` on a `watch` channel; `merge`
 combines the parent's stream with the aux streams into `Arc<MergedWork>`. A parent tip
 change is a clean job; an aux tip change is a non-clean job, so parent shares in flight
@@ -96,7 +103,11 @@ template prefix and the extranonce. Share validation rebuilds the parent header,
 it once, and compares against the share target, the parent target, and every aux target;
 each target met yields a `BlockCandidate` (the aux ones wrapped in an `AuxPow`). Sessions
 track extranonce1, authorized workers, current difficulty, the last few jobs (for late
-shares), and per-job seen-share sets. Vardiff adjusts per-session difficulty toward a
+shares), per-job seen-share sets, and the BIP310 version-rolling mask negotiated with
+`mining.configure` (the miner's mask ANDed with the lane's). A share's optional sixth
+parameter rolls the header version as `(job_version & !mask) | (bits & mask)`; bits
+outside the mask reject it, the version is part of the duplicate key, and a block is
+assembled from the rolled header. `d=<n>` in the password sets the starting difficulty. Vardiff adjusts per-session difficulty toward a
 target share interval. Session logic is pure (`Session::handle` returns effects), so it is
 unit-tested without sockets.
 

@@ -72,16 +72,34 @@ fallback_address = "DExampleExampleExampleExampleExampl"
 # node is still syncing never keeps another's miners out. A parent uses [stratum] above
 # unless it has a section of its own; two parents cannot share a listen address. A
 # merge-mined coin has no section: its miners connect to the parent. If the vardiff
-# table is present it must name all six fields; without it the built-in defaults apply.
-# The dashboard's vardiff overrides for such a lane are stored as
-# coins.<key>.stratum.vardiff.<field>.
+# table is present it must name all six fields. Without one (here or in [stratum]) a lane
+# gets its algorithm's built-in values: for scrypt the ones in [stratum.vardiff] above,
+# for SHA-256d (BTC) initial 1024, min 0.001, max 4294967296, target 10 s, retarget 60 s,
+# variance 30 %. A lane with its own section never uses [stratum.vardiff], whose numbers
+# are in another algorithm's units. The dashboard's vardiff overrides for such a lane are
+# stored as coins.<key>.stratum.vardiff.<field>.
+
+# Bitcoin solo mining, a second lane on its own port. Needs a fully synced bitcoind with
+# RPC (and, optionally, -zmqpubhashblock). Miners connect with a BTC address (bc1q...,
+# bc1p..., 1..., 3...) as username and any password; "d=<n>" in the password sets the
+# starting difficulty. Version rolling (BIP310, mask 1fffe000) is offered on this lane.
+# Signet is not supported.
 #
-# [coins.<key>.stratum]
+# [coins.btc]
+# enabled = true
+# rpc_url = "http://127.0.0.1:8332"
+# rpc_user = "alamo"
+# rpc_password = "${BTC_RPC_PASSWORD}"
+# zmq_hashblock = "tcp://127.0.0.1:28334"
+# fallback_address = "bc1qexampleexampleexampleexampleexampleexamp"
+#
+# [coins.btc.stratum]
 # listen = "0.0.0.0:3334"
-# [coins.<key>.stratum.vardiff]
-# initial_difficulty = 65536
-# min_difficulty = 1024
-# max_difficulty = 16777216
+# # Optional; if present, every field. Values are SHA-256d share difficulties.
+# [coins.btc.stratum.vardiff]
+# initial_difficulty = 1024
+# min_difficulty = 0.001
+# max_difficulty = 4294967296
 # target_share_seconds = 10
 # retarget_seconds = 60
 # variance_percent = 30

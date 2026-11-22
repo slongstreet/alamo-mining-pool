@@ -380,3 +380,78 @@ fallback_address = "{ltc_fallback}"
     );
     let _ = std::fs::remove_dir_all(&data_dir);
 }
+
+/// A Bitcoin node on signet fails the BTC lane at connect with a message that says why,
+/// and the LTC lane keeps mining.
+#[tokio::test]
+async fn a_bitcoin_lane_on_signet_fails_alone() {
+    let data_dir = std::env::temp_dir().join(format!("alamo-lanes-signet-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let ltc_node = stub_node("regtest").await;
+    let btc_node = stub_node("signet").await;
+    let (ltc_port, btc_port) = (free_port(), free_port());
+    let ltc_fallback = encode_segwit("rltc", 0, &[0x22; 20]).unwrap();
+    // Valid on signet (tb), so the only thing wrong is the network itself.
+    let btc_fallback = encode_segwit("tb", 1, &[0x33; 32]).unwrap();
+    let config = Config::parse(&format!(
+        r#"
+[pool]
+name = "lanes test"
+data_dir = "{}"
+[stratum]
+listen = "127.0.0.1:{ltc_port}"
+[web]
+listen = "127.0.0.1:0"
+[coins.ltc]
+rpc_url = "http://{ltc_node}"
+rpc_user = "u"
+rpc_password = "p"
+fallback_address = "{ltc_fallback}"
+[coins.btc]
+rpc_url = "http://{btc_node}"
+rpc_user = "u"
+rpc_password = "p"
+fallback_address = "{btc_fallback}"
+[coins.btc.stratum]
+listen = "127.0.0.1:{btc_port}"
+"#,
+        data_dir.display()
+    ))
+    .unwrap();
+    let store = alamo_store::Store::open(&config.database_path())
+        .await
+        .unwrap();
+    let state = alamo_web::AppState::new("lanes test", ltc_port, store.clone());
+    let shutdown = CancellationToken::new();
+    let pool = tokio::spawn(alamo::pool::run(
+        config,
+        store,
+        state.clone(),
+        log(),
+        shutdown.clone(),
+    ));
+
+    let lanes = wait_for_lanes(&state, |l| {
+        l.iter()
+            .any(|l| l.key == "ltc" && l.state == alamo_web::LaneState::Running)
+            && l.iter()
+                .any(|l| l.key == "btc" && l.state == alamo_web::LaneState::Failed)
+    })
+    .await;
+    let btc = lanes.iter().find(|l| l.key == "btc").unwrap();
+    let error = btc.error.as_deref().unwrap();
+    assert!(error.contains("lane 'btc'"), "{error}");
+    assert!(error.contains("coins.btc node is on signet"), "{error}");
+    assert!(error.contains("'signet' rule"), "{error}");
+    assert!(TcpStream::connect(("127.0.0.1", ltc_port)).await.is_ok());
+    assert!(TcpStream::connect(("127.0.0.1", btc_port)).await.is_err());
+    assert!(!pool.is_finished(), "the healthy lane keeps the daemon up");
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), pool)
+        .await
+        .expect("the pool did not stop")
+        .unwrap()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&data_dir);
+}

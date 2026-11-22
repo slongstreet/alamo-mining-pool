@@ -155,6 +155,9 @@ async fn connect_node(
             }
         }
     };
+    if let Some(why) = coin.unsupported_network(&info.chain) {
+        bail!("coins.{key} node is on {}: {why}", info.chain);
+    }
     let chain =
         Chain::parse(&info.chain).with_context(|| format!("unknown chain '{}'", info.chain))?;
     tracing::info!(coin = coin.symbol(), %chain, height = info.blocks, "node connected");
@@ -704,6 +707,7 @@ async fn start_lane(task: &LaneTask) -> anyhow::Result<Option<StartedLane>> {
             work: work_rx.clone(),
             events: task.events.clone(),
             blocks: blocks_tx,
+            version_mask: chains.parent.coin.version_rolling_mask(),
         }
         .bind()
         .await

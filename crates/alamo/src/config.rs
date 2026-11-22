@@ -1,6 +1,7 @@
 //! Top-level configuration file.
 
 use alamo_coins::CoinConfig;
+use alamo_core::Algorithm;
 use alamo_stratum::{StratumConfig, VardiffConfig};
 use alamo_web::WebConfig;
 use anyhow::{bail, Context};
@@ -80,16 +81,28 @@ impl Config {
         self.coins
             .iter()
             .filter(|(_, c)| c.enabled && c.merge_mined_with.is_none())
-            .map(|(key, coin)| LaneConfig {
-                key: key.clone(),
-                aux: self
-                    .coins
-                    .iter()
-                    .filter(|(_, c)| c.enabled && c.merge_mined_with.as_deref() == Some(key))
-                    .map(|(k, _)| k.clone())
-                    .collect(),
-                own_stratum: coin.stratum.is_some(),
-                stratum: coin.stratum.clone().unwrap_or_else(|| self.stratum.clone()),
+            .map(|(key, coin)| {
+                let stratum = coin.stratum.clone().unwrap_or_else(|| self.stratum.clone());
+                // Validation refuses unknown keys, so the fallback is never used.
+                let algorithm = alamo_coins::builtin(key)
+                    .map(|c| c.algorithm())
+                    .unwrap_or(Algorithm::Scrypt);
+                LaneConfig {
+                    key: key.clone(),
+                    aux: self
+                        .coins
+                        .iter()
+                        .filter(|(_, c)| c.enabled && c.merge_mined_with.as_deref() == Some(key))
+                        .map(|(k, _)| k.clone())
+                        .collect(),
+                    own_stratum: coin.stratum.is_some(),
+                    algorithm,
+                    vardiff: stratum
+                        .vardiff
+                        .clone()
+                        .unwrap_or_else(|| VardiffConfig::default_for(algorithm)),
+                    stratum,
+                }
             })
             .collect()
     }
@@ -129,10 +142,9 @@ impl Config {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        self.stratum
-            .vardiff
-            .validate()
-            .map_err(anyhow::Error::msg)?;
+        if let Some(vardiff) = &self.stratum.vardiff {
+            vardiff.validate().map_err(anyhow::Error::msg)?;
+        }
 
         let enabled: Vec<&str> = self
             .coins
@@ -145,7 +157,10 @@ impl Config {
         }
         for (key, coin) in &self.coins {
             if alamo_coins::builtin(key).is_none() {
-                bail!("unknown coin '{key}' under [coins]; supported: ltc, doge");
+                bail!(
+                    "unknown coin '{key}' under [coins]; supported: {}",
+                    alamo_coins::BUILTIN_KEYS.join(", ")
+                );
             }
             if let (Some(parent), Some(_)) = (&coin.merge_mined_with, &coin.stratum) {
                 bail!(
@@ -175,8 +190,7 @@ impl Config {
         }
         for lane in &lanes {
             if lane.own_stratum {
-                lane.stratum
-                    .vardiff
+                lane.vardiff
                     .validate_at(&lane.vardiff_path())
                     .map_err(anyhow::Error::msg)?;
             }
@@ -211,6 +225,13 @@ pub struct LaneConfig {
     pub own_stratum: bool,
     /// The stratum section in force for this lane.
     pub stratum: StratumConfig,
+    /// The parent coin's proof-of-work algorithm.
+    pub algorithm: Algorithm,
+    /// The vardiff the file gives this lane: the table in `stratum` if it has one, else
+    /// the built-in default for `algorithm`. A lane with its own `[coins.<key>.stratum]`
+    /// section never inherits `[stratum.vardiff]`, which is in another algorithm's units
+    /// when the lanes differ.
+    pub vardiff: VardiffConfig,
 }
 
 impl LaneConfig {
@@ -229,9 +250,9 @@ impl LaneConfig {
         !self.aux.is_empty()
     }
 
-    /// The lane's file vardiff.
+    /// The lane's file vardiff: the `vardiff` field.
     pub fn vardiff(&self) -> &VardiffConfig {
-        &self.stratum.vardiff
+        &self.vardiff
     }
 }
 
@@ -291,6 +312,7 @@ fn expand_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alamo_coins::Coin;
 
     #[test]
     fn expands_env_references() {
@@ -321,6 +343,18 @@ mod tests {
         assert_eq!(cfg.coins.len(), 2);
         assert_eq!(cfg.coins["doge"].merge_mined_with.as_deref(), Some("ltc"));
         assert_eq!(cfg.stratum.listen.port(), 3333);
+    }
+
+    #[test]
+    fn regtest_config_parses_with_a_bitcoin_lane() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/alamo.regtest.toml");
+        let cfg = Config::load(&path).unwrap();
+        let lanes = cfg.lanes();
+        let btc = lanes.iter().find(|l| l.key == "btc").unwrap();
+        assert_eq!(btc.algorithm, Algorithm::Sha256d);
+        assert_eq!(btc.stratum.listen.port(), 3334);
+        let params = alamo_coins::Bitcoin.address_params(alamo_coins::Chain::Regtest);
+        alamo_core::address::payout_script(&cfg.coins["btc"].fallback_address, &params).unwrap();
     }
 
     #[test]
@@ -428,6 +462,62 @@ variance_percent = 20"#,
     }
 
     #[test]
+    fn vardiff_defaults_follow_the_lane_algorithm_when_no_table_is_written() {
+        let btc = |extra: &str| {
+            coin(
+                "btc",
+                &format!("[coins.btc.stratum]\nlisten = \"0.0.0.0:3334\"\n{extra}"),
+            )
+        };
+        let lane =
+            |cfg: &Config, key: &str| cfg.lanes().into_iter().find(|l| l.key == key).unwrap();
+
+        // No table anywhere: each lane gets its own algorithm's built-in values.
+        let cfg = parse(&[coin("ltc", ""), btc("")]).unwrap();
+        assert_eq!(lane(&cfg, "ltc").vardiff(), &VardiffConfig::SCRYPT);
+        assert_eq!(lane(&cfg, "btc").algorithm, Algorithm::Sha256d);
+        assert_eq!(lane(&cfg, "btc").vardiff(), &VardiffConfig::SHA256D);
+        assert!(cfg.stratum.vardiff.is_none());
+
+        // A BTC-only pool on [stratum] gets the SHA-256d values too.
+        let cfg = parse(&[coin("btc", "")]).unwrap();
+        assert_eq!(lane(&cfg, "btc").vardiff(), &VardiffConfig::SHA256D);
+        assert_eq!(lane(&cfg, "btc").vardiff_path(), "stratum.vardiff");
+
+        // A [stratum.vardiff] table is used as written, even when it spells out the scrypt
+        // defaults: absent and default are different things.
+        let table = "[stratum.vardiff]\ninitial_difficulty = 65536\nmin_difficulty = 1024\n\
+                     max_difficulty = 16777216\ntarget_share_seconds = 10\nretarget_seconds = 60\n\
+                     variance_percent = 30\n";
+        let cfg = Config::parse(&format!("{HEAD}{table}{}", coin("btc", ""))).unwrap();
+        assert_eq!(lane(&cfg, "btc").vardiff(), &VardiffConfig::SCRYPT);
+        // ...but it does not reach a lane with its own section, which is in other units.
+        let cfg = Config::parse(&format!("{HEAD}{table}{}{}", coin("ltc", ""), btc(""))).unwrap();
+        assert_eq!(lane(&cfg, "ltc").vardiff(), &VardiffConfig::SCRYPT);
+        assert_eq!(lane(&cfg, "btc").vardiff(), &VardiffConfig::SHA256D);
+
+        // Fractional values are fine in a table.
+        let cfg = parse(&[
+            coin("ltc", ""),
+            btc(
+                "[coins.btc.stratum.vardiff]\ninitial_difficulty = 0.5\nmin_difficulty = 0.001\n\
+                 max_difficulty = 1e9\ntarget_share_seconds = 10\nretarget_seconds = 60\n\
+                 variance_percent = 30",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(lane(&cfg, "btc").vardiff().min_difficulty, 0.001);
+        assert_eq!(lane(&cfg, "btc").vardiff().initial_difficulty, 0.5);
+
+        // The redacted copy keeps an absent table absent.
+        let cfg = parse(&[coin("ltc", ""), btc("")]).unwrap();
+        let text = cfg.redacted_toml();
+        assert!(!text.contains("vardiff"), "{text}");
+        let again = Config::parse(&text).unwrap();
+        assert_eq!(lane(&again, "btc").vardiff(), &VardiffConfig::SHA256D);
+    }
+
+    #[test]
     fn primary_lane_falls_back_to_the_first_key() {
         let cfg = parse(&[
             coin("ltc", "[coins.ltc.stratum]\nlisten = \"0.0.0.0:3335\""),
@@ -447,12 +537,16 @@ variance_percent = 20"#,
                 aux: vec![],
                 own_stratum: false,
                 stratum: cfg.stratum.clone(),
+                algorithm: Algorithm::Scrypt,
+                vardiff: VardiffConfig::default(),
             },
             LaneConfig {
                 key: "ltc".into(),
                 aux: vec![],
                 own_stratum: false,
                 stratum: cfg.stratum.clone(),
+                algorithm: Algorithm::Scrypt,
+                vardiff: VardiffConfig::default(),
             },
         ];
         assert_eq!(Config::primary_lane_index(&lanes), 0);

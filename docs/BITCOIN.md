@@ -1,6 +1,8 @@
 # Bitcoin solo mining — design
 
-Status: proposed (Wave 7 in [ROADMAP.md](ROADMAP.md)). Nothing here is implemented yet.
+Status: Wave 7 in [ROADMAP.md](ROADMAP.md). Lanes (1, 2, 6, 7), the Bitcoin coin (3),
+version rolling (4), vardiff (5), and the proof (8) are implemented; the dashboard and
+settings UI below are not.
 
 Adding Bitcoin is mostly a runtime-shape problem, not a hashing problem.
 `Algorithm::Sha256d` already exists, but the daemon assumes exactly one parent chain
@@ -21,8 +23,7 @@ a vardiff that copes with ASIC-scale hashrate.
 ### What blocks Bitcoin today
 - ~~**One parent only.**~~ Done: every enabled parent is a lane with its own listener and
   vardiff (`[coins.<key>.stratum]`), started independently.
-- **No version rolling.** `mining.configure` answers `version-rolling: false`
-  (`crates/alamo-stratum/src/session.rs`). Modern SHA-256 ASICs expect BIP310.
+- ~~**No version rolling.**~~ Done: a Bitcoin lane negotiates BIP310 (section 4).
 - ~~**Stats are global.**~~ Done: one `Stats` per lane, each with its own
   `share_multiplier`, and the API and metrics show every lane (section 7).
 - ~~**Storage has no lane.**~~ Done: migration 0008 (section 6).
@@ -68,9 +69,9 @@ fallback_address = "bc1q..."
 listen = "0.0.0.0:3334"
 
 [coins.btc.stratum.vardiff]   # optional; if present, every field
-initial_difficulty = 2048
+initial_difficulty = 1024
 min_difficulty = 0.001
-max_difficulty = 1073741824
+max_difficulty = 4294967296
 target_share_seconds = 10
 retarget_seconds = 60
 variance_percent = 30
@@ -89,36 +90,69 @@ variance_percent = 30
   valid address would have no unambiguous fallback lane.
 
 ### 3. Bitcoin coin
-`crates/alamo-coins/src/btc.rs`:
+`crates/alamo-coins/src/btc.rs`, registered as `btc`:
 
 | Property | Value |
 | --- | --- |
 | Symbol / name | `BTC` / Bitcoin |
-| Algorithm | `Sha256d` |
+| Algorithm | `Sha256d` (share multiplier 1) |
 | Aux chain id | none |
 | Template rules | `["segwit"]` |
 | Coinbase maturity | 100 |
 | Addresses, main | P2PKH 0, P2SH 5, hrp `bc` |
 | Addresses, test | P2PKH 111, P2SH 196, hrp `tb` |
 | Addresses, regtest | P2PKH 111, P2SH 196, hrp `bcrt` |
+| Version rolling mask | `0x1fffe000` (BIP320) |
 
-Signet needs the extra `signet` template rule and is left out of the first cut.
+Bech32m (taproot, `bc1p…`) payouts work through the existing witness v1+ handling; the
+tests use BIP350's and BIP86's vectors. Testnet3 (`test`) and testnet4 (`testnet4`) share
+the `tb` parameters. Signet is refused: `Coin::unsupported_network` makes a node reporting
+`chain = "signet"` fail the BTC lane at connect with a message that says why (signet
+templates need the `signet` rule and a signet solution in the coinbase). Like any lane
+start failure it fails that lane alone.
 
 ### 4. BIP310 version rolling (SHA-256 lanes only)
-- `mining.configure` answers `version-rolling: true` with
-  `version-rolling.mask = miner_mask & 0x1fffe000`. Scrypt lanes keep answering `false`.
-- `mining.submit` takes the optional sixth parameter (version bits). Bits outside the
-  negotiated mask reject the share; the header version is
-  `(job_version & !mask) | (bits & mask)`.
-- The per-job duplicate key gains the version, and the rolled version goes into the
-  assembled block.
+The capability comes from the coin: `Coin::version_rolling_mask()` (default 0) is handed to
+the lane's `StratumServer`, and a session offers version rolling only when it is non-zero.
+
+- `mining.configure` may arrive before or after subscribe and authorize. Every requested
+  extension gets an answer: `version-rolling` gets `true` with `version-rolling.mask` =
+  miner mask AND `0x1fffe000` as 8 hex digits, every other extension `false`. A missing
+  miner mask means `ffffffff` (BIP310's default). If the shared mask is empty the answer is
+  `false` and the miner hashes without rolling. `version-rolling.min-bit-count` is
+  diagnostic (BIP310): a non-empty mask with fewer bits than the miner asked for is still
+  granted, and the shortfall is logged at info level. A malformed mask gets an error
+  string, as BIP310 allows. Scrypt lanes
+  answer `{"version-rolling": false}` to every configure, exactly as before.
+- `mining.submit` takes an optional sixth parameter, the version bits (hex). Any bit
+  outside the session's negotiated mask (zero before a successful configure) rejects the
+  share with `invalid_version_bits` ("Invalid version bits", code 20). The header version
+  is `(job_version & !mask) | (bits & mask)` (`alamo_core::header::rolled_version`); no
+  sixth parameter hashes the job's version. A scrypt lane ignores a sixth parameter.
+- The per-job duplicate key is `(extranonce2, ntime, nonce, version)`, and the candidate
+  block is assembled from the rolled header. Nothing is allocated per share for this.
+- No `mining.set_version_mask`: the lane's mask never changes.
+
+Reference implementations differ from the BIP on the header formula: ckpool ORs the bits
+into the job version and public-pool XORs them. All three agree when the job version has
+no bits inside the mask, which is what Bitcoin Core templates carry today (BIP320 keeps
+deployments out of bits 13-28); the BIP's form is used here. Neither ckpool nor
+public-pool ANDs with the miner's mask or looks at `min-bit-count`.
 
 ### 5. Vardiff
 - Fast start is done (prework above).
-- Honour `d=<n>` in the stratum password as a starting difficulty. The miner setup hint
-  already mentions it; the code currently ignores it.
-- Fractional minimums already work in `Target::from_difficulty`, so very small devices
-  (NerdMiner class) are served by a low `min_difficulty`.
+- Built-in defaults depend on the lane's algorithm when no table is configured for it
+  (its own section's, or `[stratum.vardiff]` for a lane on `[stratum]`): scrypt keeps
+  65536 initial, 1024 to 16777216; SHA-256d starts at 1024 within 0.001 to 4294967296.
+  Both aim for a share every 10 s, retarget every 60 s, and allow 30 % variance.
+  `[stratum].vardiff` is now optional in the file so "absent" is distinguishable from a
+  table that happens to spell out the scrypt defaults; the settings page shows the
+  effective file values either way.
+- `d=<n>` in the stratum password sets a session's starting difficulty on any lane,
+  clamped to the lane's min and max, next to aux addresses (`doge=D…,d=4096`,
+  `D… d=4096`); values that are not positive numbers are ignored.
+- Fractional difficulties work end to end (`mining.set_difficulty`, share target, clamp);
+  `Target::from_difficulty` keeps 32 fractional bits.
 
 ### 6. Storage (migration 0008)
 - Add `lane` to `workers` (primary key becomes `(lane, name)`), `shares`, and
@@ -148,12 +182,20 @@ Signet needs the extra `signet` template rule and is left out of the first cut.
 ### 8. Proof
 Block construction must be byte-exact (see `CLAUDE.md`), so:
 
-- Known-answer tests in `alamo-core` against real mainnet data: a segwit block's header
-  hash, merkle root, and coinbase txid, plus a version-rolled header.
-- Regtest: add `bitcoind` to `deploy/regtest/docker-compose.yml` and a test that mines a
-  block through the stratum path with a rolled version and a segwit transaction in the
-  template, then checks the coinbase pays the worker's address. CI runs it alongside the
-  existing LTC/DOGE test.
+- Known-answer tests in `alamo-core` (`src/bitcoin_kat.rs`) against real mainnet data.
+  Block 699,412 (`crates/alamo-core/testdata/btc-699412.hex`, 7 transactions, 5 segwit):
+  header round trip, block hash, proof of work against its own bits, merkle root from the
+  coinbase branch, the coinbase's witness serialization rebuilt from stratum-style parts,
+  the witness commitment, and version rolling (`0x20000004` template version, bits
+  `0x0fffe000`, mask `0x1fffe000` give the mined `0x2fffe004`). Block 759,892's header
+  repeats the version-rolling check over a plain `0x20000000`.
+- Regtest: `bitcoind` (Bitcoin Core 32.1, SHA256-verified tarball) in
+  `deploy/regtest/docker-compose.yml`, `deploy/regtest/prepare-bitcoin.sh` to mature coins
+  and put a segwit transaction in the mempool, and `mines_bitcoin_blocks_with_version_rolling`
+  in `crates/alamo/tests/regtest.rs`: the whole pool with a BTC lane, `mining.configure`,
+  `d=` in the password, two CPU-mined blocks with non-zero rolled bits, checked in
+  bitcoind for the rolled version, the mempool segwit transaction, and coinbases paying a
+  bech32 and a bech32m address. CI runs it after the LTC/DOGE runs.
 
 ## User interface design
 

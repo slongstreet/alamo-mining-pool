@@ -4,7 +4,7 @@ use crate::events::BlockCandidate;
 use crate::job::{SessionJob, EXTRANONCE1_LEN, EXTRANONCE2_LEN};
 use alamo_core::auxpow::AuxPow;
 use alamo_core::hash::to_display_hex;
-use alamo_core::header::BlockHeader;
+use alamo_core::header::{rolled_version, BlockHeader};
 use alamo_core::job::{RejectReason, ShareOutcome};
 
 /// The fields of a `mining.submit`, already parsed from hex.
@@ -18,18 +18,23 @@ pub struct Submit<'a> {
     pub ntime: u32,
     /// Header nonce.
     pub nonce: u32,
+    /// BIP310 version bits (the optional sixth parameter); `None` hashes the job's own
+    /// version.
+    pub version_bits: Option<u32>,
 }
 
 /// Maximum seconds a share's ntime may be ahead of the current time.
 const MAX_FUTURE_NTIME: u64 = 7_200;
 
-/// Validate a submit against a session job and its extranonce1.
+/// Validate a submit against a session job and its extranonce1. `version_mask` is the
+/// version-rolling mask negotiated for the session (zero when none was).
 ///
 /// Returns the outcome and a block candidate for every chain whose target the share met.
 pub fn validate(
     job: &mut SessionJob,
     extranonce1: &[u8; EXTRANONCE1_LEN],
     submit: &Submit<'_>,
+    version_mask: u32,
     payout_address: &str,
     now_unix: u64,
 ) -> (ShareOutcome, Vec<BlockCandidate>) {
@@ -50,8 +55,21 @@ pub fn validate(
             Vec::new(),
         );
     }
+    let version = match submit.version_bits {
+        Some(bits) if bits & !version_mask != 0 => {
+            return (
+                ShareOutcome::Rejected(RejectReason::InvalidVersionBits),
+                Vec::new(),
+            );
+        }
+        Some(bits) => rolled_version(job.work.version, bits, version_mask),
+        None => job.work.version,
+    };
     let en2 = u32::from_be_bytes(submit.extranonce2[..].try_into().unwrap());
-    if !job.seen.insert((en2, submit.ntime, submit.nonce)) {
+    if !job
+        .seen
+        .insert((en2, submit.ntime, submit.nonce, version as u32))
+    {
         return (ShareOutcome::Rejected(RejectReason::Duplicate), Vec::new());
     }
 
@@ -61,7 +79,7 @@ pub fn validate(
 
     let coinbase_txid = job.coinbase.txid(&extranonce);
     let header = BlockHeader {
-        version: job.work.version,
+        version,
         prev_hash: job.work.prev_hash,
         merkle_root: job.work.merkle_root(&coinbase_txid),
         time: submit.ntime,
@@ -211,6 +229,7 @@ mod tests {
             extranonce2: vec![0, 0, 0, 1],
             ntime: 1_700_000_000,
             nonce,
+            version_bits: None,
         }
     }
 
@@ -219,7 +238,7 @@ mod tests {
         let nonce = (0u32..)
             .find(|&nonce| {
                 let (outcome, _) =
-                    validate(job, &[1, 2, 3, 4], &submit(nonce), "addr", 1_700_000_100);
+                    validate(job, &[1, 2, 3, 4], &submit(nonce), 0, "addr", 1_700_000_100);
                 !matches!(outcome, ShareOutcome::Rejected(RejectReason::LowDifficulty))
             })
             .unwrap();
@@ -231,8 +250,14 @@ mod tests {
     fn regtest_share_is_a_block_and_duplicates_are_rejected() {
         let mut j = job(TINY);
         let nonce = mine(&mut j);
-        let (outcome, block) =
-            validate(&mut j, &[1, 2, 3, 4], &submit(nonce), "addr", 1_700_000_100);
+        let (outcome, block) = validate(
+            &mut j,
+            &[1, 2, 3, 4],
+            &submit(nonce),
+            0,
+            "addr",
+            1_700_000_100,
+        );
         assert!(matches!(outcome, ShareOutcome::Block { .. }), "{outcome:?}");
         assert_eq!(block.len(), 1);
         let block = &block[0];
@@ -246,7 +271,14 @@ mod tests {
             .windows(8)
             .any(|w| w == [1, 2, 3, 4, 0, 0, 0, 1]));
 
-        let (dup, _) = validate(&mut j, &[1, 2, 3, 4], &submit(nonce), "addr", 1_700_000_100);
+        let (dup, _) = validate(
+            &mut j,
+            &[1, 2, 3, 4],
+            &submit(nonce),
+            0,
+            "addr",
+            1_700_000_100,
+        );
         assert_eq!(dup, ShareOutcome::Rejected(RejectReason::Duplicate));
     }
 
@@ -255,20 +287,20 @@ mod tests {
         let mut j = job(TINY);
         j.stale = true;
         assert_eq!(
-            validate(&mut j, &[0; 4], &submit(1), "a", 1_700_000_100).0,
+            validate(&mut j, &[0; 4], &submit(1), 0, "a", 1_700_000_100).0,
             ShareOutcome::Rejected(RejectReason::StaleJob)
         );
         let mut j = job(TINY);
         let mut s = submit(1);
         s.ntime = 1;
         assert_eq!(
-            validate(&mut j, &[0; 4], &s, "a", 1_700_000_100).0,
+            validate(&mut j, &[0; 4], &s, 0, "a", 1_700_000_100).0,
             ShareOutcome::Rejected(RejectReason::InvalidNtime)
         );
         let mut s = submit(1);
         s.extranonce2 = vec![0; 3];
         assert_eq!(
-            validate(&mut j, &[0; 4], &s, "a", 1_700_000_100).0,
+            validate(&mut j, &[0; 4], &s, 0, "a", 1_700_000_100).0,
             ShareOutcome::Rejected(RejectReason::InvalidExtranonce2)
         );
     }
@@ -278,8 +310,14 @@ mod tests {
         use alamo_core::auxpow::{decode_for_test, MERGED_MINING_MAGIC};
         let mut j = merged_job(TINY);
         let nonce = mine(&mut j);
-        let (outcome, blocks) =
-            validate(&mut j, &[1, 2, 3, 4], &submit(nonce), "addr", 1_700_000_100);
+        let (outcome, blocks) = validate(
+            &mut j,
+            &[1, 2, 3, 4],
+            &submit(nonce),
+            0,
+            "addr",
+            1_700_000_100,
+        );
         assert!(matches!(outcome, ShareOutcome::Block { .. }));
         assert_eq!(blocks.len(), 2);
         let (ltc, doge) = (&blocks[0], &blocks[1]);
@@ -323,15 +361,149 @@ mod tests {
         // A stale aux job still yields the parent block but no aux block.
         j.seen.clear();
         j.aux[0].stale = true;
-        let (_, blocks) = validate(&mut j, &[1, 2, 3, 4], &submit(nonce), "addr", 1_700_000_100);
+        let (_, blocks) = validate(
+            &mut j,
+            &[1, 2, 3, 4],
+            &submit(nonce),
+            0,
+            "addr",
+            1_700_000_100,
+        );
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].coin, "LTC");
+    }
+
+    /// A Bitcoin-shaped job at a SHA-256d share difficulty that every regtest block meets.
+    fn sha_job() -> SessionJob {
+        let mut work = WorkTemplate::regtest_sample(1, None);
+        work.coin = "BTC";
+        work.algorithm = alamo_core::Algorithm::Sha256d;
+        let work = Arc::new(work);
+        let coinbase = CoinbaseParts::build(&work, &[0x51], &[], 8).unwrap();
+        let difficulty = 1e-9;
+        SessionJob {
+            id: JobId(9),
+            target: work.algorithm.share_target(difficulty),
+            work,
+            coinbase,
+            aux: Vec::new(),
+            difficulty,
+            stale: false,
+            seen: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn rolled_version_bits_go_into_the_header_and_the_duplicate_key() {
+        const MASK: u32 = 0x1fff_e000;
+        let mut j = sha_job();
+        let rolled = |nonce, bits| Submit {
+            version_bits: Some(bits),
+            ..submit(nonce)
+        };
+        let bits = 0x0aaa_e000;
+        let nonce = (0u32..)
+            .find(|&n| {
+                let (outcome, _) = validate(
+                    &mut j,
+                    &[1, 2, 3, 4],
+                    &rolled(n, bits),
+                    MASK,
+                    "a",
+                    1_700_000_100,
+                );
+                !matches!(outcome, ShareOutcome::Rejected(RejectReason::LowDifficulty))
+            })
+            .unwrap();
+        j.seen.clear();
+        let (outcome, blocks) = validate(
+            &mut j,
+            &[1, 2, 3, 4],
+            &rolled(nonce, bits),
+            MASK,
+            "a",
+            1_700_000_100,
+        );
+        assert!(matches!(outcome, ShareOutcome::Block { .. }), "{outcome:?}");
+        // The block carries the rolled header, and its hash is that header's.
+        let header = BlockHeader::deserialize(blocks[0].block[..80].try_into().unwrap());
+        assert_eq!(header.version, 0x2aaa_e000);
+        assert_eq!(header.nonce, nonce);
+        assert_eq!(blocks[0].block_hash, to_display_hex(&header.block_hash()));
+        assert!(j
+            .target
+            .is_met_by(&alamo_core::hash::sha256d(&header.serialize())));
+
+        // The same nonce and bits again is a duplicate; other bits are another share.
+        assert_eq!(
+            validate(
+                &mut j,
+                &[1, 2, 3, 4],
+                &rolled(nonce, bits),
+                MASK,
+                "a",
+                1_700_000_100
+            )
+            .0,
+            ShareOutcome::Rejected(RejectReason::Duplicate)
+        );
+        assert_ne!(
+            validate(
+                &mut j,
+                &[1, 2, 3, 4],
+                &rolled(nonce, 0x0000_2000),
+                MASK,
+                "a",
+                1_700_000_100
+            )
+            .0,
+            ShareOutcome::Rejected(RejectReason::Duplicate)
+        );
+        // Without the sixth parameter the job's own version is hashed.
+        j.seen.clear();
+        let (_, blocks) = validate(
+            &mut j,
+            &[1, 2, 3, 4],
+            &submit(nonce),
+            MASK,
+            "a",
+            1_700_000_100,
+        );
+        if let Some(block) = blocks.first() {
+            assert_eq!(&block.block[..4], &0x2000_0000i32.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn version_bits_outside_the_negotiated_mask_are_rejected() {
+        let mut j = sha_job();
+        let bits = |b| Submit {
+            version_bits: Some(b),
+            ..submit(1)
+        };
+        for (mask, b) in [
+            (0x1fff_e000, 0x0000_1000),
+            (0x1fff_e000, 0x2000_0000),
+            (0x0000_6000, 0x0000_8000),
+            (0, 0x0000_2000),
+        ] {
+            assert_eq!(
+                validate(&mut j, &[0; 4], &bits(b), mask, "a", 1_700_000_100).0,
+                ShareOutcome::Rejected(RejectReason::InvalidVersionBits),
+                "mask {mask:08x} bits {b:08x}"
+            );
+        }
+        // Zero bits are always allowed, negotiated or not.
+        assert_ne!(
+            validate(&mut j, &[0; 4], &bits(0), 0, "a", 1_700_000_100).0,
+            ShareOutcome::Rejected(RejectReason::InvalidVersionBits)
+        );
     }
 
     #[test]
     fn high_difficulty_rejects_low_share() {
         let mut j = job(1e12);
-        let (outcome, _) = validate(&mut j, &[0; 4], &submit(0), "a", 1_700_000_100);
+        let (outcome, _) = validate(&mut j, &[0; 4], &submit(0), 0, "a", 1_700_000_100);
         assert_eq!(outcome, ShareOutcome::Rejected(RejectReason::LowDifficulty));
     }
 }

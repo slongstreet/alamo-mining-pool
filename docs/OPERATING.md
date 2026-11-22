@@ -9,9 +9,12 @@ see [ARCHITECTURE.md](ARCHITECTURE.md).
 - A Litecoin Core node (0.21 or newer) with RPC enabled. Litecoin is the parent chain.
 - Optionally a Dogecoin Core node (1.14.6 or newer) with RPC enabled, for merge mining.
   Dogecoin needs at least one peer before it will hand out block templates.
+- Optionally a Bitcoin Core node with RPC enabled, fully synced, for Bitcoin solo mining
+  on a lane of its own (see [Bitcoin](#bitcoin)). The regtest setup and CI use Bitcoin
+  Core 32.1.
 - A Linux box for the daemon: x86-64 or arm64, a few hundred megabytes of RAM, and a
   little disk for the SQLite database. A Raspberry Pi next to the nodes is fine.
-- Miners that speak stratum v1 and hash scrypt.
+- Miners that speak stratum v1 and hash scrypt (Litecoin lane) or SHA-256d (Bitcoin lane).
 
 The pool never holds funds. Every block pays the miner that found it directly from the
 coinbase, so there is nothing to withdraw and no wallet to back up on the pool side.
@@ -38,6 +41,17 @@ rpcpassword=<another long random string>
 rpcbind=127.0.0.1
 rpcallowip=127.0.0.1
 zmqpubhashblock=tcp://127.0.0.1:28333
+```
+
+And, for a Bitcoin lane, to `bitcoin.conf`:
+
+```ini
+server=1
+rpcuser=alamo
+rpcpassword=<a third long random string>
+rpcbind=127.0.0.1
+rpcallowip=127.0.0.1
+zmqpubhashblock=tcp://127.0.0.1:28334
 ```
 
 The `zmqpubhashblock` lines are optional but recommended: the pool learns about new
@@ -148,8 +162,8 @@ The dashboard is embedded at build time, so build `web/dist` first.
 | `pool.name` | Shown on the dashboard. |
 | `pool.data_dir` | Where `alamo.db` lives. Must be writable. |
 | `stratum.listen` | Where miners connect. `0.0.0.0:3333` to accept from the LAN. |
-| `stratum.vardiff.*` | Share difficulty range and target share interval, in the units miners display: for scrypt a share of difficulty 65536 equals one unit of network difficulty, as in cgminer and every Litecoin pool. |
-| `coins.<coin>.stratum.listen`, `.vardiff.*` | A parent coin's own listener and vardiff, instead of `[stratum]`. Each parent coin is its own lane; two parents cannot share an address. Not allowed on a merge-mined coin. |
+| `stratum.vardiff.*` | Share difficulty range and target share interval, in the units miners display: for scrypt a share of difficulty 65536 equals one unit of network difficulty, as in cgminer and every Litecoin pool; for SHA-256d a share of difficulty 1 is one unit. Optional: without the table a lane on `[stratum]` gets its algorithm's built-in values (scrypt 65536 / 1024 to 16777216; SHA-256d 1024 / 0.001 to 4294967296; both 10 s target, 60 s retarget, 30 % variance). |
+| `coins.<coin>.stratum.listen`, `.vardiff.*` | A parent coin's own listener and vardiff, instead of `[stratum]`. Each parent coin is its own lane; two parents cannot share an address. Not allowed on a merge-mined coin. A lane with its own section and no vardiff table gets its algorithm's built-in values, never `[stratum.vardiff]`. |
 | `web.listen` | Dashboard and API. Bind to `127.0.0.1` and put a reverse proxy in front if the box is reachable from the internet; the API has no authentication. |
 | `web.read_only` | Refuse every change from the dashboard (settings, share-count reset, worker removal). |
 | `coins.<coin>.rpc_url`, `rpc_user`, `rpc_password` | Node RPC. The password is never logged. |
@@ -189,8 +203,43 @@ after a dot: `ltc1q....rig1`. The Dogecoin address goes in the password field, b
 `doge=D...`. A miner that supplies no valid address is paid at the fallback address and
 the dashboard flags it.
 
-Vardiff defaults suit ASICs in the hundreds of MH/s to GH/s range. For a small test rig,
-lower `initial_difficulty` and `min_difficulty`.
+Any miner can ask for a starting difficulty with `d=<number>` in the password, alone or
+next to the Dogecoin address (`doge=D...,d=4096` or `D... d=4096`). It is clamped to the
+lane's `min_difficulty` and `max_difficulty`, vardiff takes over from there, and a value
+that is not a positive number is ignored.
+
+The scrypt vardiff defaults suit ASICs in the hundreds of MH/s to GH/s range. For a small
+test rig, lower `initial_difficulty` and `min_difficulty`, or use `d=`.
+
+### Bitcoin
+
+Bitcoin is a lane of its own: its own port, vardiff, statistics, and blocks, next to (or
+instead of) the Litecoin lane. Add `[coins.btc]` and `[coins.btc.stratum]` as in the
+commented example in `config/alamo.example.toml`, pointing at a `bitcoind` that:
+
+- has RPC enabled (`server=1`, credentials, `rpcallowip` for the pool's host);
+- is fully synced. The lane opens its port once the node answers RPC, but a syncing
+  node refuses `getblocktemplate`, so miners get no work (and the dashboard shows the
+  node's error) until it catches up; the Litecoin lane is not affected;
+- ideally publishes `zmqpubhashblock`, so the pool switches to a new tip at once;
+- is on mainnet, testnet (`test`/`testnet4`), or regtest. Signet is refused at connect
+  with a message saying so: signet templates need a rule and a coinbase solution the
+  pool does not provide. The lane fails on its own; other lanes keep running.
+
+Miners connect to the Bitcoin lane's port (3334 in the example) with a Bitcoin address as
+the username (`bc1q...`, `bc1p...` taproot, `1...`, or `3...`; plus `.worker` if you like)
+and any password, optionally with `d=<number>`. Without a vardiff table the lane starts
+new connections at difficulty 1024, lets vardiff go as low as 0.001 for NerdMiner-class
+devices, and jumps a large ASIC to its measured difficulty within seconds.
+
+The Bitcoin lane offers BIP310 version rolling (ASICBoost) over BIP320's bits, mask
+`1fffe000`. A miner that sends `mining.configure` with `version-rolling` gets the mask it
+asked for ANDed with that one; it may then roll those header version bits and send them
+as the sixth `mining.submit` parameter. A share that changes any bit outside the
+negotiated mask is rejected as "Invalid version bits" (code 20). A shared mask with fewer
+bits than the miner's `version-rolling.min-bit-count` is still granted (BIP310 treats the
+count as diagnostic) and logged at info level; only a miner whose mask shares no bits
+with the lane's is refused, and it then hashes without rolling. Litecoin lanes keep answering `version-rolling: false`.
 
 ## Upgrading
 
