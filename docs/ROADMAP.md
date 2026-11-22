@@ -102,7 +102,20 @@ Work proceeds in waves. Each wave ends with something runnable and tested.
   view of the effective configuration.
 - [x] `[web] read_only` refuses every change from the dashboard.
 
+## Wave 7 — Bitcoin solo mining (SHA-256)
+Design in [BITCOIN.md](BITCOIN.md).
+- [ ] Lanes: one parent chain, its aux chains, stratum listener, vardiff, and stats per
+  lane, each started independently. Per-lane block submission with retry and a
+  write-ahead copy of the block. Migration adding `lane` to workers, shares, and hashrate
+  samples. Snapshot gains `lanes[]`. No behaviour change for LTC/DOGE.
+- [ ] Bitcoin coin definition, BIP310 version rolling on SHA-256 lanes, vardiff fast start
+  and `d=` in the password. Known-answer tests against mainnet data and a `bitcoind`
+  regtest round trip in CI.
+- [ ] Dashboard: lane cards, lane-scoped panels, "1 in N" odds, per-lane miner setup and
+  vardiff settings, Bitcoin node card.
+- [ ] Packaging: example config, operator docs, Umbrel app.
+
 ## Later
-- Additional coins via the `Coin` abstraction (BTC/BCH sha256d solo are cheap).
+- More sha256d parents (BCH) as additional lanes.
 - Stratum v2.
 - Notifications (webhook, email) on block found.

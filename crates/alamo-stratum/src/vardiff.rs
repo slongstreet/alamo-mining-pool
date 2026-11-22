@@ -8,6 +8,11 @@
 //! needs enough shares behind it to be a measurement rather than a burst. The algorithm
 //! is independent of the proof-of-work: it works in whatever share units the session
 //! uses, scrypt or sha256d.
+//!
+//! The exception is a gross mismatch. A worker measured at [`FAST_MIN_RATIO`] times the
+//! target rate or more (an ASIC that connected at a small miner's starting difficulty)
+//! jumps straight to the measured difficulty after [`FAST_RETARGET_SECS`], without the
+//! step cap: doubling once a minute would leave it flooding shares for many minutes.
 
 use crate::config::VardiffConfig;
 use std::collections::VecDeque;
@@ -21,6 +26,11 @@ const MAX_STEP: f64 = 2.0;
 const QUIET_STEP: f64 = 0.25;
 /// Shares needed in the window before difficulty is raised.
 const MIN_SHARES_TO_RAISE: usize = 8;
+/// A worker this many times over the target rate skips the step cap and the retarget
+/// interval and moves straight to the measured difficulty.
+const FAST_MIN_RATIO: f64 = 8.0;
+/// Minimum seconds between changes on the fast path (and after connecting).
+const FAST_RETARGET_SECS: f64 = 5.0;
 /// Upper bound on remembered shares; a worker above this rate is far above target anyway.
 const MAX_WINDOW_SHARES: usize = 512;
 
@@ -73,7 +83,11 @@ impl Vardiff {
 
     /// The difficulty the worker should move to, if it is time and the evidence says so.
     pub fn evaluate(&mut self, now: Instant, current: f64) -> Option<f64> {
-        if now.duration_since(self.last_change).as_secs_f64() < self.cfg.retarget_seconds {
+        let since_change = now.duration_since(self.last_change).as_secs_f64();
+        // Before the retarget interval only the fast path can act, and it needs a
+        // measurement; bail out early so the common case costs nothing per share.
+        let due = since_change >= self.cfg.retarget_seconds;
+        if !due && (since_change < FAST_RETARGET_SECS || self.shares.len() < MIN_SHARES_TO_RAISE) {
             return None;
         }
         self.trim(now);
@@ -85,6 +99,11 @@ impl Vardiff {
             .max(1.0);
         let work: f64 = self.shares.iter().map(|(_, d)| d).sum();
         let optimal = work / span * self.cfg.target_share_seconds;
+        let measured = self.shares.len() >= MIN_SHARES_TO_RAISE;
+        let gross = measured && optimal >= current * FAST_MIN_RATIO;
+        if !due && !gross {
+            return None;
+        }
 
         let ratio = if self.shares.is_empty() {
             QUIET_STEP
@@ -94,10 +113,14 @@ impl Vardiff {
                 return None;
             }
             let ratio = optimal / current;
-            if ratio > 1.0 && self.shares.len() < MIN_SHARES_TO_RAISE {
+            if ratio > 1.0 && !measured {
                 return None;
             }
-            ratio.clamp(1.0 / MAX_STEP, MAX_STEP)
+            if gross {
+                ratio
+            } else {
+                ratio.clamp(1.0 / MAX_STEP, MAX_STEP)
+            }
         };
         let proposed = self.clamp(current * ratio);
         if (proposed - current).abs() / current < 1e-9 {
@@ -140,8 +163,56 @@ mod tests {
     fn nothing_before_retarget_interval() {
         let t0 = Instant::now();
         let mut v = Vardiff::new(cfg(), t0);
-        shares_every(&mut v, t0, 0, 30, 1, 1000.0);
+        // 5x too fast is not a gross mismatch: it waits for the interval.
+        shares_every(&mut v, t0, 0, 30, 2, 1000.0);
         assert_eq!(v.evaluate(t0 + secs(30), 1000.0), None);
+    }
+
+    /// An ASIC that connects at a small miner's difficulty is moved to its measured
+    /// difficulty within seconds, not doubled once a minute.
+    #[test]
+    fn gross_mismatch_jumps_straight_to_the_measured_difficulty() {
+        let t0 = Instant::now();
+        let mut v = Vardiff::new(cfg(), t0);
+        // 20 shares a second at difficulty 10: 200x the target rate.
+        for i in 1..=200u64 {
+            v.on_share(t0 + Duration::from_millis(i * 50), 10.0);
+        }
+        // Too soon after connecting, even with plenty of shares.
+        assert_eq!(v.evaluate(t0 + secs(4), 10.0), None);
+        let new = v.evaluate(t0 + secs(10), 10.0).unwrap();
+        assert!(
+            (new - 2000.0).abs() < 1e-9,
+            "200 work/s x 10 s target: {new}"
+        );
+        // Shares for the old job keep arriving until the next job; the estimate is in
+        // work, so they do not move the difficulty again.
+        for i in 201..=400u64 {
+            v.on_share(t0 + Duration::from_millis(i * 50), 10.0);
+        }
+        assert_eq!(v.evaluate(t0 + secs(20), 2000.0), None);
+    }
+
+    #[test]
+    fn a_burst_of_few_shares_does_not_jump() {
+        let t0 = Instant::now();
+        let mut v = Vardiff::new(cfg(), t0);
+        // Seven lucky shares in six seconds look like 11x the target rate, but that is
+        // below the count that makes a measurement.
+        for i in 1..=7u64 {
+            v.on_share(t0 + secs(i - 1), 1000.0);
+        }
+        assert_eq!(v.evaluate(t0 + secs(6), 1000.0), None);
+    }
+
+    #[test]
+    fn fast_jump_respects_the_maximum() {
+        let t0 = Instant::now();
+        let mut v = Vardiff::new(cfg(), t0);
+        for i in 1..=100u64 {
+            v.on_share(t0 + Duration::from_millis(i * 100), 50_000.0);
+        }
+        assert_eq!(v.evaluate(t0 + secs(10), 50_000.0), Some(100_000.0));
     }
 
     #[test]
