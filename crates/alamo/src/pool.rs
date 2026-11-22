@@ -12,10 +12,15 @@ use alamo_coins::{
 use alamo_core::odds::OddsSummary;
 use alamo_core::payout::{AuxPayoutTable, PayoutSet, PayoutTable};
 use alamo_core::time::now_unix;
+use alamo_core::work::MergedWork;
 use alamo_core::work::WorkTemplate;
+use alamo_core::Algorithm;
 use alamo_store::{BlockRow, BlockStatus, CoinRounds, NewBlock, Store};
+use alamo_stratum::server::Bound;
 use alamo_stratum::{BlockCandidate, PoolEvent, StratumServer, WorkReceiver};
-use alamo_web::{AppState, CoinStatus, Command, NodeStatus, PoolSnapshot, RoundStatus};
+use alamo_web::{
+    AppState, CoinStatus, Command, LaneState, LaneStatus, NodeStatus, PoolSnapshot, RoundStatus,
+};
 use anyhow::{bail, Context};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -495,10 +500,14 @@ fn spawn_feed(
 ///
 /// Each enabled parent coin is a lane with its own nodes, stratum listener, vardiff,
 /// payout tables, submitter, and trackers. Lanes start independently: one whose node is
-/// unreachable keeps retrying without holding any other lane's listener closed. A
-/// configuration error found while a lane starts (a node on the wrong network, a fallback
-/// address that does not fit it, a listener that cannot bind) stops the whole daemon,
-/// since it will not fix itself; an unreachable node never does.
+/// unreachable keeps retrying without holding any other lane's listener closed.
+///
+/// A lane that cannot start (its node is on another network than the config implies, a
+/// fallback address does not fit that network, its listener cannot bind) fails on its
+/// own: it is logged, shown as failed, and the other lanes keep running. The daemon exits
+/// with that error only when no lane is left running or connecting, so a single-lane
+/// pool with a bad config stops as it always did. A component of a running lane that
+/// stops unexpectedly still stops the daemon, so its supervisor restarts it.
 pub async fn run(
     config: Config,
     store: Store,
@@ -521,8 +530,8 @@ pub async fn run(
 
     let config = Arc::new(config);
     let spool = config.pool.data_dir.join(BLOCK_SPOOL_DIR);
-    let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
-    let (up_tx, up_rx) = mpsc::channel::<LaneUp>(lanes.len());
+    let mut tasks: JoinSet<anyhow::Result<TaskEnd>> = JoinSet::new();
+    let (notice_tx, notice_rx) = mpsc::channel::<LaneNotice>(lanes.len());
     // One event channel per lane: which channel an event arrives on is its lane, so
     // nothing is added to the per-share path.
     let mut events = Vec::with_capacity(lanes.len());
@@ -537,11 +546,11 @@ pub async fn run(
             store: store.clone(),
             spool: spool.clone(),
             events: events_tx,
-            up: up_tx.clone(),
+            notices: notice_tx.clone(),
             shutdown: shutdown.child_token(),
         }));
     }
-    drop(up_tx);
+    drop(notice_tx);
 
     let commands = state
         .take_commands()
@@ -552,25 +561,33 @@ pub async fn run(
         publisher(
             publisher_state,
             events,
-            up_rx,
+            notice_rx,
             state,
             commands,
             token.clone(),
         )
         .await;
         if token.is_cancelled() {
-            Ok(())
+            Ok(TaskEnd::Done)
         } else {
             bail!("publisher stopped unexpectedly")
         }
     });
 
+    // Lanes still running or connecting.
+    let mut alive = lanes.len();
     let result = loop {
         tokio::select! {
             _ = shutdown.cancelled() => break Ok(()),
             finished = tasks.join_next() => match finished {
-                // A lane that saw the shutdown, or one with nothing left to do.
-                Some(Ok(Ok(()))) => continue,
+                // A task that saw the shutdown.
+                Some(Ok(Ok(TaskEnd::Done))) => continue,
+                Some(Ok(Ok(TaskEnd::LaneFailed(err)))) => {
+                    alive -= 1;
+                    if alive == 0 {
+                        break Err(err.context("no lane is left running"));
+                    }
+                }
                 Some(Ok(Err(err))) => break Err(err),
                 Some(Err(join)) => break Err(anyhow::Error::new(join).context("pool task panicked")),
                 None => break Ok(()),
@@ -580,6 +597,14 @@ pub async fn run(
     shutdown.cancel();
     while tasks.join_next().await.is_some() {}
     result
+}
+
+/// How a pool task ended without stopping the daemon.
+enum TaskEnd {
+    /// It saw the shutdown.
+    Done,
+    /// A lane could not start; the others carry on.
+    LaneFailed(anyhow::Error),
 }
 
 /// Everything one lane's task tree needs.
@@ -592,8 +617,21 @@ struct LaneTask {
     store: Store,
     spool: PathBuf,
     events: mpsc::Sender<PoolEvent>,
-    up: mpsc::Sender<LaneUp>,
+    notices: mpsc::Sender<LaneNotice>,
     shutdown: CancellationToken,
+}
+
+/// What a lane tells the publisher about itself.
+enum LaneNotice {
+    /// Nodes connected and listener open.
+    Up(LaneUp),
+    /// The lane gave up starting.
+    Failed {
+        /// Lane index.
+        lane: usize,
+        /// The reason, with its causes.
+        error: String,
+    },
 }
 
 /// A lane's nodes have connected and its listener is bound: what the publisher needs to
@@ -606,37 +644,101 @@ struct LaneUp {
     nodes: Vec<(&'static str, watch::Receiver<NodeHealth>)>,
 }
 
+/// A lane that has connected and bound its listener, before any of its tasks run.
+struct StartedLane {
+    chains: Chains,
+    bound: Bound,
+    work_tx: watch::Sender<Option<Arc<MergedWork>>>,
+    work_rx: WorkReceiver,
+    blocks_rx: mpsc::Receiver<BlockCandidate>,
+}
+
 /// Connect one lane, then run its template sources, merger, stratum server, submitter,
-/// and trackers until shutdown or until one of them stops.
-async fn run_lane(task: LaneTask) -> anyhow::Result<()> {
+/// and trackers until shutdown or until one of them stops. A failure while starting is
+/// this lane's alone (`TaskEnd::LaneFailed`); a failure once running is the daemon's.
+async fn run_lane(task: LaneTask) -> anyhow::Result<TaskEnd> {
     let key = task.lane.key.clone();
-    lane_tree(task)
+    let started = match start_lane(&task).await {
+        Ok(Some(started)) => started,
+        Ok(None) => return Ok(TaskEnd::Done),
+        Err(err) => {
+            let err = err.context(format!("lane '{key}'"));
+            let error = format!("{err:#}");
+            tracing::error!(lane = %key, %error, "lane failed to start; other lanes keep running");
+            task.settings.lane_detached(&key).await;
+            let _ = task
+                .notices
+                .send(LaneNotice::Failed {
+                    lane: task.index,
+                    error,
+                })
+                .await;
+            return Ok(TaskEnd::LaneFailed(err));
+        }
+    };
+    run_started_lane(task, started)
         .await
+        .map(|()| TaskEnd::Done)
         .with_context(|| format!("lane '{key}'"))
 }
 
-async fn lane_tree(task: LaneTask) -> anyhow::Result<()> {
+/// Everything that can fail because of the configuration: connecting (and checking) the
+/// nodes, attaching the settings, binding the listener. Nothing is spawned yet, so a
+/// failure leaves nothing behind. `Ok(None)` is a shutdown while waiting for a node.
+async fn start_lane(task: &LaneTask) -> anyhow::Result<Option<StartedLane>> {
+    let Some(chains) = connect_lane(&task.config, &task.lane, &task.shutdown).await? else {
+        return Ok(None);
+    };
+    let payouts = task.settings.lane_connected(&chains).await?;
+    let attached = async {
+        let vardiff = task
+            .settings
+            .vardiff(&task.lane.key)
+            .context("no vardiff settings for this lane")?;
+        let (work_tx, work_rx) = watch::channel(None);
+        let (blocks_tx, blocks_rx) = mpsc::channel::<BlockCandidate>(64);
+        let bound = StratumServer {
+            listen: task.lane.stratum.listen,
+            vardiff,
+            payouts,
+            work: work_rx.clone(),
+            events: task.events.clone(),
+            blocks: blocks_tx,
+        }
+        .bind()
+        .await
+        .context("binding stratum")?;
+        anyhow::Ok((bound, work_tx, work_rx, blocks_rx))
+    }
+    .await;
+    let (bound, work_tx, work_rx, blocks_rx) = attached?;
+    Ok(Some(StartedLane {
+        chains,
+        bound,
+        work_tx,
+        work_rx,
+        blocks_rx,
+    }))
+}
+
+async fn run_started_lane(task: LaneTask, started: StartedLane) -> anyhow::Result<()> {
     let LaneTask {
         index,
         lane,
-        config,
         settings,
         store,
         spool,
-        events,
-        up,
+        notices,
         shutdown,
+        ..
     } = task;
-    let Some(chains) = connect_lane(&config, &lane, &shutdown).await? else {
-        return Ok(());
-    };
-    let payouts = settings.lane_connected(&chains).await?;
-    let vardiff = settings
-        .vardiff(&lane.key)
-        .context("no vardiff settings for this lane")?;
-
-    let (work_tx, work_rx) = watch::channel(None);
-    let (blocks_tx, blocks_rx) = mpsc::channel::<BlockCandidate>(64);
+    let StartedLane {
+        chains,
+        bound,
+        work_tx,
+        work_rx,
+        blocks_rx,
+    } = started;
 
     // Every task returns its name when it stops; none of them stops on its own.
     let mut tasks: JoinSet<&'static str> = JoinSet::new();
@@ -671,17 +773,6 @@ async fn lane_tree(task: LaneTask) -> anyhow::Result<()> {
         "work merger"
     });
 
-    let bound = StratumServer {
-        listen: lane.stratum.listen,
-        vardiff,
-        payouts,
-        work: work_rx.clone(),
-        events,
-        blocks: blocks_tx,
-    }
-    .bind()
-    .await
-    .context("binding stratum")?;
     let token = shutdown.child_token();
     tasks.spawn(async move {
         bound.run(token).await;
@@ -709,13 +800,13 @@ async fn lane_tree(task: LaneTask) -> anyhow::Result<()> {
             shutdown.child_token(),
         ));
     }
-    let announced = up
-        .send(LaneUp {
+    let announced = notices
+        .send(LaneNotice::Up(LaneUp {
             lane: index,
             chain: chains.parent.chain,
             work: work_rx,
             nodes,
-        })
+        }))
         .await;
 
     let result = if announced.is_err() {
@@ -821,23 +912,44 @@ struct LaneView {
 }
 
 /// One lane's statistics and accounting, owned by the publisher.
-struct LaneState {
+struct LaneAccount {
     key: String,
+    algorithm: Algorithm,
+    stratum_port: u16,
     stats: Stats,
     persist: Persistence,
     /// `None` until the lane's nodes have connected.
     view: Option<LaneView>,
+    /// Why the lane gave up starting, once it has.
+    failed: Option<String>,
 }
 
-/// Every lane's statistics, and the snapshot built from the primary lane.
+impl LaneAccount {
+    fn state(&self) -> LaneState {
+        if self.failed.is_some() {
+            LaneState::Failed
+        } else if self.view.is_some() {
+            LaneState::Running
+        } else {
+            LaneState::Connecting
+        }
+    }
+}
+
+/// Every lane's statistics, and the snapshot built from them.
 struct Publisher {
     store: Store,
-    lanes: Vec<LaneState>,
+    lanes: Vec<LaneAccount>,
     primary: usize,
     retention: Retention,
     blocks: Vec<BlockRow>,
     rounds: Vec<CoinRounds>,
     ticks: u32,
+}
+
+/// The algorithm of a lane's parent coin.
+fn lane_algorithm(key: &str) -> Algorithm {
+    alamo_coins::builtin(key).map_or(Algorithm::Scrypt, |c| c.algorithm())
 }
 
 impl Publisher {
@@ -846,8 +958,8 @@ impl Publisher {
     async fn load(store: Store, lanes: &[LaneConfig], primary: usize, now: u64) -> Self {
         let mut states = Vec::with_capacity(lanes.len());
         for lane in lanes {
-            let share_multiplier =
-                alamo_coins::builtin(&lane.key).map_or(1.0, |c| c.algorithm().share_multiplier());
+            let algorithm = lane_algorithm(&lane.key);
+            let share_multiplier = algorithm.share_multiplier();
             let stats = match Stats::load(&store, &lane.key, now, share_multiplier).await {
                 Ok(s) => {
                     tracing::info!(
@@ -863,11 +975,14 @@ impl Publisher {
                     Stats::new(share_multiplier)
                 }
             };
-            states.push(LaneState {
+            states.push(LaneAccount {
                 key: lane.key.clone(),
+                algorithm,
+                stratum_port: lane.stratum.listen.port(),
                 stats,
                 persist: Persistence::new(store.clone(), &lane.key),
                 view: None,
+                failed: None,
             });
         }
         Self {
@@ -881,16 +996,24 @@ impl Publisher {
         }
     }
 
-    fn lane_up(&mut self, up: LaneUp) {
-        let Some(lane) = self.lanes.get_mut(up.lane) else {
-            return;
-        };
-        lane.view = Some(LaneView {
-            chain: up.chain,
-            work: up.work,
-            nodes: up.nodes,
-            templates: HashMap::new(),
-        });
+    fn notice(&mut self, notice: LaneNotice) {
+        match notice {
+            LaneNotice::Up(up) => {
+                if let Some(lane) = self.lanes.get_mut(up.lane) {
+                    lane.view = Some(LaneView {
+                        chain: up.chain,
+                        work: up.work,
+                        nodes: up.nodes,
+                        templates: HashMap::new(),
+                    });
+                }
+            }
+            LaneNotice::Failed { lane, error } => {
+                if let Some(lane) = self.lanes.get_mut(lane) {
+                    lane.failed = Some(error);
+                }
+            }
+        }
     }
 
     /// Account one event from `lane`. Session ids are only unique within a lane's
@@ -912,36 +1035,47 @@ impl Publisher {
         }
     }
 
-    /// Carry out an operator command on the primary lane, the one the API shows.
+    /// Carry out an operator command on the lane it names.
     async fn command(&mut self, command: Command) {
-        let l = &mut self.lanes[self.primary];
-        match command {
-            Command::ResetStats => {
+        let (lane, name) = match &command {
+            Command::ResetStats { lane } => (lane, None),
+            Command::RemoveWorker { lane, name } => (lane, Some(name)),
+        };
+        let Some(l) = self.lanes.iter_mut().find(|l| l.key == *lane) else {
+            tracing::warn!(lane = %lane, "command for an unknown lane ignored");
+            return;
+        };
+        match name {
+            None => {
                 // Queued shares must land before the zeroing or they would be
                 // counted on top of it.
                 flush_persist(&l.key, &mut l.persist).await;
                 match self.store.reset_share_counters(&l.key).await {
                     Ok(()) => {
                         l.stats.reset_counters();
-                        tracing::info!("share counters and best share reset by operator");
+                        tracing::info!(lane = %l.key, "share counters and best share reset by operator");
                     }
-                    Err(err) => tracing::warn!(%err, "could not reset share counters"),
+                    Err(err) => {
+                        tracing::warn!(lane = %l.key, %err, "could not reset share counters")
+                    }
                 }
             }
-            Command::RemoveWorker(name) => {
+            Some(name) => {
                 // The API already refused connected workers, but a session may have
                 // arrived since; and queued shares must land before the row goes.
-                if l.stats.is_connected(&name) {
-                    tracing::warn!(worker = %name, "worker reconnected; not removed");
+                if l.stats.is_connected(name) {
+                    tracing::warn!(lane = %l.key, worker = %name, "worker reconnected; not removed");
                     return;
                 }
                 flush_persist(&l.key, &mut l.persist).await;
-                match self.store.remove_worker(&l.key, &name).await {
+                match self.store.remove_worker(&l.key, name).await {
                     Ok(_) => {
-                        l.stats.remove_worker(&name);
-                        tracing::info!(worker = %name, "worker removed by operator");
+                        l.stats.remove_worker(name);
+                        tracing::info!(lane = %l.key, worker = %name, "worker removed by operator");
                     }
-                    Err(err) => tracing::warn!(%err, worker = %name, "could not remove worker"),
+                    Err(err) => {
+                        tracing::warn!(lane = %l.key, %err, worker = %name, "could not remove worker")
+                    }
                 }
             }
         }
@@ -976,20 +1110,37 @@ impl Publisher {
         self.ticks = self.ticks.wrapping_add(1);
     }
 
-    /// The status document, built from the primary lane; `None` until it has connected.
-    /// Blocks are every lane's.
-    fn snapshot(&mut self) -> Option<PoolSnapshot> {
-        let l = &mut self.lanes[self.primary];
-        let view = l.view.as_mut()?;
-        remember_templates(&view.work, &mut view.templates);
-        Some(build_snapshot(
-            &l.stats,
-            &view.templates,
-            &view.nodes,
-            self.blocks.clone(),
-            &self.rounds,
-            view.chain,
-        ))
+    /// Lane indexes, primary first, then in config order.
+    fn order(&self) -> Vec<usize> {
+        std::iter::once(self.primary)
+            .chain((0..self.lanes.len()).filter(|&i| i != self.primary))
+            .collect()
+    }
+
+    /// The status document: every lane (primary first), with the deprecated top-level
+    /// fields mirroring the primary lane while it runs, and every lane's blocks.
+    fn snapshot(&mut self) -> PoolSnapshot {
+        let now = now_unix();
+        let mut lanes = Vec::with_capacity(self.lanes.len());
+        for i in self.order() {
+            let l = &mut self.lanes[i];
+            if let Some(view) = l.view.as_mut() {
+                remember_templates(&view.work, &mut view.templates);
+            }
+            lanes.push(lane_status(l, &self.rounds, now));
+        }
+        let primary = self.lanes[self.primary].stats.share_multiplier();
+        let multipliers: HashMap<&str, f64> = self
+            .lanes
+            .iter()
+            .map(|l| (l.key.as_str(), l.stats.share_multiplier()))
+            .collect();
+        let blocks = convert_blocks(self.blocks.clone(), |lane| {
+            multipliers.get(lane).copied().unwrap_or_else(|| {
+                alamo_coins::builtin(lane).map_or(primary, |c| c.algorithm().share_multiplier())
+            })
+        });
+        PoolSnapshot::from_lanes(now, lanes, blocks)
     }
 }
 
@@ -1028,7 +1179,7 @@ async fn next_event(
 async fn publisher(
     mut p: Publisher,
     mut events: Vec<Option<mpsc::Receiver<PoolEvent>>>,
-    mut lanes_up: mpsc::Receiver<LaneUp>,
+    mut notices: mpsc::Receiver<LaneNotice>,
     state: AppState,
     mut commands: mpsc::Receiver<Command>,
     shutdown: CancellationToken,
@@ -1037,7 +1188,10 @@ async fn publisher(
     let mut interval = tokio::time::interval(PUBLISH_INTERVAL);
     loop {
         tokio::select! {
-            Some(up) = lanes_up.recv() => p.lane_up(up),
+            Some(notice) = notices.recv() => {
+                p.notice(notice);
+                state.publish(p.snapshot());
+            }
             next = next_event(&mut events, &mut start) => {
                 let Some((lane, event)) = next else {
                     p.flush_all().await;
@@ -1047,15 +1201,11 @@ async fn publisher(
             }
             Some(command) = commands.recv() => {
                 p.command(command).await;
-                if let Some(snapshot) = p.snapshot() {
-                    state.publish(snapshot);
-                }
+                state.publish(p.snapshot());
             }
             _ = interval.tick() => {
                 p.tick(now_unix()).await;
-                if let Some(snapshot) = p.snapshot() {
-                    state.publish(snapshot);
-                }
+                state.publish(p.snapshot());
             }
             _ = shutdown.cancelled() => {
                 p.flush_all().await;
@@ -1071,7 +1221,7 @@ async fn flush_persist(lane: &str, persist: &mut Persistence) {
     }
 }
 
-/// Pool-wide figures every chain's status is derived from.
+/// Lane-wide figures every chain's status in the lane is derived from.
 #[derive(Clone, Copy)]
 struct PoolFigures {
     hashrate: f64,
@@ -1168,55 +1318,66 @@ fn round_status(
     }
 }
 
-fn build_snapshot(
-    stats: &Stats,
-    templates: &HashMap<&'static str, Arc<WorkTemplate>>,
-    nodes: &[(&'static str, watch::Receiver<NodeHealth>)],
-    mut blocks: Vec<BlockRow>,
-    rounds: &[CoinRounds],
-    chain: Chain,
-) -> PoolSnapshot {
-    let now = now_unix();
+/// Convert each block's winning share from stratum units to network units with its
+/// own lane's share multiplier, so it compares to the block's difficulty next to it.
+fn convert_blocks(mut blocks: Vec<BlockRow>, multiplier: impl Fn(&str) -> f64) -> Vec<BlockRow> {
+    for b in &mut blocks {
+        let m = multiplier(&b.lane);
+        if m > 0.0 {
+            b.share_diff /= m;
+        }
+    }
+    blocks
+}
+
+/// The round of `coin` in `lane`: the same coin mined in another lane has its own.
+fn lane_round<'a>(rounds: &'a [CoinRounds], lane: &str, coin: &str) -> Option<&'a CoinRounds> {
+    rounds.iter().find(|r| r.lane == lane && r.coin == coin)
+}
+
+/// One lane's status. Its coins appear once they have had a template; node health rides
+/// along; rounds are matched by lane and coin.
+fn lane_status(l: &LaneAccount, rounds: &[CoinRounds], now: u64) -> LaneStatus {
+    let stats = &l.stats;
     let workers = stats.workers(now);
     let hashrate = workers.iter().map(|w| w.hashrate).fold(0.0, |a, b| a + b);
     let total_work = stats.total_work();
     let share_multiplier = stats.share_multiplier();
-    let pool = PoolFigures {
+    let figures = PoolFigures {
         hashrate,
         total_work,
         share_multiplier,
     };
-    // Blocks are stored with the winning share in stratum units; the API reports network
-    // units so the figure compares to the block's difficulty next to it.
-    for b in &mut blocks {
-        b.share_diff /= share_multiplier;
-    }
+    let coins = l.view.as_ref().map_or_else(Vec::new, |view| {
+        view.nodes
+            .iter()
+            .filter_map(|(coin, health)| {
+                let w = view.templates.get(coin)?;
+                let r = lane_round(rounds, &l.key, coin);
+                let health = health.borrow().clone();
+                Some(coin_status(w, view.chain, figures, r, &health, now))
+            })
+            .collect()
+    });
     let best = stats.best_share();
-    // Coins appear once they have had a template; node health rides along.
-    let coins = nodes
-        .iter()
-        .filter_map(|(coin, health)| {
-            let w = templates.get(coin)?;
-            let r = rounds.iter().find(|r| r.coin == *coin);
-            let health = health.borrow().clone();
-            Some(coin_status(w, chain, pool, r, &health, now))
-        })
-        .collect();
-    PoolSnapshot {
-        now,
-        coins,
+    LaneStatus {
+        key: l.key.clone(),
+        algorithm: l.algorithm.name().to_string(),
+        stratum_port: l.stratum_port,
+        state: l.state(),
+        error: l.failed.clone(),
+        chain: l.view.as_ref().map(|v| v.chain.to_string()),
+        share_multiplier,
         hashrate,
         shares_accepted: stats.shares_accepted(),
         shares_rejected: stats.shares_rejected(),
         total_work,
-        share_multiplier,
         best_share_difficulty: best.as_ref().map_or(0.0, |b| b.difficulty),
         best_share_worker: best.as_ref().map(|b| b.worker.clone()),
         best_share_at: best.and_then(|b| b.at),
         scoring_since: stats.scoring_since(),
+        coins,
         workers,
-        blocks,
-        ..Default::default()
     }
 }
 
@@ -1341,6 +1502,7 @@ mod tests {
     #[test]
     fn round_after_blocks_starts_at_the_banked_work() {
         let rounds = CoinRounds {
+            lane: "ltc".into(),
             coin: "LTC".into(),
             blocks_found: 2,
             expected_work: 2_000.0,
@@ -1394,11 +1556,11 @@ mod tests {
             lanes.iter().map(|l| l.key.as_str()).collect::<Vec<_>>(),
             vec!["doge", "ltc"]
         );
-        let primary = Config::primary_lane_index(&lanes);
-        assert_eq!(lanes[primary].key, "ltc");
+        let primary_index = Config::primary_lane_index(&lanes);
+        assert_eq!(lanes[primary_index].key, "ltc");
         let (doge, ltc) = (0, 1);
         let t0 = 1_700_000_000u64;
-        let mut p = Publisher::load(store.clone(), &lanes, primary, t0).await;
+        let mut p = Publisher::load(store.clone(), &lanes, primary_index, t0).await;
 
         // Both stratum servers number their first session 1.
         let auth = |address: &str| PoolEvent::Authorized {
@@ -1451,49 +1613,155 @@ mod tests {
         assert_eq!(rows("doge").await[0].shares_accepted, 1);
         assert_eq!(rows("doge").await[0].payout_address, "D1");
 
-        // No snapshot until the primary lane is up, and then only its figures.
-        assert!(p.snapshot().is_none());
+        // A snapshot from the start: every lane, primary first, still connecting, with
+        // the deprecated top-level fields at their defaults.
+        let snapshot = p.snapshot();
+        let keys = |s: &PoolSnapshot| s.lanes.iter().map(|l| l.key.clone()).collect::<Vec<_>>();
+        assert_eq!(keys(&snapshot), vec!["ltc", "doge"]);
+        assert!(snapshot
+            .lanes
+            .iter()
+            .all(|l| l.state == LaneState::Connecting && l.chain.is_none()));
+        assert_eq!(
+            snapshot.lanes[0].shares_accepted, 3,
+            "restored figures per lane"
+        );
+        assert_eq!(snapshot.lanes[1].shares_accepted, 1);
+        assert_eq!(snapshot.shares_accepted, 0);
+        assert!(snapshot.workers.is_empty());
+        assert_eq!(snapshot.lanes[0].algorithm, "scrypt");
+        assert_eq!(snapshot.lanes[0].share_multiplier, 65_536.0);
+
+        // DOGE fails to start; LTC comes up.
         let (_work_tx, work) = watch::channel(None);
-        p.lane_up(LaneUp {
+        p.notice(LaneNotice::Failed {
             lane: doge,
-            chain: Chain::Regtest,
-            work: work.clone(),
-            nodes: vec![],
+            error: "lane 'doge': wrong network".into(),
         });
-        assert!(p.snapshot().is_none(), "another lane up is not enough");
-        p.lane_up(LaneUp {
+        let snapshot = p.snapshot();
+        assert_eq!(snapshot.lanes[1].state, LaneState::Failed);
+        assert_eq!(
+            snapshot.lanes[1].error.as_deref(),
+            Some("lane 'doge': wrong network")
+        );
+        assert_eq!(snapshot.shares_accepted, 0, "primary still connecting");
+        p.notice(LaneNotice::Up(LaneUp {
             lane: ltc,
             chain: Chain::Regtest,
             work,
             nodes: vec![],
-        });
-        let snapshot = p.snapshot().unwrap();
-        assert_eq!(snapshot.shares_accepted, 3);
+        }));
+        let snapshot = p.snapshot();
+        let primary = &snapshot.lanes[0];
+        assert_eq!(primary.state, LaneState::Running);
+        assert_eq!(primary.chain.as_deref(), Some("regtest"));
+        assert!(primary.error.is_none());
+        // The deprecated fields mirror the primary lane exactly.
+        assert_eq!(snapshot.shares_accepted, primary.shares_accepted);
+        assert_eq!(snapshot.shares_rejected, primary.shares_rejected);
+        assert_eq!(snapshot.hashrate, primary.hashrate);
+        assert_eq!(snapshot.total_work, primary.total_work);
+        assert_eq!(snapshot.share_multiplier, primary.share_multiplier);
+        assert_eq!(
+            snapshot.best_share_difficulty,
+            primary.best_share_difficulty
+        );
+        assert_eq!(snapshot.best_share_worker, primary.best_share_worker);
+        assert_eq!(snapshot.scoring_since, primary.scoring_since);
         assert_eq!(snapshot.workers.len(), 1);
         assert_eq!(snapshot.workers[0].address, "ltc1q");
         assert_eq!(snapshot.workers[0].connections, 1);
+        assert_eq!(snapshot.lanes[1].workers[0].address, "D1");
+        assert_eq!(snapshot.lanes[1].workers[0].connections, 0);
 
-        // Operator commands act on the primary lane only.
-        p.command(Command::ResetStats).await;
+        // Operator commands act on the lane they name.
+        p.command(Command::ResetStats { lane: "ltc".into() }).await;
         assert_eq!(p.lanes[ltc].stats.shares_accepted(), 0);
         assert_eq!(p.lanes[doge].stats.shares_accepted(), 1);
         assert_eq!(rows("doge").await[0].shares_accepted, 1);
-        p.command(Command::RemoveWorker("rig".into())).await;
+        p.command(Command::RemoveWorker {
+            lane: "ltc".into(),
+            name: "rig".into(),
+        })
+        .await;
         assert_eq!(
             rows("ltc").await.len(),
             1,
             "a connected worker is not removed"
         );
-        assert_eq!(rows("doge").await.len(), 1);
+        p.command(Command::RemoveWorker {
+            lane: "doge".into(),
+            name: "rig".into(),
+        })
+        .await;
+        assert!(
+            rows("doge").await.is_empty(),
+            "idle in doge, so removed there"
+        );
+        assert_eq!(rows("ltc").await.len(), 1);
+        p.command(Command::ResetStats {
+            lane: "nope".into(),
+        })
+        .await;
 
         // Restored per lane on restart.
-        let p = Publisher::load(store.clone(), &lanes, primary, t0 + 3).await;
-        assert_eq!(p.lanes[doge].stats.shares_accepted(), 1);
+        let p = Publisher::load(store.clone(), &lanes, primary_index, t0 + 3).await;
+        assert!(p.lanes[doge].stats.workers(t0 + 3).is_empty());
         assert_eq!(p.lanes[ltc].stats.shares_accepted(), 0);
         assert_eq!(p.lanes[ltc].stats.total_work(), 12.0 / 65_536.0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    #[test]
+    fn blocks_convert_with_their_own_lane_and_rounds_match_lane_and_coin() {
+        let block = |lane: &str, share_diff: f64| BlockRow {
+            id: 1,
+            lane: lane.into(),
+            coin: "X".into(),
+            height: 1,
+            hash: "00".into(),
+            worker: "w".into(),
+            difficulty: 1.0,
+            share_diff,
+            reward_sats: None,
+            found_at: 0,
+            status: BlockStatus::Accepted,
+            confirmations: 0,
+            work_at_found: None,
+        };
+        let blocks = convert_blocks(vec![block("ltc", 65_536.0), block("btc", 3.0)], |lane| {
+            if lane == "ltc" {
+                65_536.0
+            } else {
+                1.0
+            }
+        });
+        assert_eq!(blocks[0].share_diff, 1.0);
+        assert_eq!(blocks[1].share_diff, 3.0);
+
+        let round = |lane: &str, last: f64| CoinRounds {
+            lane: lane.into(),
+            coin: "DOGE".into(),
+            blocks_found: 1,
+            expected_work: 1.0,
+            last_found_at: Some(1),
+            last_work_at_found: Some(last),
+        };
+        let rounds = vec![round("doge", 10.0), round("ltc", 20.0)];
+        assert_eq!(
+            lane_round(&rounds, "ltc", "DOGE")
+                .unwrap()
+                .last_work_at_found,
+            Some(20.0)
+        );
+        assert_eq!(
+            lane_round(&rounds, "doge", "DOGE")
+                .unwrap()
+                .last_work_at_found,
+            Some(10.0)
+        );
+        assert!(lane_round(&rounds, "ltc", "LTC").is_none());
+    }
     #[tokio::test]
     async fn next_event_tags_each_event_with_its_lane_and_rotates() {
         let (a_tx, a_rx) = mpsc::channel(8);

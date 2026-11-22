@@ -74,23 +74,39 @@ async fn stream_snapshots(mut socket: WebSocket, state: AppState) {
     }
 }
 
-/// A store failure surfaced as a JSON 500.
-pub struct ApiError(StoreError);
+/// A failed API request: a store failure (JSON 500) or a refusal with its own status.
+pub enum ApiError {
+    /// The database query failed.
+    Store(StoreError),
+    /// The request was refused, for example naming an unknown lane.
+    Refused(Refusal),
+}
 
 impl From<StoreError> for ApiError {
     fn from(err: StoreError) -> Self {
-        Self(err)
+        Self::Store(err)
+    }
+}
+
+impl From<Refusal> for ApiError {
+    fn from(refusal: Refusal) -> Self {
+        Self::Refused(refusal)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        tracing::warn!(err = %self.0, "api query failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": self.0.to_string() })),
-        )
-            .into_response()
+        match self {
+            Self::Store(err) => {
+                tracing::warn!(%err, "api query failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": err.to_string() })),
+                )
+                    .into_response()
+            }
+            Self::Refused(refusal) => refusal.into_response(),
+        }
     }
 }
 
@@ -98,21 +114,83 @@ impl IntoResponse for ApiError {
 const MAX_HASHRATE_SPAN_SECS: u64 = 30 * 24 * 3600;
 const DEFAULT_HASHRATE_SPAN_SECS: u64 = 24 * 3600;
 
+/// The optional `lane` query parameter of the per-lane endpoints.
+#[derive(Debug, Default, Deserialize)]
+pub struct LaneQuery {
+    /// Lane key; omitted means the primary lane.
+    pub lane: Option<String>,
+}
+
+/// A lane a request resolved to.
+struct LaneRef {
+    key: String,
+    /// Stratum share units per unit of network difficulty in this lane, or 1 before
+    /// the pool has said. The store keeps `share_diff` in stratum units; the API reports
+    /// network units, matching the best-share figures in the status document.
+    share_multiplier: f64,
+    /// The lane's workers as the latest snapshot has them.
+    workers: Vec<crate::WorkerStatus>,
+}
+
+fn positive_or_one(m: f64) -> f64 {
+    if m > 0.0 {
+        m
+    } else {
+        1.0
+    }
+}
+
+/// Resolve the requested lane, defaulting to the primary one. A lane the pool does not
+/// have is a 400 that lists the ones it does. Before the pool has published its lanes
+/// only the primary lane is known.
+fn resolve_lane(state: &AppState, requested: Option<&str>) -> Result<LaneRef, Refusal> {
+    let snapshot = state.snapshot();
+    let primary = state.primary_lane();
+    let key = requested.unwrap_or(&primary);
+    if snapshot.lanes.is_empty() {
+        if key == primary {
+            return Ok(LaneRef {
+                key: primary.clone(),
+                share_multiplier: positive_or_one(snapshot.share_multiplier),
+                workers: snapshot.workers,
+            });
+        }
+    } else if let Some(lane) = snapshot.lane(key) {
+        return Ok(LaneRef {
+            key: lane.key.clone(),
+            share_multiplier: positive_or_one(lane.share_multiplier),
+            workers: lane.workers.clone(),
+        });
+    }
+    let known: Vec<&str> = if snapshot.lanes.is_empty() {
+        vec![primary.as_str()]
+    } else {
+        snapshot.lanes.iter().map(|l| l.key.as_str()).collect()
+    };
+    Err(error(
+        StatusCode::BAD_REQUEST,
+        format!("unknown lane '{key}'; lanes: {}", known.join(", ")),
+    ))
+}
+
 /// Query for `/api/hashrate`.
 #[derive(Debug, Default, Deserialize)]
 pub struct HashrateQuery {
-    /// Worker name; omitted or empty means the pool total.
+    /// Worker name; omitted or empty means the lane total.
     #[serde(default)]
     pub worker: String,
     /// How far back to look, in seconds (default one day, capped at 30 days).
     pub span: Option<u64>,
+    /// Lane key; omitted means the primary lane.
+    pub lane: Option<String>,
 }
 
-/// Hashrate samples for the pool or one worker, oldest first.
+/// Hashrate samples for a lane or one of its workers, oldest first.
 pub async fn hashrate(
     State(state): State<AppState>,
     Query(q): Query<HashrateQuery>,
 ) -> Result<Json<Vec<HashrateSample>>, ApiError> {
+    let lane = resolve_lane(&state, q.lane.as_deref())?;
     let span = q
         .span
         .unwrap_or(DEFAULT_HASHRATE_SPAN_SECS)
@@ -120,7 +198,7 @@ pub async fn hashrate(
     let since = alamo_core::time::now_unix().saturating_sub(span) as i64;
     let samples = state
         .store()
-        .hashrate_samples_since(&state.primary_lane(), Some(q.worker.as_str()), since)
+        .hashrate_samples_since(&lane.key, Some(q.worker.as_str()), since)
         .await?;
     Ok(Json(samples))
 }
@@ -138,93 +216,104 @@ impl LimitQuery {
     }
 }
 
-/// Stratum share units per unit of network difficulty, or 1 before the pool has
-/// published a snapshot. The store keeps `share_diff` in stratum units; the API reports
-/// network units, matching the best-share figures in the status document.
-fn share_multiplier(state: &AppState) -> f64 {
-    let m = state.snapshot().share_multiplier;
-    if m > 0.0 {
-        m
-    } else {
-        1.0
-    }
+/// Query for `/api/shares`.
+#[derive(Debug, Default, Deserialize)]
+pub struct SharesQuery {
+    /// Maximum rows to return.
+    pub limit: Option<i64>,
+    /// Lane key; omitted means the primary lane.
+    pub lane: Option<String>,
 }
 
-/// Most recent shares, newest first. `share_diff` is in network units; `difficulty`
-/// (the job's) stays in stratum units.
+/// A lane's most recent shares, newest first. `share_diff` is in the lane's network
+/// units; `difficulty` (the job's) stays in stratum units.
 pub async fn shares(
     State(state): State<AppState>,
-    Query(q): Query<LimitQuery>,
+    Query(q): Query<SharesQuery>,
 ) -> Result<Json<Vec<ShareRow>>, ApiError> {
-    let m = share_multiplier(&state);
-    let mut rows = state
-        .store()
-        .recent_shares(&state.primary_lane(), q.clamp(100, 1000))
-        .await?;
+    let lane = resolve_lane(&state, q.lane.as_deref())?;
+    let limit = LimitQuery { limit: q.limit }.clamp(100, 1000);
+    let mut rows = state.store().recent_shares(&lane.key, limit).await?;
     for r in &mut rows {
-        r.share_diff /= m;
+        r.share_diff /= lane.share_multiplier;
     }
     Ok(Json(rows))
 }
 
-/// `POST /api/stats/reset`: zero accepted/rejected share counts and best share for every
-/// worker. The pool task applies it within one publish interval; the response only
-/// confirms it was queued.
-pub async fn reset_stats(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    if state.send_command(Command::ResetStats) {
-        (
+fn queued(
+    state: &AppState,
+    command: Command,
+) -> Result<(StatusCode, Json<serde_json::Value>), Refusal> {
+    if state.send_command(command) {
+        Ok((
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "status": "queued" })),
-        )
+        ))
     } else {
-        (
+        Err(error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "pool is not accepting commands" })),
-        )
+            "pool is not accepting commands",
+        ))
     }
 }
 
-/// `DELETE /api/workers/{name}`: forget a worker that is not connected. Refused with 409
-/// while it has a live session and 404 when the dashboard has never seen it. Like reset,
-/// the pool task applies it within one publish interval.
+/// `POST /api/stats/reset[?lane=]`: zero accepted/rejected share counts and best share
+/// for every worker of the lane (default the primary lane). The pool task applies it
+/// within one publish interval; the response only confirms it was queued.
+pub async fn reset_stats(
+    State(state): State<AppState>,
+    Query(q): Query<LaneQuery>,
+) -> Result<(StatusCode, Json<serde_json::Value>), Refusal> {
+    let lane = resolve_lane(&state, q.lane.as_deref())?;
+    queued(&state, Command::ResetStats { lane: lane.key })
+}
+
+/// `DELETE /api/workers/{name}[?lane=]`: forget a worker of the lane (default the
+/// primary lane) that is not connected. Refused with 409 while it has a live session in
+/// that lane and 404 when the lane has never seen it. Like reset, the pool task applies
+/// it within one publish interval.
 pub async fn remove_worker(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let snapshot = state.snapshot();
-    let Some(worker) = snapshot.workers.iter().find(|w| w.name == name) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "no such worker" })),
-        );
+    Query(q): Query<LaneQuery>,
+) -> Result<(StatusCode, Json<serde_json::Value>), Refusal> {
+    let lane = resolve_lane(&state, q.lane.as_deref())?;
+    let Some(worker) = lane.workers.iter().find(|w| w.name == name) else {
+        return Err(error(StatusCode::NOT_FOUND, "no such worker"));
     };
     if worker.connections > 0 {
-        return (
+        return Err(error(
             StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "worker is connected; disconnect it first" })),
-        );
+            "worker is connected; disconnect it first",
+        ));
     }
-    if state.send_command(Command::RemoveWorker(name)) {
-        (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "status": "queued" })),
-        )
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "pool is not accepting commands" })),
-        )
-    }
+    queued(
+        &state,
+        Command::RemoveWorker {
+            lane: lane.key,
+            name,
+        },
+    )
 }
 
-/// Blocks found, newest first.
+/// Blocks found in every lane, newest first. Each row's `share_diff` is converted with
+/// its own lane's share multiplier; a row from a lane no longer configured uses the
+/// primary lane's.
 pub async fn blocks(
     State(state): State<AppState>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<Vec<BlockRow>>, ApiError> {
-    let m = share_multiplier(&state);
+    let snapshot = state.snapshot();
+    let fallback = positive_or_one(
+        snapshot
+            .lane(&state.primary_lane())
+            .map_or(snapshot.share_multiplier, |l| l.share_multiplier),
+    );
     let mut rows = state.store().recent_blocks(q.clamp(50, 500)).await?;
     for r in &mut rows {
+        let m = snapshot
+            .lane(&r.lane)
+            .map_or(fallback, |l| positive_or_one(l.share_multiplier));
         r.share_diff /= m;
     }
     Ok(Json(rows))
@@ -411,6 +500,20 @@ mod tests {
                     .unwrap_or(0)
             ))
             .join("pool.db")
+    }
+
+    fn lane(
+        key: &str,
+        share_multiplier: f64,
+        workers: Vec<crate::WorkerStatus>,
+    ) -> crate::LaneStatus {
+        crate::LaneStatus {
+            key: key.into(),
+            state: crate::LaneState::Running,
+            share_multiplier,
+            workers,
+            ..Default::default()
+        }
     }
 
     async fn state(tag: &str) -> (AppState, PathBuf) {
@@ -647,7 +750,30 @@ mod tests {
         };
         let res = router(state.clone()).oneshot(post()).await.unwrap();
         assert_eq!(res.status(), StatusCode::ACCEPTED);
-        assert_eq!(rx.try_recv().unwrap(), Command::ResetStats);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::ResetStats { lane: "ltc".into() },
+            "the primary lane by default"
+        );
+        // Another lane by name, once the pool has published its lanes.
+        state.publish(PoolSnapshot::from_lanes(
+            0,
+            vec![lane("ltc", 65536.0, vec![]), lane("doge", 65536.0, vec![])],
+            vec![],
+        ));
+        let (status, _, _) = send(&state, "POST", "/api/stats/reset?lane=doge", None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::ResetStats {
+                lane: "doge".into()
+            }
+        );
+        let (status, _, body) = send(&state, "POST", "/api/stats/reset?lane=btc", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "unknown lane 'btc'; lanes: ltc, doge");
+        assert!(rx.try_recv().is_err());
         // GET is not allowed: the reset must be a deliberate POST.
         let res = router(state.clone())
             .oneshot(
@@ -684,10 +810,15 @@ mod tests {
             work_accepted: 0.0,
             last_share_seconds: None,
         };
-        state.publish(PoolSnapshot {
-            workers: vec![worker("live", 1), worker("gone", 0)],
-            ..PoolSnapshot::default()
-        });
+        // The same name is connected in one lane and idle in the other.
+        state.publish(PoolSnapshot::from_lanes(
+            0,
+            vec![
+                lane("ltc", 65536.0, vec![worker("live", 1), worker("gone", 0)]),
+                lane("doge", 65536.0, vec![worker("live", 0)]),
+            ],
+            vec![],
+        ));
         let delete = |name: &str| {
             Request::builder()
                 .method("DELETE")
@@ -697,9 +828,28 @@ mod tests {
         };
         let res = router(state.clone()).oneshot(delete("gone")).await.unwrap();
         assert_eq!(res.status(), StatusCode::ACCEPTED);
-        assert_eq!(rx.try_recv().unwrap(), Command::RemoveWorker("gone".into()));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::RemoveWorker {
+                lane: "ltc".into(),
+                name: "gone".into()
+            }
+        );
         let res = router(state.clone()).oneshot(delete("live")).await.unwrap();
         assert_eq!(res.status(), StatusCode::CONFLICT);
+        let (status, _, _) = send(&state, "DELETE", "/api/workers/live?lane=doge", None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "idle in doge");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::RemoveWorker {
+                lane: "doge".into(),
+                name: "live".into()
+            }
+        );
+        let (status, _, _) = send(&state, "DELETE", "/api/workers/gone?lane=doge", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "doge never saw it");
+        let (status, _, _) = send(&state, "DELETE", "/api/workers/gone?lane=nope", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         let res = router(state.clone())
             .oneshot(delete("nobody"))
             .await
@@ -721,10 +871,14 @@ mod tests {
     #[tokio::test]
     async fn metrics_serves_prometheus_text() {
         let (state, path) = state("metrics").await;
-        state.publish(PoolSnapshot {
-            shares_accepted: 3,
-            ..Default::default()
-        });
+        state.publish(PoolSnapshot::from_lanes(
+            0,
+            vec![crate::LaneStatus {
+                shares_accepted: 3,
+                ..lane("ltc", 65536.0, vec![])
+            }],
+            vec![],
+        ));
         let res = router(state)
             .oneshot(
                 Request::builder()
@@ -743,7 +897,7 @@ mod tests {
             .await
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(text.contains("alamo_shares_total{result=\"accepted\"} 3\n"));
+        assert!(text.contains("alamo_shares_total{lane=\"ltc\",result=\"accepted\"} 3\n"));
         assert!(text.contains("alamo_info{version=\""));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -938,6 +1092,104 @@ mod tests {
         assert_eq!(second["shares_accepted"], 7);
 
         socket.close(None).await.unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn history_endpoints_take_a_lane_and_convert_with_its_multiplier() {
+        let (state, path) = state("lanes").await;
+        let now = alamo_core::time::now_unix() as i64;
+        let share = |share_diff: f64| NewShare {
+            ts: now,
+            worker: "rig".into(),
+            difficulty: 8.0,
+            share_diff,
+            accepted: true,
+            reject_reason: None,
+        };
+        let store = state.store();
+        store
+            .persist_batch("ltc", &[], &[share(64.0)])
+            .await
+            .unwrap();
+        store
+            .persist_batch("btc", &[], &[share(64.0)])
+            .await
+            .unwrap();
+        for (lane, hashrate) in [("ltc", 1.0), ("btc", 2.0)] {
+            store
+                .insert_hashrate_samples(
+                    lane,
+                    &[HashrateSample {
+                        ts: now - 60,
+                        worker: String::new(),
+                        hashrate,
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+        for (lane, coin, hash) in [
+            ("ltc", "LTC", "aa"),
+            ("btc", "BTC", "bb"),
+            ("gone", "X", "cc"),
+        ] {
+            store
+                .insert_block(&alamo_store::NewBlock {
+                    lane: lane.into(),
+                    coin: coin.into(),
+                    height: 1,
+                    hash: hash.into(),
+                    worker: "rig".into(),
+                    difficulty: 1.0,
+                    share_diff: 64.0,
+                    reward_sats: None,
+                    found_at: now as u64,
+                    status: alamo_store::BlockStatus::Accepted,
+                })
+                .await
+                .unwrap();
+        }
+        // Different multipliers per lane, as scrypt and sha256d lanes would have.
+        state.publish(PoolSnapshot::from_lanes(
+            0,
+            vec![lane("ltc", 16.0, vec![]), lane("btc", 1.0, vec![])],
+            vec![],
+        ));
+
+        let (_, json) = get_json(&state, "/api/shares").await;
+        assert_eq!(json[0]["share_diff"], 4.0, "primary lane, its multiplier");
+        let (_, json) = get_json(&state, "/api/shares?lane=btc").await;
+        assert_eq!(json[0]["share_diff"], 64.0);
+        let (_, json) = get_json(&state, "/api/hashrate").await;
+        assert_eq!(json[0]["hashrate"], 1.0);
+        let (_, json) = get_json(&state, "/api/hashrate?lane=btc").await;
+        assert_eq!(json[0]["hashrate"], 2.0);
+        for uri in ["/api/shares?lane=doge", "/api/hashrate?lane=doge"] {
+            let (status, json) = get_json(&state, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert!(json["error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown lane 'doge'"));
+        }
+
+        let (_, json) = get_json(&state, "/api/blocks").await;
+        let diff = |hash: &str| {
+            json.as_array()
+                .unwrap()
+                .iter()
+                .find(|b| b["hash"] == hash)
+                .unwrap()["share_diff"]
+                .clone()
+        };
+        assert_eq!(diff("aa"), 4.0, "each block in its own lane's units");
+        assert_eq!(diff("bb"), 64.0);
+        assert_eq!(
+            diff("cc"),
+            4.0,
+            "a lane no longer configured uses the primary's"
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -6,6 +6,9 @@
 //! everything else, so no template ever arrives; the DOGE lane's node is a closed port.
 //! The regtest test in `regtest.rs` repeats this against a real node and also checks
 //! that a job is handed out.
+//!
+//! A lane that cannot start fails alone and shows as failed; the daemon exits only when
+//! no lane is left running or connecting.
 
 use alamo::settings::LogSetup;
 use alamo::Config;
@@ -108,6 +111,18 @@ fn log() -> LogSetup {
 }
 
 fn config(ltc_rpc: &str, ltc_port: u16, doge_port: u16, data_dir: &std::path::Path) -> Config {
+    config_with_doge(ltc_rpc, "http://127.0.0.1:1", ltc_port, doge_port, data_dir)
+}
+
+/// LTC on `[stratum]` and DOGE as a second parent with its own section. The DOGE
+/// fallback address is valid on no network, so a DOGE node that answers fails the lane.
+fn config_with_doge(
+    ltc_rpc: &str,
+    doge_rpc: &str,
+    ltc_port: u16,
+    doge_port: u16,
+    data_dir: &std::path::Path,
+) -> Config {
     let ltc_fallback = encode_segwit("rltc", 0, &[0x22; 20]).unwrap();
     Config::parse(&format!(
         r#"
@@ -125,7 +140,7 @@ rpc_password = "p"
 fallback_address = "{ltc_fallback}"
 poll_interval_ms = 100
 [coins.doge]
-rpc_url = "http://127.0.0.1:1"
+rpc_url = "{doge_rpc}"
 rpc_user = "u"
 rpc_password = "p"
 fallback_address = "nUnreachable"
@@ -195,10 +210,91 @@ async fn a_lane_listens_while_another_lane_waits_for_its_node() {
     assert_eq!(state.primary_lane(), "ltc");
     let doc = state.operator().expect("settings installed").settings();
     assert_eq!(
-        doc.coins.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(),
-        vec!["ltc"],
-        "only the connected lane's coins"
+        doc.coins
+            .iter()
+            .map(|c| (c.key.as_str(), c.connected))
+            .collect::<Vec<_>>(),
+        vec![("ltc", true), ("doge", false)],
+        "every coin, connected or not"
     );
+    let lanes = wait_for_lanes(&state, |l| l[0].state == alamo_web::LaneState::Running).await;
+    assert_eq!(lanes[1].state, alamo_web::LaneState::Connecting);
+    assert_eq!(lanes[0].stratum_port, ltc_port);
+    assert_eq!(lanes[1].stratum_port, doge_port);
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), pool)
+        .await
+        .expect("the pool did not stop")
+        .unwrap()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// Wait until the published lanes satisfy `ready`, and return them.
+async fn wait_for_lanes(
+    state: &alamo_web::AppState,
+    ready: impl Fn(&[alamo_web::LaneStatus]) -> bool,
+) -> Vec<alamo_web::LaneStatus> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let lanes = state.snapshot().lanes;
+            if !lanes.is_empty() && ready(&lanes) {
+                return lanes;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the lanes never reached the expected states")
+}
+
+#[tokio::test]
+async fn a_lane_that_cannot_start_fails_alone() {
+    let data_dir = std::env::temp_dir().join(format!("alamo-lanes-one-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let ltc_node = stub_node("regtest").await;
+    // DOGE answers, but its fallback address fits no Dogecoin network.
+    let doge_node = stub_node("main").await;
+    let (ltc_port, doge_port) = (free_port(), free_port());
+    let config = config_with_doge(
+        &format!("http://{ltc_node}"),
+        &format!("http://{doge_node}"),
+        ltc_port,
+        doge_port,
+        &data_dir,
+    );
+    let store = alamo_store::Store::open(&config.database_path())
+        .await
+        .unwrap();
+    let state = alamo_web::AppState::new("lanes test", ltc_port, store.clone());
+    let shutdown = CancellationToken::new();
+    let pool = tokio::spawn(alamo::pool::run(
+        config,
+        store,
+        state.clone(),
+        log(),
+        shutdown.clone(),
+    ));
+
+    let lanes = wait_for_lanes(&state, |l| {
+        l[0].state == alamo_web::LaneState::Running && l[1].state == alamo_web::LaneState::Failed
+    })
+    .await;
+    assert_eq!(lanes[0].key, "ltc");
+    assert!(lanes[0].error.is_none());
+    let error = lanes[1].error.as_deref().unwrap();
+    assert!(error.contains("lane 'doge'"), "{error}");
+    assert!(
+        error.contains("fallback_address is not a valid DOGE address"),
+        "{error}"
+    );
+    assert!(lanes[1].chain.is_none());
+    assert!(TcpStream::connect(("127.0.0.1", ltc_port)).await.is_ok());
+    assert!(TcpStream::connect(("127.0.0.1", doge_port)).await.is_err());
+    assert!(!pool.is_finished(), "the healthy lane keeps the daemon up");
+    let doc = state.operator().unwrap().settings();
+    assert!(doc.coins.iter().any(|c| c.key == "doge" && !c.connected));
 
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(10), pool)
@@ -210,17 +306,61 @@ async fn a_lane_listens_while_another_lane_waits_for_its_node() {
 }
 
 #[tokio::test]
-async fn a_configuration_error_in_one_lane_stops_the_daemon() {
+async fn the_daemon_exits_when_every_lane_has_failed() {
     let data_dir = std::env::temp_dir().join(format!("alamo-lanes-err-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
-    // A mainnet node, but the LTC fallback address is a regtest one.
+    // Mainnet nodes, but the LTC fallback address is a regtest one and the DOGE one fits
+    // no network.
     let node = stub_node("main").await;
-    let config = config(
+    let config = config_with_doge(
+        &format!("http://{node}"),
         &format!("http://{node}"),
         free_port(),
         free_port(),
         &data_dir,
     );
+    let store = alamo_store::Store::open(&config.database_path())
+        .await
+        .unwrap();
+    let state = alamo_web::AppState::new("lanes test", 0, store.clone());
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        alamo::pool::run(config, store, state, log(), CancellationToken::new()),
+    )
+    .await
+    .expect("the pool should stop on its own")
+    .unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("no lane is left running"), "{err}");
+    assert!(err.contains("not a valid"), "{err}");
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[tokio::test]
+async fn a_single_lane_with_a_bad_config_stops_the_daemon_as_before() {
+    let data_dir = std::env::temp_dir().join(format!("alamo-lanes-single-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let node = stub_node("main").await;
+    let ltc_fallback = encode_segwit("rltc", 0, &[0x22; 20]).unwrap();
+    let config = Config::parse(&format!(
+        r#"
+[pool]
+name = "lanes test"
+data_dir = "{}"
+[stratum]
+listen = "127.0.0.1:{}"
+[web]
+listen = "127.0.0.1:0"
+[coins.ltc]
+rpc_url = "http://{node}"
+rpc_user = "u"
+rpc_password = "p"
+fallback_address = "{ltc_fallback}"
+"#,
+        data_dir.display(),
+        free_port()
+    ))
+    .unwrap();
     let store = alamo_store::Store::open(&config.database_path())
         .await
         .unwrap();

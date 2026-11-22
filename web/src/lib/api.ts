@@ -106,32 +106,74 @@ export interface HashrateSample {
   hashrate: number;
 }
 
-export interface Status {
-  pool_name: string;
-  version: string;
-  uptime_seconds: number;
-  /** TCP port miners connect to, on the same host as this dashboard. */
+export type LaneState = 'connecting' | 'running' | 'failed';
+
+/** One lane: a parent coin, its aux coins, its stratum listener, and its own statistics. */
+export interface LaneStatus {
+  /** The parent coin's config key, which is the lane id. */
+  key: string;
+  /** Proof-of-work algorithm. */
+  algorithm: 'scrypt' | 'sha256d';
+  /** TCP port this lane's miners connect to. */
   stratum_port: number;
-  now: number;
-  coins: CoinStatus[];
+  state: LaneState;
+  /** Why the lane failed to start; null unless `state` is 'failed'. */
+  error: string | null;
+  /** 'main', 'test', or 'regtest'; null until the parent's node has answered. */
+  chain: string | null;
+  /**
+   * Stratum share units per unit of network difficulty on this lane's parent chain
+   * (65536 for scrypt, 1 for sha256d). Job difficulties are in stratum units, as the
+   * miner sees them; every other difficulty the API reports, including `share_diff`, is
+   * in network units.
+   */
+  share_multiplier: number;
   hashrate: number;
   shares_accepted: number;
   shares_rejected: number;
   total_work: number;
-  /**
-   * Stratum share units per unit of network difficulty (65536 for scrypt). Job
-   * difficulties are in stratum units, as the miner sees them; every other difficulty
-   * the API reports, including `share_diff`, is in network units.
-   */
-  share_multiplier: number;
   best_share_difficulty: number;
-  /** Worker that found the best share, once there is one. */
   best_share_worker: string | null;
-  /** Unix time the best share arrived, when known. */
   best_share_at: number | null;
-  /** Unix time the pool first saw a worker: when it started keeping score. */
+  /** Unix time the lane first saw a worker: when it started keeping score. */
   scoring_since: number | null;
+  /** Chains mined in this lane, parent first, once they have had a template. */
+  coins: CoinStatus[];
   workers: WorkerStatus[];
+}
+
+export interface Status {
+  pool_name: string;
+  version: string;
+  uptime_seconds: number;
+  /** TCP port the primary lane's miners connect to, on the same host as this dashboard. */
+  stratum_port: number;
+  now: number;
+  /** Every configured lane, primary first. */
+  lanes: LaneStatus[];
+  /** @deprecated Use `lanes[0].coins`. Mirrors the primary lane while it is running. */
+  coins: CoinStatus[];
+  /** @deprecated Use `lanes[0].hashrate`. */
+  hashrate: number;
+  /** @deprecated Use `lanes[0].shares_accepted`. */
+  shares_accepted: number;
+  /** @deprecated Use `lanes[0].shares_rejected`. */
+  shares_rejected: number;
+  /** @deprecated Use `lanes[0].total_work`. */
+  total_work: number;
+  /** @deprecated Use `lanes[0].share_multiplier`. 0 until the primary lane is running. */
+  share_multiplier: number;
+  /** @deprecated Use `lanes[0].best_share_difficulty`. */
+  best_share_difficulty: number;
+  /** @deprecated Use `lanes[0].best_share_worker`. */
+  best_share_worker: string | null;
+  /** @deprecated Use `lanes[0].best_share_at`. */
+  best_share_at: number | null;
+  /** @deprecated Use `lanes[0].scoring_since`. */
+  scoring_since: number | null;
+  /** @deprecated Use `lanes[0].workers`. */
+  workers: WorkerStatus[];
+  /** Every lane's recent blocks; each `share_diff` is in its own lane's network units. */
   blocks: BlockRow[];
 }
 
@@ -170,7 +212,12 @@ export interface Setting<T> {
 export interface CoinSettings {
   key: string;
   symbol: string;
-  chain: string;
+  /** The lane the coin is mined in: its parent's key, or its own if it is a parent. */
+  lane: string;
+  /** Whether the coin's lane has connected; until then a fallback-address change is refused. */
+  connected: boolean;
+  /** null until the coin's node has answered. */
+  chain: string | null;
   merge_mined_with: string | null;
   fallback_address: Setting<string>;
   rpc_url: string;
@@ -191,13 +238,26 @@ export type VardiffField =
 
 export type VardiffSettings = Record<VardiffField, Setting<number>>;
 
+export interface LaneSettings {
+  key: string;
+  /** Address the lane's stratum listener binds. */
+  stratum_listen: string;
+  /** Whether the lane has its own [coins.<key>.stratum]; lanes without one share [stratum]. */
+  own_stratum_section: boolean;
+  vardiff: VardiffSettings;
+}
+
 export interface SettingsDoc {
   read_only: boolean;
   pool_name: Setting<string>;
   coinbase_tag: Setting<string>;
   coinbase_tag_max_bytes: number;
+  /** Every configured coin, primary lane first, connected or not. */
   coins: CoinSettings[];
+  /** @deprecated Use `lanes[0].vardiff`: the primary lane's vardiff. */
   vardiff: VardiffSettings;
+  /** Every configured lane, primary first. */
+  lanes: LaneSettings[];
   log_level: Setting<string>;
   config_toml: string;
 }
@@ -207,7 +267,13 @@ export interface SettingsPatch {
   pool_name?: string | null;
   coinbase_tag?: string | null;
   fallback_addresses?: Record<string, string | null>;
+  /** @deprecated Use `lanes[<primary>].vardiff`. */
   vardiff?: Partial<Record<VardiffField, number | null>>;
+  /**
+   * Per-lane changes. A lane on the default [stratum] section shares its vardiff
+   * overrides with every other lane on that section.
+   */
+  lanes?: Record<string, { vardiff?: Partial<Record<VardiffField, number | null>> }>;
   log_level?: string | null;
 }
 
@@ -235,20 +301,30 @@ async function sendJson<T>(method: 'POST' | 'PUT' | 'DELETE', path: string, body
   return (await res.json()) as T;
 }
 
+/** `&lane=<key>` when a lane is named; the daemon defaults to the primary lane. */
+function laneParam(lane: string | undefined, first = false): string {
+  return lane ? `${first ? '?' : '&'}lane=${encodeURIComponent(lane)}` : '';
+}
+
 export const api = {
   health: () => getJson<Health>('/api/health'),
-  /** Zero accepted/rejected share counts and best share for every worker. */
-  resetStats: () => sendJson<{ status: string }>('POST', '/api/stats/reset'),
-  /** Forget an offline worker: its row, share log, and hashrate history. */
-  removeWorker: (name: string) =>
-    sendJson<{ status: string }>('DELETE', `/api/workers/${encodeURIComponent(name)}`),
-  status: () => getJson<Status>('/api/status'),
-  /** Samples for the pool (empty worker) or one worker over the last `span` seconds. */
-  hashrate: (span: number, worker = '') =>
-    getJson<HashrateSample[]>(
-      `/api/hashrate?span=${span}${worker ? `&worker=${encodeURIComponent(worker)}` : ''}`,
+  /** Zero accepted/rejected share counts and best share for every worker of a lane. */
+  resetStats: (lane?: string) =>
+    sendJson<{ status: string }>('POST', `/api/stats/reset${laneParam(lane, true)}`),
+  /** Forget an offline worker of a lane: its row, share log, and hashrate history. */
+  removeWorker: (name: string, lane?: string) =>
+    sendJson<{ status: string }>(
+      'DELETE',
+      `/api/workers/${encodeURIComponent(name)}${laneParam(lane, true)}`,
     ),
-  shares: (limit: number) => getJson<ShareRow[]>(`/api/shares?limit=${limit}`),
+  status: () => getJson<Status>('/api/status'),
+  /** Samples for a lane (empty worker) or one worker over the last `span` seconds. */
+  hashrate: (span: number, worker = '', lane?: string) =>
+    getJson<HashrateSample[]>(
+      `/api/hashrate?span=${span}${worker ? `&worker=${encodeURIComponent(worker)}` : ''}${laneParam(lane)}`,
+    ),
+  shares: (limit: number, lane?: string) =>
+    getJson<ShareRow[]>(`/api/shares?limit=${limit}${laneParam(lane)}`),
   blocks: (limit: number) => getJson<BlockRow[]>(`/api/blocks?limit=${limit}`),
   settings: () => getJson<SettingsDoc>('/api/settings'),
   /** Apply a change; the daemon validates the whole patch before storing any of it. */

@@ -104,7 +104,7 @@ Work proceeds in waves. Each wave ends with something runnable and tested.
 
 ## Wave 7 — Bitcoin solo mining (SHA-256)
 Design in [BITCOIN.md](BITCOIN.md).
-- [ ] Lanes: one parent chain, its aux chains, stratum listener, vardiff, and stats per
+- [x] Lanes: one parent chain, its aux chains, stratum listener, vardiff, and stats per
   lane, each started independently. Per-lane block submission with retry and a
   write-ahead copy of the block. Migration adding `lane` to workers, shares, and hashrate
   samples. Snapshot gains `lanes[]`. No behaviour change for LTC/DOGE.

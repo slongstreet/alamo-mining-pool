@@ -24,22 +24,32 @@ use tower_http::trace::TraceLayer;
 pub use config::WebConfig;
 pub use logs::LogBuffer;
 pub use settings::{
-    CoinSettings, LogControl, NodeProbe, Operator, Setting, SettingsDoc, SettingsError,
-    SettingsPatch, VardiffPatch, VardiffSettings,
+    CoinSettings, LanePatch, LaneSettings, LogControl, NodeProbe, Operator, Setting, SettingsDoc,
+    SettingsError, SettingsPatch, VardiffPatch, VardiffSettings,
 };
 pub use snapshot::{
-    AuxPayoutStatus, CoinStatus, NodeStatus, PoolSnapshot, RoundStatus, WorkerStatus,
+    AuxPayoutStatus, CoinStatus, LaneState, LaneStatus, NodeStatus, PoolSnapshot, RoundStatus,
+    WorkerStatus,
 };
 
 /// An operator action requested through the API, carried out by the pool task that
 /// owns the live statistics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// Zero every worker's accepted and rejected share counts and best share.
-    ResetStats,
-    /// Forget a worker that has no live session: its row, share log, and hashrate
-    /// history. Its accepted work stays in the pool total so rounds do not move.
-    RemoveWorker(String),
+    /// Zero the accepted and rejected share counts and best share of every worker in
+    /// `lane`.
+    ResetStats {
+        /// Lane key.
+        lane: String,
+    },
+    /// Forget a worker of `lane` that has no live session: its row, share log, and
+    /// hashrate history. Its accepted work stays in the lane total so rounds do not move.
+    RemoveWorker {
+        /// Lane key.
+        lane: String,
+        /// Worker name.
+        name: String,
+    },
 }
 
 /// State shared with request handlers.

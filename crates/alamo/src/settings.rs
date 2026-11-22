@@ -23,8 +23,8 @@ use alamo_stratum::job::{EXTRANONCE1_LEN, EXTRANONCE2_LEN};
 use alamo_stratum::VardiffConfig;
 use alamo_web::settings::BoxFuture;
 use alamo_web::{
-    AppState, CoinSettings, LogControl, NodeProbe, Operator, Setting, SettingsDoc, SettingsError,
-    SettingsPatch, VardiffSettings,
+    AppState, CoinSettings, LaneSettings, LogControl, NodeProbe, Operator, Setting, SettingsDoc,
+    SettingsError, SettingsPatch, VardiffPatch, VardiffSettings,
 };
 use anyhow::Context;
 use std::collections::BTreeMap;
@@ -69,14 +69,18 @@ struct CoinRef {
 }
 
 /// One lane's settings, known from the config alone.
-struct LaneSettings {
+struct LaneSlot {
     key: String,
     /// Config path of the lane's vardiff table; overrides are `<path>.<field>`.
     vardiff_path: String,
     file_vardiff: VardiffConfig,
     vardiff_tx: watch::Sender<VardiffConfig>,
+    stratum_listen: String,
+    own_stratum: bool,
     /// The lane's coin keys, parent first.
     coin_keys: Vec<String>,
+    /// The same coins' configuration, for the document before they connect.
+    coin_configs: Vec<CoinConfig>,
 }
 
 /// A lane whose nodes have connected: its coins and the payout tables built from them.
@@ -109,7 +113,7 @@ struct Effective {
 pub struct LiveSettings {
     store: Store,
     state: AppState,
-    lanes: Vec<LaneSettings>,
+    lanes: Vec<LaneSlot>,
     /// Index of the lane the single-lane settings document describes.
     primary: usize,
     /// Tightest coinbase tag budget over every configured lane.
@@ -151,16 +155,31 @@ impl LiveSettings {
     ) -> anyhow::Result<Arc<Self>> {
         let lane_configs = config.lanes();
         let primary = Config::primary_lane_index(&lane_configs);
-        let lanes: Vec<LaneSettings> = lane_configs
+        let lanes: Vec<LaneSlot> = lane_configs
             .iter()
-            .map(|l: &LaneConfig| LaneSettings {
-                key: l.key.clone(),
-                vardiff_path: l.vardiff_path(),
-                file_vardiff: l.vardiff().clone(),
-                vardiff_tx: watch::Sender::new(l.vardiff().clone()),
-                coin_keys: std::iter::once(l.key.clone())
+            .map(|l: &LaneConfig| {
+                let coin_keys: Vec<String> = std::iter::once(l.key.clone())
                     .chain(l.aux.iter().cloned())
-                    .collect(),
+                    .collect();
+                LaneSlot {
+                    key: l.key.clone(),
+                    vardiff_path: l.vardiff_path(),
+                    file_vardiff: l.vardiff().clone(),
+                    vardiff_tx: watch::Sender::new(l.vardiff().clone()),
+                    stratum_listen: l.stratum.listen.to_string(),
+                    own_stratum: l.own_stratum,
+                    coin_configs: coin_keys
+                        .iter()
+                        .map(|k| {
+                            config
+                                .coins
+                                .get(k)
+                                .cloned()
+                                .expect("lane coins are configured")
+                        })
+                        .collect(),
+                    coin_keys,
+                }
             })
             .collect();
         let file = FileValues {
@@ -292,6 +311,40 @@ impl LiveSettings {
         Ok(receiver)
     }
 
+    /// Forget a lane that failed after [`lane_connected`](Self::lane_connected): its coins
+    /// leave the document's connected set, and their fallback-address overrides go back
+    /// to waiting (kept in the database) so a restart with a fixed config applies them.
+    pub async fn lane_detached(&self, key: &str) {
+        let _guard = self.apply_lock.lock().await;
+        let Some(lane) = self.lane_index(key) else {
+            return;
+        };
+        let connected = {
+            let mut all = self.connected.lock().expect("connected lock");
+            all.retain(|c| c.lane != lane);
+            all.clone()
+        };
+        let mut current = self.overrides.lock().expect("overrides lock").clone();
+        let mut pending = self.pending.lock().expect("pending lock");
+        let coins = &self.lanes[lane].coin_keys;
+        let moved: Vec<String> = current
+            .keys()
+            .filter(|k| Self::fallback_coin(k).is_some_and(|c| coins.iter().any(|k| k == c)))
+            .cloned()
+            .collect();
+        for key in moved {
+            if let Some(value) = current.remove(&key) {
+                pending.insert(key, value);
+            }
+        }
+        drop(pending);
+        match self.validate(&current, &connected) {
+            Ok(effective) => self.apply_live(&effective, &connected, false),
+            Err(err) => tracing::warn!(%err, "settings not reapplied after a lane failed"),
+        }
+        *self.overrides.lock().expect("overrides lock") = current;
+    }
+
     /// Receiver for the coinbase tag bytes, shared by every lane.
     pub fn coinbase_tag(&self) -> watch::Receiver<Vec<u8>> {
         self.tag_tx.subscribe()
@@ -328,7 +381,7 @@ impl LiveSettings {
         format!("coins.{key}.fallback_address")
     }
 
-    fn vardiff_key(lane: &LaneSettings, field: &str) -> String {
+    fn vardiff_key(lane: &LaneSlot, field: &str) -> String {
         format!("{}.{field}", lane.vardiff_path)
     }
 
@@ -437,7 +490,7 @@ impl LiveSettings {
 
     /// One lane's vardiff: its file table with that table's overrides applied.
     fn lane_vardiff(
-        lane: &LaneSettings,
+        lane: &LaneSlot,
         ov: &BTreeMap<String, String>,
     ) -> Result<VardiffConfig, SettingsError> {
         let invalid = |msg: String| SettingsError::Invalid(msg);
@@ -565,14 +618,13 @@ impl LiveSettings {
         })
     }
 
-    /// The settings document. `coins` lists the coins of lanes that have connected and
-    /// `vardiff` is the primary lane's.
-    fn doc(&self, ov: &BTreeMap<String, String>) -> SettingsDoc {
-        let text = |key: &str, file: &str| match ov.get(key) {
-            Some(v) => Setting::overridden(file.to_string(), v.clone()),
-            None => Setting::from_file(file.to_string()),
-        };
-        let lane = &self.lanes[self.primary];
+    /// Lane indexes with the primary first, then the rest in config order: the order of
+    /// the document's `lanes` and `coins`, like the snapshot's.
+    fn lane_order(&self) -> impl Iterator<Item = usize> + '_ {
+        std::iter::once(self.primary).chain((0..self.lanes.len()).filter(|&i| i != self.primary))
+    }
+
+    fn vardiff_doc(lane: &LaneSlot, ov: &BTreeMap<String, String>) -> VardiffSettings {
         let number = |field: &str, file: f64| match ov
             .get(&Self::vardiff_key(lane, field))
             .and_then(|v| v.parse::<f64>().ok())
@@ -581,37 +633,70 @@ impl LiveSettings {
             None => Setting::from_file(file),
         };
         let v = &lane.file_vardiff;
+        VardiffSettings {
+            initial_difficulty: number("initial_difficulty", v.initial_difficulty),
+            min_difficulty: number("min_difficulty", v.min_difficulty),
+            max_difficulty: number("max_difficulty", v.max_difficulty),
+            target_share_seconds: number("target_share_seconds", v.target_share_seconds),
+            retarget_seconds: number("retarget_seconds", v.retarget_seconds),
+            variance_percent: number("variance_percent", v.variance_percent),
+        }
+    }
+
+    /// The settings document. `coins` lists every configured coin, connected or not;
+    /// a stored fallback address still waiting for its coin's node shows as overridden.
+    /// The top-level `vardiff` is the primary lane's.
+    fn doc(&self, ov: &BTreeMap<String, String>) -> SettingsDoc {
+        let pending = self.pending.lock().expect("pending lock").clone();
+        let text = |key: &str, file: &str| match ov.get(key).or_else(|| pending.get(key)) {
+            Some(v) => Setting::overridden(file.to_string(), v.clone()),
+            None => Setting::from_file(file.to_string()),
+        };
         let connected = self.connected();
+        let mut coins = Vec::new();
+        for i in self.lane_order() {
+            let lane = &self.lanes[i];
+            let live = connected.iter().find(|c| c.lane == i);
+            for (key, config) in lane.coin_keys.iter().zip(&lane.coin_configs) {
+                let coin = live.and_then(|l| l.coins.iter().find(|c| &c.key == key));
+                coins.push(CoinSettings {
+                    key: key.clone(),
+                    symbol: alamo_coins::builtin(key)
+                        .map(|c| c.symbol().to_string())
+                        .unwrap_or_else(|| key.to_ascii_uppercase()),
+                    lane: lane.key.clone(),
+                    connected: coin.is_some(),
+                    chain: coin.map(|c| c.chain.to_string()),
+                    merge_mined_with: config.merge_mined_with.clone(),
+                    fallback_address: text(&Self::fallback_key(key), &config.fallback_address),
+                    rpc_url: config.rpc_url.clone(),
+                    rpc_user: config.rpc_user.clone(),
+                    zmq_hashblock: config.zmq_hashblock.clone(),
+                    poll_interval_ms: config.poll_interval_ms,
+                    template_refresh_secs: config.template_refresh_secs,
+                    template_stale_secs: config.template_stale_secs,
+                });
+            }
+        }
         SettingsDoc {
             read_only: false,
             pool_name: text("pool.name", &self.file.pool_name),
             coinbase_tag: text("pool.coinbase_tag", &self.file.coinbase_tag),
             coinbase_tag_max_bytes: self.tag_budget(),
-            coins: connected
-                .iter()
-                .flat_map(|l| &l.coins)
-                .map(|c| CoinSettings {
-                    key: c.key.clone(),
-                    symbol: c.coin.symbol().to_string(),
-                    chain: c.chain.to_string(),
-                    merge_mined_with: c.config.merge_mined_with.clone(),
-                    fallback_address: text(&Self::fallback_key(&c.key), &c.config.fallback_address),
-                    rpc_url: c.config.rpc_url.clone(),
-                    rpc_user: c.config.rpc_user.clone(),
-                    zmq_hashblock: c.config.zmq_hashblock.clone(),
-                    poll_interval_ms: c.config.poll_interval_ms,
-                    template_refresh_secs: c.config.template_refresh_secs,
-                    template_stale_secs: c.config.template_stale_secs,
+            coins,
+            vardiff: Self::vardiff_doc(&self.lanes[self.primary], ov),
+            lanes: self
+                .lane_order()
+                .map(|i| {
+                    let lane = &self.lanes[i];
+                    LaneSettings {
+                        key: lane.key.clone(),
+                        stratum_listen: lane.stratum_listen.clone(),
+                        own_stratum_section: lane.own_stratum,
+                        vardiff: Self::vardiff_doc(lane, ov),
+                    }
                 })
                 .collect(),
-            vardiff: VardiffSettings {
-                initial_difficulty: number("initial_difficulty", v.initial_difficulty),
-                min_difficulty: number("min_difficulty", v.min_difficulty),
-                max_difficulty: number("max_difficulty", v.max_difficulty),
-                target_share_seconds: number("target_share_seconds", v.target_share_seconds),
-                retarget_seconds: number("retarget_seconds", v.retarget_seconds),
-                variance_percent: number("variance_percent", v.variance_percent),
-            },
             log_level: text("log.level", &self.file.log_filter),
             config_toml: self.config_toml.clone(),
         }
@@ -653,18 +738,48 @@ impl LiveSettings {
             }
             set(Self::fallback_key(key), &Some(change.clone()));
         }
-        let lane = &self.lanes[self.primary];
-        let v = &patch.vardiff;
-        for (field, change) in [
-            ("initial_difficulty", &v.initial_difficulty),
-            ("min_difficulty", &v.min_difficulty),
-            ("max_difficulty", &v.max_difficulty),
-            ("target_share_seconds", &v.target_share_seconds),
-            ("retarget_seconds", &v.retarget_seconds),
-            ("variance_percent", &v.variance_percent),
-        ] {
-            let as_text = change.map(|c| c.map(|n| n.to_string()));
-            set(Self::vardiff_key(lane, field), &as_text);
+        // The deprecated top-level vardiff is the primary lane's; `lanes` names lanes. Two
+        // lanes on the default section write the same keys, so a patch may not give one key
+        // two different values.
+        let mut vardiff: Vec<(usize, &str, &VardiffPatch)> =
+            vec![(self.primary, "vardiff", &patch.vardiff)];
+        for (key, lane_patch) in &patch.lanes {
+            let lane = self
+                .lane_index(key)
+                .ok_or_else(|| SettingsError::Invalid(format!("unknown lane {key}")))?;
+            vardiff.push((lane, key.as_str(), &lane_patch.vardiff));
+        }
+        let mut written: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
+        for (lane, source, v) in vardiff {
+            let lane = &self.lanes[lane];
+            for (field, change) in [
+                ("initial_difficulty", &v.initial_difficulty),
+                ("min_difficulty", &v.min_difficulty),
+                ("max_difficulty", &v.max_difficulty),
+                ("target_share_seconds", &v.target_share_seconds),
+                ("retarget_seconds", &v.retarget_seconds),
+                ("variance_percent", &v.variance_percent),
+            ] {
+                let Some(change) = change else {
+                    continue;
+                };
+                let as_text = change.map(|n| n.to_string());
+                let key = Self::vardiff_key(lane, field);
+                let origin = if source == "vardiff" {
+                    format!("vardiff.{field}")
+                } else {
+                    format!("lanes.{source}.vardiff.{field}")
+                };
+                if let Some((earlier, from)) = written.get(&key) {
+                    if *earlier != as_text {
+                        return Err(SettingsError::Invalid(format!(
+                            "{origin} and {from} both set {key} to different values"
+                        )));
+                    }
+                }
+                written.insert(key.clone(), (as_text.clone(), origin));
+                set(key, &Some(as_text));
+            }
         }
         Ok(next)
     }
@@ -704,7 +819,17 @@ impl LiveSettings {
             .flat_map(|l| &l.coins)
             .find(|c| c.key == key)
             .map(|c| (c.key.clone(), c.coin.symbol(), c.rpc.clone()))
-            .ok_or_else(|| format!("unknown coin {key}"))?;
+            .ok_or_else(|| {
+                if self
+                    .lanes
+                    .iter()
+                    .any(|l| l.coin_keys.iter().any(|c| c == key))
+                {
+                    format!("coin {key} has not connected yet")
+                } else {
+                    format!("unknown coin {key}")
+                }
+            })?;
         let started = Instant::now();
         let chain: serde_json::Value = rpc
             .call("getblockchaininfo", &[])
@@ -751,7 +876,7 @@ mod tests {
     use super::*;
     use crate::pool::ChainNode;
     use alamo_coins::{Dogecoin, Litecoin};
-    use alamo_web::VardiffPatch;
+    use alamo_web::LanePatch;
     use std::sync::Mutex as StdMutex;
 
     use alamo_core::address::encode_base58;
@@ -967,6 +1092,7 @@ variance_percent = 20
                     ..Default::default()
                 },
                 log_level: Some(Some("debug".into())),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1226,7 +1352,14 @@ variance_percent = 20
         let merged = start(config()).await;
         assert_eq!(merged.tag_budget(), 41);
         assert_eq!(merged.settings().coinbase_tag_max_bytes, 41);
-        assert!(merged.settings().coins.is_empty(), "nothing connected yet");
+        assert!(
+            merged
+                .settings()
+                .coins
+                .iter()
+                .all(|c| !c.connected && c.chain.is_none()),
+            "nothing connected yet"
+        );
         let err = merged
             .apply(SettingsPatch {
                 coinbase_tag: Some(Some("x".repeat(42))),
@@ -1275,7 +1408,21 @@ variance_percent = 20
             vec!["coins.doge.fallback_address", "coins.ltc.fallback_address"],
             "kept while their lanes are down"
         );
-        assert!(live.settings().coins.is_empty());
+        // Every configured coin is listed, unconnected, with its waiting address shown.
+        let doc = live.settings();
+        assert_eq!(
+            doc.coins
+                .iter()
+                .map(|c| (c.key.as_str(), c.lane.as_str(), c.connected))
+                .collect::<Vec<_>>(),
+            vec![("ltc", "ltc", false), ("doge", "doge", false)],
+            "primary lane first"
+        );
+        assert_eq!(
+            doc.coins[1].fallback_address,
+            Setting::overridden(DOGE_FALLBACK.clone(), DOGE_OTHER.clone())
+        );
+        assert!(doc.coins[1].chain.is_none());
         let err = live
             .apply(SettingsPatch {
                 fallback_addresses: [("doge".to_string(), Some(DOGE_FALLBACK.clone()))].into(),
@@ -1298,9 +1445,11 @@ variance_percent = 20
         let doge = live.lane_connected(&lane_chains("doge")).await.unwrap();
         assert_eq!(doge.borrow().parent.fallback_address(), DOGE_OTHER.as_str());
         let doc = live.settings();
-        assert_eq!(doc.coins.len(), 1);
+        assert!(doc.coins[1].connected);
+        assert_eq!(doc.coins[1].chain.as_deref(), Some("main"));
+        assert!(!doc.coins[0].connected);
         assert_eq!(
-            doc.coins[0].fallback_address,
+            doc.coins[1].fallback_address,
             Setting::overridden(DOGE_FALLBACK.clone(), DOGE_OTHER.clone())
         );
         assert!(store
@@ -1320,13 +1469,210 @@ variance_percent = 20
             vec!["coins.doge.fallback_address", "pool.name"]
         );
         let doc = live.settings();
-        assert_eq!(
-            doc.coins.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(),
-            vec!["doge", "ltc"],
-            "lane order"
-        );
-        assert!(!doc.coins[1].fallback_address.overridden);
+        assert!(doc.coins.iter().all(|c| c.connected));
+        assert!(!doc.coins[0].fallback_address.overridden);
         assert_eq!(doge.borrow().parent.fallback_address(), DOGE_OTHER.as_str());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn lanes_in_the_document_and_per_lane_vardiff_patches() {
+        let (store, path) = temp_store("lane-patches").await;
+        let state = AppState::new("File Pool", 3333, store.clone());
+        let (log, _) = log_setup();
+        let live = LiveSettings::start(&two_lane_config(), store.clone(), state, log)
+            .await
+            .unwrap();
+        let doc = live.settings();
+        assert_eq!(
+            doc.lanes
+                .iter()
+                .map(|l| (
+                    l.key.as_str(),
+                    l.stratum_listen.as_str(),
+                    l.own_stratum_section
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("ltc", "127.0.0.1:3333", false),
+                ("doge", "127.0.0.1:3334", true)
+            ]
+        );
+        assert_eq!(doc.lanes[1].vardiff.initial_difficulty.value, 8.0);
+        assert_eq!(
+            doc.vardiff, doc.lanes[0].vardiff,
+            "the alias is the primary lane"
+        );
+
+        // A lane by name writes its own table's keys.
+        let doc = live
+            .apply(SettingsPatch {
+                lanes: [(
+                    "doge".to_string(),
+                    LanePatch {
+                        vardiff: VardiffPatch {
+                            min_difficulty: Some(Some(2.0)),
+                            ..Default::default()
+                        },
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            doc.lanes[1].vardiff.min_difficulty,
+            Setting::overridden(1.0, 2.0)
+        );
+        assert!(!doc.lanes[0].vardiff.min_difficulty.overridden);
+        assert_eq!(live.vardiff("doge").unwrap().borrow().min_difficulty, 2.0);
+        assert_eq!(live.vardiff("ltc").unwrap().borrow().min_difficulty, 1024.0);
+        let stored = store.load_settings().await.unwrap();
+        assert_eq!(stored["coins.doge.stratum.vardiff.min_difficulty"], "2");
+
+        // The alias and the primary lane by name write the same key; they must agree.
+        live.apply(SettingsPatch {
+            vardiff: VardiffPatch {
+                min_difficulty: Some(Some(2048.0)),
+                ..Default::default()
+            },
+            lanes: [(
+                "ltc".to_string(),
+                LanePatch {
+                    vardiff: VardiffPatch {
+                        min_difficulty: Some(Some(2048.0)),
+                        ..Default::default()
+                    },
+                },
+            )]
+            .into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(live.vardiff("ltc").unwrap().borrow().min_difficulty, 2048.0);
+        let err = live
+            .apply(SettingsPatch {
+                vardiff: VardiffPatch {
+                    min_difficulty: Some(Some(1.0e3)),
+                    ..Default::default()
+                },
+                lanes: [(
+                    "ltc".to_string(),
+                    LanePatch {
+                        vardiff: VardiffPatch {
+                            min_difficulty: Some(Some(2.0e3)),
+                            ..Default::default()
+                        },
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("both set stratum.vardiff.min_difficulty to different values"),
+            "{err}"
+        );
+        let err = live
+            .apply(SettingsPatch {
+                lanes: [("btc".to_string(), LanePatch::default())].into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown lane btc"), "{err}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn lanes_sharing_the_default_section_share_its_overrides() {
+        // Both parents on the default [stratum] section, which validates only with port 0.
+        let text = format!(
+            r#"
+[pool]
+name = "File Pool"
+data_dir = "./data"
+[stratum]
+listen = "127.0.0.1:0"
+[web]
+listen = "127.0.0.1:8080"
+{}
+[coins.doge]
+rpc_url = "http://y"
+rpc_user = "u"
+rpc_password = "secret"
+fallback_address = "{}"
+"#,
+            ltc_section(),
+            *DOGE_FALLBACK
+        );
+        let config = Config::parse(&text).unwrap();
+        let (store, path) = temp_store("shared-section").await;
+        let state = AppState::new("File Pool", 0, store.clone());
+        let (log, _) = log_setup();
+        let live = LiveSettings::start(&config, store.clone(), state, log)
+            .await
+            .unwrap();
+        let doc = live
+            .apply(SettingsPatch {
+                lanes: [(
+                    "ltc".to_string(),
+                    LanePatch {
+                        vardiff: VardiffPatch {
+                            max_difficulty: Some(Some(1.0e6)),
+                            ..Default::default()
+                        },
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // One stored key, and every lane on [stratum] follows it.
+        assert_eq!(store.load_settings().await.unwrap().len(), 1);
+        assert!(doc.lanes.iter().all(|l| !l.own_stratum_section
+            && l.vardiff.max_difficulty == Setting::overridden(16_777_216.0, 1.0e6)));
+        assert_eq!(live.vardiff("doge").unwrap().borrow().max_difficulty, 1.0e6);
+        assert_eq!(live.vardiff("ltc").unwrap().borrow().max_difficulty, 1.0e6);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_detached_lane_puts_its_addresses_back_to_waiting() {
+        let (store, path) = temp_store("detach").await;
+        store
+            .set_setting("coins.doge.fallback_address", &DOGE_OTHER, 1)
+            .await
+            .unwrap();
+        let state = AppState::new("File Pool", 3333, store.clone());
+        let (log, _) = log_setup();
+        let live = LiveSettings::start(&two_lane_config(), store.clone(), state, log)
+            .await
+            .unwrap();
+        live.lane_connected(&lane_chains("doge")).await.unwrap();
+        assert!(live.settings().coins[1].connected);
+        live.lane_detached("doge").await;
+        let doc = live.settings();
+        assert!(!doc.coins[1].connected);
+        assert!(doc.coins[1].fallback_address.overridden, "still stored");
+        // Other changes still validate with the lane gone.
+        live.apply(SettingsPatch {
+            pool_name: Some(Some("After".into())),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(store
+            .load_settings()
+            .await
+            .unwrap()
+            .contains_key("coins.doge.fallback_address"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

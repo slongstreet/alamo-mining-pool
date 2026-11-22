@@ -24,7 +24,7 @@ a vardiff that copes with ASIC-scale hashrate.
 - **No version rolling.** `mining.configure` answers `version-rolling: false`
   (`crates/alamo-stratum/src/session.rs`). Modern SHA-256 ASICs expect BIP310.
 - ~~**Stats are global.**~~ Done: one `Stats` per lane, each with its own
-  `share_multiplier`. The API still shows only the primary lane (section 7 is next).
+  `share_multiplier`, and the API and metrics show every lane (section 7).
 - ~~**Storage has no lane.**~~ Done: migration 0008 (section 6).
 
 ### Prework before real BTC hashrate is pointed at it
@@ -125,15 +125,25 @@ Signet needs the extra `signet` template rule and is left out of the first cut.
   `hashrate_samples`; key `retired_work` per lane in `pool_counters`.
 - Existing rows default to `ltc`. That is safe because no other parent has ever existed.
 
-### 7. API and metrics
-- The snapshot gains `lanes[]`. Each entry carries the lane key, algorithm, stratum port,
-  share multiplier, hashrate, share counts, best share, coins, and workers.
-- The current top-level fields keep mirroring the first lane for one release and are
-  marked deprecated.
-- `/api/hashrate`, `/api/shares`, the stats reset, and worker removal take a `lane`
-  parameter. Pool-level Prometheus series gain a `lane` label.
-- Settings: vardiff becomes per lane. The coinbase tag stays global, with the byte budget
+### 7. API and metrics (done)
+- ~~The snapshot gains `lanes[]`.~~ Done: one entry per configured lane, primary first,
+  with key, algorithm, stratum port, `state` (`connecting`/`running`/`failed`) and
+  `error`, chain, share multiplier, hashrate, share counts, work, best share,
+  `scoring_since`, coins, and workers. It is published from startup.
+- ~~Top-level fields mirror the first lane.~~ Done: they mirror the primary lane while it
+  runs (defaults otherwise), for one release, marked deprecated. `blocks` stays global,
+  each row converted with its own lane's share multiplier; rounds are keyed by lane and
+  coin.
+- ~~`lane` parameters.~~ Done: `/api/hashrate`, `/api/shares`, the stats reset, and
+  worker removal take `?lane=` (default the primary lane; unknown is a 400).
+- ~~Prometheus `lane` label.~~ Done on every per-lane series, plus
+  `alamo_lane_state{lane,state}`.
+- ~~Per-lane settings.~~ Done: `SettingsDoc.lanes[]` with each lane's listener and
+  vardiff, `SettingsPatch.lanes.<key>.vardiff`, and every configured coin listed with its
+  lane and whether it has connected. The coinbase tag stays global, with the byte budget
   taken from the tightest lane (41 bytes when a lane merge-mines).
+- A lane that cannot start fails alone and is shown as failed; the daemon exits only when
+  no lane is left running or connecting.
 
 ### 8. Proof
 Block construction must be byte-exact (see `CLAUDE.md`), so:

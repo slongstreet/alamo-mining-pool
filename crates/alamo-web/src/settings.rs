@@ -60,10 +60,13 @@ pub struct SettingsDoc {
     pub coinbase_tag: Setting<String>,
     /// Longest tag the coinbase can carry, in bytes, given the chains being mined.
     pub coinbase_tag_max_bytes: usize,
-    /// Each configured coin, parent first.
+    /// Every configured coin, lane by lane (primary lane first), parent first within a
+    /// lane, whether or not its node has answered yet.
     pub coins: Vec<CoinSettings>,
-    /// Variable-difficulty settings, in the units miners display.
+    /// Deprecated: the primary lane's vardiff, `lanes[0].vardiff`.
     pub vardiff: VardiffSettings,
+    /// Every configured lane, primary first.
+    pub lanes: Vec<LaneSettings>,
     /// Log filter directive (`info`, `debug`, ...).
     pub log_level: Setting<String>,
     /// The effective configuration as TOML with secrets redacted.
@@ -77,8 +80,13 @@ pub struct CoinSettings {
     pub key: String,
     /// Ticker (`LTC`).
     pub symbol: String,
-    /// Network the node is on (`main`, `test`, `regtest`).
-    pub chain: String,
+    /// The lane the coin is mined in: its parent's key, or its own if it is a parent.
+    pub lane: String,
+    /// Whether the coin's lane has connected to its nodes. Until then `chain` is unknown
+    /// and a fallback-address change is refused, since it cannot be checked.
+    pub connected: bool,
+    /// Network the node is on (`main`, `test`, `regtest`); `null` until connected.
+    pub chain: Option<String>,
     /// The parent coin's key when this coin is merge-mined.
     pub merge_mined_with: Option<String>,
     /// Address paid when a miner supplies none that is valid.
@@ -95,6 +103,20 @@ pub struct CoinSettings {
     pub template_refresh_secs: u64,
     /// Seconds a node may stay unreachable before its template is withdrawn.
     pub template_stale_secs: u64,
+}
+
+/// One lane's settings.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LaneSettings {
+    /// Lane id: the parent coin's config key.
+    pub key: String,
+    /// Address the lane's stratum listener binds.
+    pub stratum_listen: String,
+    /// Whether the lane has its own `[coins.<key>.stratum]` section. Lanes without one
+    /// share the default `[stratum]` section, and its vardiff overrides, with each other.
+    pub own_stratum_section: bool,
+    /// The lane's vardiff, in the units its miners display.
+    pub vardiff: VardiffSettings,
 }
 
 /// Variable-difficulty settings, one [`Setting`] each.
@@ -127,12 +149,25 @@ pub struct SettingsPatch {
     /// Fallback address per coin key.
     #[serde(default)]
     pub fallback_addresses: BTreeMap<String, Option<String>>,
-    /// Vardiff fields.
+    /// Deprecated: vardiff fields for the primary lane, like `lanes.<primary>.vardiff`.
     #[serde(default)]
     pub vardiff: VardiffPatch,
+    /// Per-lane changes keyed by lane. A lane's vardiff override is stored under the
+    /// config table it overrides, so patching a lane on the default `[stratum]` section
+    /// changes every lane that shares that section.
+    #[serde(default)]
+    pub lanes: BTreeMap<String, LanePatch>,
     /// Log filter directive.
     #[serde(default, deserialize_with = "double_option")]
     pub log_level: Option<Option<String>>,
+}
+
+/// One lane's part of a [`SettingsPatch`].
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct LanePatch {
+    /// Vardiff fields.
+    #[serde(default)]
+    pub vardiff: VardiffPatch,
 }
 
 /// Vardiff part of a [`SettingsPatch`].
@@ -166,6 +201,10 @@ impl SettingsPatch {
             && self.fallback_addresses.is_empty()
             && self.log_level.is_none()
             && self.vardiff == VardiffPatch::default()
+            && self
+                .lanes
+                .values()
+                .all(|l| l.vardiff == VardiffPatch::default())
     }
 }
 
@@ -244,5 +283,12 @@ mod tests {
         assert_eq!(p.fallback_addresses["doge"].as_deref(), Some("D1"));
         assert_eq!(p.vardiff.min_difficulty, Some(Some(2048.0)));
         assert_eq!(p.vardiff.max_difficulty, None);
+        let p: SettingsPatch =
+            serde_json::from_str(r#"{"lanes": {"doge": {"vardiff": {"min_difficulty": null}}}}"#)
+                .unwrap();
+        assert_eq!(p.lanes["doge"].vardiff.min_difficulty, Some(None));
+        assert!(!p.is_empty());
+        let p: SettingsPatch = serde_json::from_str(r#"{"lanes": {"doge": {}}}"#).unwrap();
+        assert!(p.is_empty());
     }
 }

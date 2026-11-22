@@ -51,9 +51,12 @@ pub struct BlockRow {
     pub work_at_found: Option<f64>,
 }
 
-/// Per-coin round and luck figures derived from the blocks table.
+/// Round and luck figures for one coin in one lane, derived from the blocks table. Keyed
+/// by lane as well as coin so a round is always compared with its own lane's work.
 #[derive(Clone, Debug, Default, PartialEq, sqlx::FromRow)]
 pub struct CoinRounds {
+    /// Lane the blocks were found in.
+    pub lane: String,
     /// Coin ticker.
     pub coin: String,
     /// Blocks the node accepted (whether or not they later matured or were orphaned).
@@ -62,7 +65,7 @@ pub struct CoinRounds {
     pub expected_work: f64,
     /// When the most recent one was found.
     pub last_found_at: Option<i64>,
-    /// Pool-wide work when the most recent one was found; the current round starts here.
+    /// The lane's work when the most recent one was found; the current round starts here.
     pub last_work_at_found: Option<f64>,
 }
 
@@ -149,19 +152,20 @@ impl Store {
         .await?)
     }
 
-    /// Round and luck inputs for every coin that has found a block. Rejected blocks do not
-    /// count: no work was banked and no round ended.
+    /// Round and luck inputs for every (lane, coin) that has found a block. Rejected blocks
+    /// do not count: no work was banked and no round ended.
     pub async fn coin_rounds(&self) -> Result<Vec<CoinRounds>, StoreError> {
         Ok(sqlx::query_as(
-            "SELECT b.coin AS coin,
+            "SELECT b.lane AS lane,
+                    b.coin AS coin,
                     COUNT(*) AS blocks_found,
                     SUM(b.difficulty) AS expected_work,
                     MAX(b.found_at) AS last_found_at,
                     (SELECT work_at_found FROM blocks l
-                     WHERE l.coin = b.coin AND l.status != 'rejected'
+                     WHERE l.lane = b.lane AND l.coin = b.coin AND l.status != 'rejected'
                      ORDER BY l.found_at DESC, l.id DESC LIMIT 1) AS last_work_at_found
              FROM blocks b WHERE b.status != 'rejected'
-             GROUP BY b.coin ORDER BY b.coin",
+             GROUP BY b.lane, b.coin ORDER BY b.lane, b.coin",
         )
         .fetch_all(&self.pool)
         .await?)
@@ -278,6 +282,7 @@ mod tests {
         assert_eq!(
             rounds,
             vec![CoinRounds {
+                lane: "ltc".into(),
                 coin: "LTC".into(),
                 blocks_found: 2,
                 expected_work: 200.0,
@@ -355,6 +360,54 @@ mod tests {
             by_hash("b").work_at_found,
             Some(1507.0),
             "the lane's live work plus its retired work"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn rounds_are_kept_per_lane_and_coin() {
+        use crate::NewShare;
+        let path = temp_path("lane-rounds");
+        let store = Store::open(&path).await.unwrap();
+        let share = |difficulty: f64| NewShare {
+            ts: 1,
+            worker: "rig".into(),
+            difficulty,
+            share_diff: difficulty,
+            accepted: true,
+            reject_reason: None,
+        };
+        let block = |lane: &str, hash: &str, found_at: u64| NewBlock {
+            lane: lane.into(),
+            coin: "DOGE".into(),
+            height: 1,
+            hash: hash.into(),
+            worker: "rig".into(),
+            difficulty: 10.0,
+            share_diff: 10.0,
+            reward_sats: None,
+            found_at,
+            status: BlockStatus::Accepted,
+        };
+        // The same coin found in two lanes, each with its own work.
+        store
+            .persist_batch("ltc", &[], &[share(30.0)])
+            .await
+            .unwrap();
+        store
+            .persist_batch("doge", &[], &[share(500.0)])
+            .await
+            .unwrap();
+        store.insert_block(&block("ltc", "a", 10)).await.unwrap();
+        store.insert_block(&block("doge", "b", 20)).await.unwrap();
+        store.insert_block(&block("doge", "c", 30)).await.unwrap();
+        let rounds = store.coin_rounds().await.unwrap();
+        assert_eq!(
+            rounds
+                .iter()
+                .map(|r| (r.lane.as_str(), r.blocks_found, r.last_work_at_found))
+                .collect::<Vec<_>>(),
+            vec![("doge", 2, Some(500.0)), ("ltc", 1, Some(30.0))]
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

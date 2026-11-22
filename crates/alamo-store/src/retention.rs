@@ -7,7 +7,8 @@ use crate::{Store, StoreError};
 pub struct RetentionPolicy {
     /// Delete individual shares older than this many seconds.
     pub share_secs: i64,
-    /// Extra cap on the shares table, newest rows kept.
+    /// Extra cap on each lane's shares, newest rows kept, so a busy lane cannot push
+    /// another lane's recent shares out of the log and the restart replay.
     pub share_max_rows: i64,
     /// Keep 1-minute hashrate samples this long.
     pub sample_raw_secs: i64,
@@ -45,8 +46,8 @@ pub struct RetentionReport {
 }
 
 impl Store {
-    /// Trim old shares and downsample hashrate samples. Deletes by age and the share row
-    /// cap apply across all lanes; downsampling never merges lanes.
+    /// Trim old shares and downsample hashrate samples. Deletes by age apply across all
+    /// lanes; the share row cap applies to each lane; downsampling never merges lanes.
     ///
     /// Every tier boundary is aligned down to its bucket width so only complete buckets are
     /// folded. A bucket that straddles a boundary is left alone until it has fully aged in,
@@ -92,17 +93,21 @@ impl Store {
             .execute(&self.pool)
             .await?;
         let mut deleted = cutoff.rows_affected();
-        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM shares")
-            .fetch_one(&self.pool)
-            .await?;
-        if count > policy.share_max_rows {
-            let extra = count - policy.share_max_rows;
+        let counts: Vec<(String, i64)> =
+            sqlx::query_as("SELECT lane, COUNT(*) FROM shares GROUP BY lane")
+                .fetch_all(&self.pool)
+                .await?;
+        for (lane, count) in counts {
+            if count <= policy.share_max_rows {
+                continue;
+            }
             let capped = sqlx::query(
                 "DELETE FROM shares WHERE id IN (
-                    SELECT id FROM shares ORDER BY ts ASC, id ASC LIMIT ?
+                    SELECT id FROM shares WHERE lane = ? ORDER BY ts ASC, id ASC LIMIT ?
                  )",
             )
-            .bind(extra)
+            .bind(&lane)
+            .bind(count - policy.share_max_rows)
             .execute(&self.pool)
             .await?;
             deleted += capped.rows_affected();
@@ -334,6 +339,42 @@ mod tests {
                 left[0].hashrate
             );
         }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_share_cap_applies_to_each_lane() {
+        let path = temp_path("retain-lane-cap");
+        let store = Store::open(&path).await.unwrap();
+        let shares = |n: i64, base: i64| -> Vec<NewShare> {
+            (0..n)
+                .map(|i| NewShare {
+                    ts: base + i,
+                    worker: "w".into(),
+                    difficulty: 1.0,
+                    share_diff: 1.0,
+                    accepted: true,
+                    reject_reason: None,
+                })
+                .collect()
+        };
+        // A busy lane with newer shares and a quiet one with two older shares.
+        store
+            .persist_batch(LTC, &[], &shares(6, 1_050))
+            .await
+            .unwrap();
+        store
+            .persist_batch("doge", &[], &shares(2, 1_020))
+            .await
+            .unwrap();
+        let report = store.retain(&policy(), 1_100).await.unwrap();
+        assert_eq!(report.shares_deleted, 3, "only the busy lane is capped");
+        let ltc = store.recent_shares(LTC, 10).await.unwrap();
+        assert_eq!(
+            ltc.iter().map(|s| s.ts).collect::<Vec<_>>(),
+            vec![1_055, 1_054, 1_053]
+        );
+        assert_eq!(store.recent_shares("doge", 10).await.unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
