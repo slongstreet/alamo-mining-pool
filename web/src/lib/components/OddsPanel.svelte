@@ -2,11 +2,12 @@
   import type { CoinStatus } from '../api';
   import {
     formatAgo,
+    formatChance,
     formatClock,
     formatCoins,
     formatDifficulty,
     formatDuration,
-    formatPercent,
+    formatFraction,
     formatPercentValue,
     formatProgress,
   } from '../format';
@@ -26,6 +27,11 @@
     { label: 'Next 30 days', p: coin.odds.p_month },
     { label: 'Next year', p: coin.odds.p_year },
   ]);
+  /**
+   * A long shot (a home miner on Bitcoin): under 1% a year. Every bar would be empty, so
+   * the panel leads with the yearly chance and lists the horizons as "1 in N".
+   */
+  const longShot = $derived(coin.odds.p_year > 0 && coin.odds.p_year < 0.01);
   const roundPct = $derived(Math.min(100, coin.round.progress * 100));
   /** Best share as a fraction of a block, on a log scale so small shares still register. */
   const bestRatio = $derived(
@@ -70,7 +76,7 @@
   const expected = $derived.by(() => {
     const n = coin.round.expected_blocks;
     if (!Number.isFinite(n)) return { value: '—', caption: 'blocks expected so far' };
-    if (n < 1) return { value: formatPercent(n), caption: 'of a block expected so far' };
+    if (n < 1) return { value: formatFraction(n), caption: 'of a block expected so far' };
     return { value: n >= 10 ? n.toFixed(1) : n.toFixed(2), caption: 'blocks expected so far' };
   });
 </script>
@@ -94,11 +100,19 @@
   </div>
 
   <div class="stats">
-    <div class="stat">
-      <div class="label">Time to block</div>
-      <div class="big num">{formatDuration(coin.odds.expected_seconds)}</div>
-      <div class="muted">expected at {coin.odds.hashrate > 0 ? 'current' : 'zero'} hashrate</div>
-    </div>
+    {#if longShot}
+      <div class="stat">
+        <div class="label">Chance this year</div>
+        <div class="big num">{formatChance(coin.odds.p_year)}</div>
+        <div class="muted">a block every {formatDuration(coin.odds.expected_seconds)} on average, at current hashrate</div>
+      </div>
+    {:else}
+      <div class="stat">
+        <div class="label">Time to block</div>
+        <div class="big num">{formatDuration(coin.odds.expected_seconds)}</div>
+        <div class="muted">expected at {coin.odds.hashrate > 0 ? 'current' : 'zero'} hashrate</div>
+      </div>
+    {/if}
     {#if luck != null}
       <div class="stat">
         <div class="label">Luck <Info text={luckHelp} align="right" /></div>
@@ -116,12 +130,14 @@
     {/if}
   </div>
 
-  <ul class="bars">
+  <ul class="bars" class:long={longShot}>
     {#each horizons as h (h.label)}
       <li>
         <span class="label">{h.label}</span>
-        <span class="meter"><span style="width: {Math.max(h.p > 0 ? 0.6 : 0, h.p * 100)}%"></span></span>
-        <span class="pct num">{formatPercent(h.p)}</span>
+        {#if !longShot}
+          <span class="meter"><span style="width: {Math.max(h.p > 0 ? 0.6 : 0, h.p * 100)}%"></span></span>
+        {/if}
+        <span class="pct num">{formatChance(h.p)}</span>
       </li>
     {/each}
   </ul>
@@ -152,7 +168,7 @@
       <span>Best share vs network target <Info text={bestHelp} /></span>
       <span class="muted num">
         {formatDifficulty(bestShare)} / {formatDifficulty(coin.network_difficulty)}
-        {#if bestRatio > 0}· {formatPercent(bestRatio)} of a block{/if}
+        {#if bestRatio > 0}· {formatFraction(bestRatio)} of a block{/if}
       </span>
     </div>
     <div class="meter tall">
@@ -216,19 +232,26 @@
     font-size: 0.82rem;
     margin-top: 0.15rem;
   }
+  /* One grid for every row, so a wide "1 in 4.52 million" widens the value column
+     for all of them and the meters stay aligned. */
   .bars {
     list-style: none;
     margin: 0;
     padding: 0;
     display: grid;
-    gap: 0.45rem;
+    grid-template-columns: 7.5rem 1fr minmax(4.5rem, auto);
+    align-items: center;
+    gap: 0.45rem 0.75rem;
+    font-size: 0.9rem;
+  }
+  .bars.long {
+    grid-template-columns: 7.5rem 1fr;
   }
   .bars li {
     display: grid;
-    grid-template-columns: 7.5rem 1fr 4.5rem;
+    grid-column: 1 / -1;
+    grid-template-columns: subgrid;
     align-items: center;
-    gap: 0.75rem;
-    font-size: 0.9rem;
   }
   .bars .pct {
     text-align: right;

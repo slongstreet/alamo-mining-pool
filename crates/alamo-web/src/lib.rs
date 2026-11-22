@@ -28,8 +28,8 @@ pub use settings::{
     SettingsError, SettingsPatch, VardiffPatch, VardiffSettings,
 };
 pub use snapshot::{
-    AuxPayoutStatus, CoinStatus, LaneState, LaneStatus, NodeStatus, PoolSnapshot, RoundStatus,
-    WorkerStatus,
+    AuxPayoutStatus, CoinStatus, LaneCoin, LaneState, LaneStatus, NodeStatus, PoolSnapshot,
+    RoundStatus, WorkerStatus,
 };
 
 /// An operator action requested through the API, carried out by the pool task that

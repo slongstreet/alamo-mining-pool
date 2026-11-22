@@ -111,7 +111,7 @@ Design in [BITCOIN.md](BITCOIN.md).
 - [x] Bitcoin coin definition, BIP310 version rolling on SHA-256 lanes, vardiff fast start
   and `d=` in the password. Known-answer tests against mainnet data and a `bitcoind`
   regtest round trip in CI.
-- [ ] Dashboard: lane cards, lane-scoped panels, "1 in N" odds, per-lane miner setup and
+- [x] Dashboard: lane cards, lane-scoped panels, "1 in N" odds, per-lane miner setup and
   vardiff settings, Bitcoin node card.
 - [ ] Packaging: example config, operator docs, Umbrel app.
 

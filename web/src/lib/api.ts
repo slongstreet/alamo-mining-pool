@@ -108,6 +108,16 @@ export interface HashrateSample {
 
 export type LaneState = 'connecting' | 'running' | 'failed';
 
+/** A coin configured in a lane, known from startup whether or not its node has answered. */
+export interface LaneCoin {
+  /** Config key (`ltc`). */
+  key: string;
+  /** Ticker (`LTC`), as `CoinStatus.symbol` spells it. */
+  symbol: string;
+  /** Human-readable name (`Litecoin`). */
+  name: string;
+}
+
 /** One lane: a parent coin, its aux coins, its stratum listener, and its own statistics. */
 export interface LaneStatus {
   /** The parent coin's config key, which is the lane id. */
@@ -137,6 +147,8 @@ export interface LaneStatus {
   best_share_at: number | null;
   /** Unix time the lane first saw a worker: when it started keeping score. */
   scoring_since: number | null;
+  /** Every coin configured in this lane, parent first, whatever the lane's state. */
+  configured_coins: LaneCoin[];
   /** Chains mined in this lane, parent first, once they have had a template. */
   coins: CoinStatus[];
   workers: WorkerStatus[];

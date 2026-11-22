@@ -1,9 +1,16 @@
 <script lang="ts">
-  import { api, type CoinSettings, type CoinStatus, type NodeProbe } from '../../api';
+  import { api, type CoinSettings, type CoinStatus, type LaneState, type NodeProbe } from '../../api';
   import { formatDuration, formatInteger } from '../../format';
 
-  /** One coin's node: what the config says, how the pool sees it, and a probe button. */
-  let { coin, live }: { coin: CoinSettings; live: CoinStatus | undefined } = $props();
+  /**
+   * One coin's node: what the config says, how the pool sees it, and a probe button. A
+   * coin whose lane has not connected has no network yet and no live status.
+   */
+  let {
+    coin,
+    live,
+    laneState,
+  }: { coin: CoinSettings; live: CoinStatus | undefined; laneState: LaneState | undefined } = $props();
 
   let probing = $state(false);
   let probe = $state<NodeProbe | null>(null);
@@ -24,15 +31,27 @@
 
   const health = $derived(live?.node);
   const reach = $derived(
-    !health ? 'waiting' : !health.connected ? (health.stale ? 'stale' : 'unreachable') : 'connected',
+    !coin.connected
+      ? laneState === 'failed'
+        ? 'lane failed'
+        : 'not connected'
+      : !health
+        ? 'waiting'
+        : !health.connected
+          ? health.stale
+            ? 'stale'
+            : 'unreachable'
+          : 'connected',
   );
-  const reachClass = $derived(reach === 'connected' ? 'ok' : reach === 'waiting' ? '' : 'bad');
+  const reachClass = $derived(
+    reach === 'connected' ? 'ok' : reach === 'waiting' ? '' : reach === 'not connected' ? 'warn' : 'bad',
+  );
 </script>
 
 <div class="card">
   <div class="title">
     <strong>{coin.symbol}</strong>
-    <span class="muted">{coin.chain}</span>
+    <span class="muted">{coin.chain ?? 'network not known yet'}</span>
     {#if coin.merge_mined_with}
       <span class="badge">merge-mined with {coin.merge_mined_with.toUpperCase()}</span>
     {:else}

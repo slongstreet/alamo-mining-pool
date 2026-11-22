@@ -55,6 +55,8 @@ coinbase to the address the miner used as its stratum username.
 - Dogecoin templates report version `0x00620004` (chain id 98 already in place); mined blocks
   are `0x00620104` (auxpow flag). Block = header, auxpow, varint(ntx), txs. The auxpow's
   coinbase is the non-witness Litecoin coinbase; its `hashBlock` field is not verified.
+- `deploy/regtest/mine-shares.py --port 3333|3334 [--seconds N]` is a dev-only CPU miner that
+  gives a lane workers, shares, and hashrate on regtest (most shares are also regtest blocks).
 - `crates/alamo-core/testdata/doge-371337.hex` is a real mainnet auxpow block; the KAT in
   `auxpow.rs` must keep passing. `btc-699412.hex` is a real Bitcoin mainnet segwit block
   whose header has BIP320 bits rolled; the KATs in `bitcoin_kat.rs` check it authenticates

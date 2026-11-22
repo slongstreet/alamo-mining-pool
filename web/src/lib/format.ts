@@ -54,7 +54,49 @@ export function formatDuration(seconds: number | null | undefined): string {
   if (hours < 48) return `${hours.toFixed(1)}h`;
   const days = hours / 24;
   if (days < 365) return `${days.toFixed(1)}d`;
-  return `${(days / 365.25).toFixed(1)}y`;
+  // A home miner on Bitcoin waits thousands of years or far longer: whole years with
+  // separators, then words, never a wall of digits.
+  const years = days / 365.25;
+  if (years < 100) return `${years.toFixed(1)}y`;
+  if (years < 1e6) return `${formatInteger(Math.round(years))}y`;
+  return `${formatLargeNumber(years)} years`;
+}
+
+const LARGE_WORDS: [number, string][] = [
+  [1e6, 'million'],
+  [1e9, 'billion'],
+  [1e12, 'trillion'],
+];
+const SUPERSCRIPT = '⁰¹²³⁴⁵⁶⁷⁸⁹';
+
+/**
+ * A count that can be astronomically large, for people: "4,520", "45.2 million",
+ * "1.23 trillion", "4.5 × 10¹⁸". Rounded to three significant figures.
+ */
+export function formatLargeNumber(n: number): string {
+  if (!Number.isFinite(n)) return '∞';
+  const rounded = Number(n.toPrecision(3));
+  if (rounded < 1e6) return formatInteger(Math.round(rounded));
+  for (const [scale, word] of LARGE_WORDS) {
+    if (rounded < scale * 1000) return `${Number((rounded / scale).toPrecision(3))} ${word}`;
+  }
+  const exponent = Math.floor(Math.log10(rounded));
+  const mantissa = Number((rounded / 10 ** exponent).toPrecision(2));
+  const power = String(exponent)
+    .split('')
+    .map((d) => SUPERSCRIPT[Number(d)])
+    .join('');
+  return `${mantissa} × 10${power}`;
+}
+
+/**
+ * A probability: a percentage from 1% up, "1 in N" below it, where percentages would
+ * collapse to "0.00%" for a long shot.
+ */
+export function formatChance(probability: number): string {
+  if (!Number.isFinite(probability) || probability <= 0) return '0%';
+  if (probability >= 0.01) return formatPercent(probability);
+  return `1 in ${formatLargeNumber(1 / probability)}`;
 }
 
 /** "3m ago", "2.1h ago", given unix seconds and the current unix time. */
@@ -68,7 +110,19 @@ export function formatPercent(probability: number): string {
   if (pct >= 10) return `${pct.toFixed(1)}%`;
   if (pct >= 0.1) return `${pct.toFixed(2)}%`;
   if (pct === 0) return '0%';
+  // toPrecision switches to exponent notation below 1e-6.
+  if (pct < 1e-6) return '<0.000001%';
   return `${pct.toPrecision(2)}%`;
+}
+
+/**
+ * A fraction of a block (work done ÷ work expected): a percentage from 1% up, "1/N"
+ * below it, so a long shot reads "1/333 million" rather than "<0.000001%".
+ */
+export function formatFraction(fraction: number): string {
+  if (!Number.isFinite(fraction) || fraction <= 0) return '0%';
+  if (fraction >= 0.01) return formatPercent(fraction);
+  return `1/${formatLargeNumber(1 / fraction)}`;
 }
 
 /** A percentage that is already in percent, like luck. */

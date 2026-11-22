@@ -1,33 +1,48 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type ShareRow } from '../api';
-  import { formatAgo, formatClock, formatDifficulty, shortWorker } from '../format';
+  import { formatAgo, formatClock, formatDifficulty, formatInteger, shortWorker } from '../format';
   import Info from './Info.svelte';
 
-  /** `shareMultiplier` converts the job difficulty (stratum units) to network units. */
-  let { now, shareMultiplier }: { now: number; shareMultiplier: number } = $props();
+  /**
+   * One lane's recent shares. `shareMultiplier` is that lane's: it converts the job
+   * difficulty (stratum units) to network units.
+   */
+  let { now, lane, shareMultiplier }: { now: number; lane: string; shareMultiplier: number } = $props();
 
-  const jobHelp =
+  const jobHelp = $derived(
     'The difficulty the pool asked the miner for, in stratum units: the number the miner itself ' +
-    'reports. Share diff, Best share, and the network difficulty are in network units, which are ' +
-    'this divided by the share multiplier (65,536 for scrypt).';
+      'reports. Share diff, Best share, and the network difficulty are in network units, which are ' +
+      (shareMultiplier === 1
+        ? 'the same on this lane (share multiplier 1).'
+        : `this divided by the share multiplier (${formatInteger(shareMultiplier)} on this lane).`),
+  );
 
   let shares = $state<ShareRow[]>([]);
   let paused = $state(false);
 
-  async function load() {
-    if (paused) return;
+  // A lane switch can overtake an answer in flight; only the latest request counts.
+  let request = 0;
+  async function load(force = false) {
+    if (!force && paused) return;
+    const mine = ++request;
     try {
-      shares = await api.shares(40);
+      const next = await api.shares(40, lane);
+      if (mine === request) shares = next;
     } catch {
       // Keep the last list.
     }
   }
 
   onMount(() => {
-    load();
     const timer = setInterval(load, 3_000);
     return () => clearInterval(timer);
+  });
+  // First load, and a fresh list for another lane (even while paused).
+  $effect(() => {
+    void lane;
+    shares = [];
+    load(true);
   });
 
   const reasons: Record<string, string> = {
@@ -38,6 +53,7 @@
     invalid_ntime: 'bad ntime',
     invalid_extranonce2: 'bad extranonce',
     unauthorized: 'unauthorized',
+    invalid_version_bits: 'bad version bits',
   };
 </script>
 

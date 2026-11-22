@@ -145,10 +145,24 @@ pub struct LaneStatus {
     pub best_share_at: Option<u64>,
     /// Unix time the lane first saw a worker: when it started keeping score.
     pub scoring_since: Option<u64>,
+    /// Every coin configured in this lane, parent first, known from startup: what the
+    /// lane mines once its nodes answer, whatever its state.
+    pub configured_coins: Vec<LaneCoin>,
     /// Chains mined in this lane, parent first, once they have had a template.
     pub coins: Vec<CoinStatus>,
     /// Workers seen in this lane, connected first.
     pub workers: Vec<WorkerStatus>,
+}
+
+/// A coin configured in a lane, from the config file rather than its node.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct LaneCoin {
+    /// Config key (`ltc`).
+    pub key: String,
+    /// Ticker (`LTC`), as `CoinStatus::symbol` spells it.
+    pub symbol: String,
+    /// Human-readable name (`Litecoin`).
+    pub name: String,
 }
 
 /// Status of one chain.
@@ -266,6 +280,11 @@ mod tests {
             shares_accepted: shares,
             hashrate: shares as f64,
             best_share_worker: Some(format!("{key}-rig")),
+            configured_coins: vec![LaneCoin {
+                key: key.into(),
+                symbol: key.to_uppercase(),
+                name: format!("{key} coin"),
+            }],
             ..Default::default()
         }
     }
@@ -302,5 +321,10 @@ mod tests {
         assert_eq!(json["lanes"][0]["state"], "connecting");
         assert_eq!(json["lanes"][0]["error"], serde_json::Value::Null);
         assert_eq!(json["lanes"][1]["state"], "running");
+        assert_eq!(
+            json["lanes"][0]["configured_coins"],
+            serde_json::json!([{ "key": "ltc", "symbol": "LTC", "name": "ltc coin" }]),
+            "a lane's configured coins are known before it connects"
+        );
     }
 }

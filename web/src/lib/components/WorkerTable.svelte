@@ -1,18 +1,18 @@
 <script lang="ts">
-  import { api, type CoinStatus, type WorkerStatus } from '../api';
+  import { api, type LaneStatus, type WorkerStatus } from '../api';
   import { formatDifficulty, formatDuration, formatHashrate, formatInteger, shortAddress, shortWorker } from '../format';
+  import { unitsHelp } from '../lanes';
   import Info from './Info.svelte';
   import MinerSetup from './MinerSetup.svelte';
 
-  const diffHelp =
-    'The share difficulty the pool currently asks this worker for, in stratum units: the number ' +
-    'the miner itself reports. Best is in network units, comparable to the network difficulty.';
+  /** The selected lane's workers, with removal and connection instructions. */
+  let { lane }: { lane: LaneStatus } = $props();
 
-  let {
-    workers,
-    stratumPort,
-    coins,
-  }: { workers: WorkerStatus[]; stratumPort: number; coins: CoinStatus[] } = $props();
+  const workers = $derived(lane.workers);
+  const diffHelp = $derived(
+    'The share difficulty the pool currently asks this worker for, in stratum units: the number ' +
+      `the miner itself reports. Best is in network units, comparable to the network difficulty. ${unitsHelp(lane)}`,
+  );
 
   /** Workers whose removal is in flight; the row disappears with the next snapshot. */
   let removing = $state<Set<string>>(new Set());
@@ -23,7 +23,7 @@
     removing = new Set(removing).add(w.name);
     removeError = null;
     try {
-      await api.removeWorker(w.name);
+      await api.removeWorker(w.name, lane.key);
     } catch (err) {
       removeError = err instanceof Error ? err.message : String(err);
       const next = new Set(removing);
@@ -37,7 +37,7 @@
   <h2>Workers</h2>
   {#if workers.length === 0}
     <p class="empty">No workers yet. Point a miner at the pool like this:</p>
-    <MinerSetup port={stratumPort} {coins} />
+    <MinerSetup {lane} />
   {:else}
     {#if removeError}<div class="bad small">{removeError}</div>{/if}
     <div class="scroll">
@@ -98,7 +98,7 @@
     </div>
     <details class="connect">
       <summary>Connect another miner</summary>
-      <MinerSetup port={stratumPort} {coins} />
+      <MinerSetup {lane} />
     </details>
   {/if}
 </section>
