@@ -2,8 +2,8 @@ manifestVersion: 1
 id: longstreet-alamo
 category: bitcoin
 name: Alamo Mining Pool
-version: "0.1.13"
-tagline: Solo mine Litecoin and merge-mine Dogecoin against your own nodes
+version: "0.1.14"
+tagline: Solo mine Litecoin and Dogecoin, and optionally Bitcoin, on your own nodes
 description: >-
   Alamo is a self-hosted solo mining pool. Miners connect over stratum with their
   Litecoin address as the username (and a Dogecoin address as the password) and every
@@ -14,14 +14,22 @@ description: >-
   and ZMQ endpoints automatically. Set your fallback payout addresses on the dashboard's
   Settings page (or in alamo.toml under the app's data directory) before pointing miners
   at port 3333.
+
+  Optional Bitcoin solo mining: point the pool at a Bitcoin node on your network (for
+  example the Bitcoin Node app on another Umbrel) by adding its RPC details to
+  data/alamo.local.toml in the app's data directory, then connect SHA-256 miners with
+  their Bitcoin address as the username to port 3334. The Bitcoin node is not a
+  dependency of this app.
 releaseNotes: >-
-  Alamo 0.1.13: groundwork for mining more than one parent chain. Workers, shares, and
-  hashrate history are now kept per lane (a parent coin and its merge-mined coins); your
-  existing history is carried over and mining is unchanged. The status API lists lanes,
-  and a stored fallback address is no longer dropped when its node is slow to start.
-  Breaking for Prometheus users: every per-lane metric now carries a lane label, so
-  queries against the old unlabelled series need sum() or a lane matcher. The database
-  is upgraded on first start and cannot be opened by older versions afterwards.
+  Alamo 0.1.14: Bitcoin solo mining. Bitcoin (SHA-256) is an optional second lane on
+  port 3334 with its own vardiff, statistics, and blocks, and supports version rolling
+  (ASICBoost). It points at a Bitcoin node of your choosing on your network, which is
+  not a dependency of this app: add its RPC details as [coins.btc] in
+  data/alamo.local.toml under the app's data directory and restart (the Settings page
+  shows the snippet). The dashboard gains lane cards to switch between Scrypt and
+  SHA-256 statistics, "1 in N" odds for long shots, and per-lane vardiff settings.
+  Litecoin and Dogecoin mining is unchanged. Config errors no longer quote the
+  offending line, which could have exposed a password in the log.
 developer: Scott Longstreet
 website: https://github.com/slongstreet/alamo-mining-pool
 icon: https://raw.githubusercontent.com/slongstreet/longstreet-umbrel-apps/refs/heads/main/longstreet-alamo/icon.svg

@@ -22,6 +22,8 @@ coinbase to the address the miner used as its stratum username.
 - Errors: `thiserror` in library crates, `anyhow` only in the binary.
 - Logging: `tracing`. Use structured fields, not formatted strings.
 - Config: TOML, deserialized with serde, validated at startup with clear messages.
+  Config: main file, then `<data_dir>/alamo.local.toml` merged over it (tables merge,
+  other values replace; it may not set `data_dir`), then Settings-page overrides.
 - Run `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and
   `cargo test --workspace` before declaring anything done.
 

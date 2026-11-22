@@ -35,22 +35,65 @@ pub struct PoolConfig {
     pub data_dir: PathBuf,
 }
 
+/// File name of the local overlay, looked up in the main file's `[pool] data_dir`.
+pub const LOCAL_OVERLAY: &str = "alamo.local.toml";
+
 impl Config {
-    /// Read and validate a config file. `${NAME}` anywhere in the file is replaced with
-    /// the environment variable `NAME` before parsing, so secrets such as RPC passwords
-    /// can stay out of the file. An unset variable is an error that names the variable,
-    /// never its value.
+    /// Read and validate a config file, then the local overlay
+    /// `<data_dir>/alamo.local.toml` if there is one, merged over it (see
+    /// [`merge_overlay`]). `${NAME}` anywhere in either file is replaced with the
+    /// environment variable `NAME` before parsing, so secrets such as RPC passwords can
+    /// stay out of the files. An unset variable is an error that names the variable,
+    /// never its value, and parse errors give a position, never the offending line.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path.display()))?;
-        let text = expand_env(&raw, |name| std::env::var(name).ok())
-            .with_context(|| format!("expanding config {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("config {}", path.display()))
+        Self::load_with(path, |name| std::env::var(name).ok())
+    }
+
+    fn load_with(path: &Path, lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let base = read_table(path, &lookup)?;
+        let Some(overlay_path) = overlay_path(&base) else {
+            // No usable data_dir; deserializing reports it.
+            return Self::from_table(base).with_context(|| format!("config {}", path.display()));
+        };
+        let overlay = match std::fs::read_to_string(&overlay_path) {
+            Ok(raw) => parse_table_text(&raw, &overlay_path, &lookup)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(path = %overlay_path.display(), "no local config overlay");
+                return Self::from_table(base)
+                    .with_context(|| format!("config {}", path.display()));
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("reading config overlay {}", overlay_path.display()))
+            }
+        };
+        tracing::info!(path = %overlay_path.display(), "applying local config overlay");
+        let merged = merge_overlay(base, overlay)
+            .with_context(|| format!("config overlay {}", overlay_path.display()))?;
+        Self::from_table(merged).with_context(|| {
+            format!(
+                "config {} with overlay {}",
+                path.display(),
+                overlay_path.display()
+            )
+        })
     }
 
     /// Parse, normalize, and validate config text (after `${NAME}` expansion).
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let mut config: Config = toml::from_str(text).context("parsing")?;
+        Self::from_table(parse_table(text)?)
+    }
+
+    /// Deserialize, normalize, and validate a parsed (and possibly merged) document.
+    fn from_table(table: toml::Table) -> anyhow::Result<Self> {
+        // Deserializing a `Value` carries no source text, so the error cannot quote a
+        // line; it names the key path instead.
+        let mut config: Config = toml::Value::Table(table)
+            .try_into()
+            .map_err(|err: toml::de::Error| {
+                anyhow::anyhow!("{}", err.to_string().trim_end().replace('\n', " "))
+            })
+            .context("parsing")?;
         config.normalize()?;
         config.validate()?;
         Ok(config)
@@ -264,6 +307,80 @@ fn listeners_collide(a: std::net::SocketAddr, b: std::net::SocketAddr) -> bool {
         && a.port() == b.port()
         && a.is_ipv4() == b.is_ipv4()
         && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+}
+
+/// Read, expand, and parse a config file into a TOML table.
+fn read_table(
+    path: &Path,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<toml::Table> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config {}", path.display()))?;
+    parse_table_text(&raw, path, lookup)
+}
+
+fn parse_table_text(
+    raw: &str,
+    path: &Path,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<toml::Table> {
+    let text =
+        expand_env(raw, lookup).with_context(|| format!("expanding config {}", path.display()))?;
+    parse_table(&text).with_context(|| format!("config {}", path.display()))
+}
+
+/// Parse TOML text into a table. The error gives the line and column and what was
+/// wrong, but never the line itself: it may be a password line, already expanded.
+fn parse_table(text: &str) -> anyhow::Result<toml::Table> {
+    text.parse::<toml::Table>().map_err(|err| {
+        let message = err.message().trim_end().replace('\n', " ");
+        match err.span() {
+            Some(span) => {
+                let before = &text[..span.start.min(text.len())];
+                let line = before.matches('\n').count() + 1;
+                let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+                anyhow::anyhow!("parsing: line {line}, column {column}: {message}")
+            }
+            None => anyhow::anyhow!("parsing: {message}"),
+        }
+    })
+}
+
+/// Where the local overlay would be, from the main file's `[pool] data_dir` (relative
+/// to the working directory, like the database). `None` if the main file has no string
+/// `data_dir`, which deserializing then reports.
+fn overlay_path(base: &toml::Table) -> Option<PathBuf> {
+    let data_dir = base.get("pool")?.as_table()?.get("data_dir")?.as_str()?;
+    Some(Path::new(data_dir).join(LOCAL_OVERLAY))
+}
+
+/// Merge the local overlay over the main file: tables merge key by key, recursively;
+/// any other value in the overlay, arrays included, replaces the base value whole. The
+/// overlay lives in `data_dir`, so it may not move it.
+pub fn merge_overlay(mut base: toml::Table, overlay: toml::Table) -> anyhow::Result<toml::Table> {
+    if overlay
+        .get("pool")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|pool| pool.contains_key("data_dir"))
+    {
+        bail!(
+            "[pool] data_dir cannot be set in {LOCAL_OVERLAY}, which is read from data_dir; \
+             set it in the main config file"
+        );
+    }
+    deep_merge(&mut base, overlay);
+    Ok(base)
+}
+
+fn deep_merge(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(b)), toml::Value::Table(o)) => deep_merge(b, o),
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
 }
 
 /// Replace every `${NAME}` with `lookup(NAME)`. Names are `[A-Za-z0-9_]+`; anything else
@@ -625,6 +742,219 @@ variance_percent = 20"#,
             e.contains("coins.doge.stratum.vardiff.initial_difficulty must lie within"),
             "{e}"
         );
+    }
+
+    fn table(text: &str) -> toml::Table {
+        parse_table(text).unwrap()
+    }
+
+    #[test]
+    fn overlay_merges_tables_and_replaces_everything_else() {
+        let base =
+            table("a = 1\nlist = [1, 2, 3]\n[t]\nx = 1\ny = \"keep\"\n[t.deep]\nz = true\nw = 2\n");
+        let overlay = table(
+            "list = [9]\nnew = \"n\"\n[t]\nx = 5\n[t.deep]\nz = false\n[added.inner]\nk = 1\n",
+        );
+        let merged = merge_overlay(base, overlay).unwrap();
+        let expected = table(
+            "a = 1\nlist = [9]\nnew = \"n\"\n[t]\nx = 5\ny = \"keep\"\n[t.deep]\nz = false\nw = 2\n\
+             [added.inner]\nk = 1\n",
+        );
+        assert_eq!(merged, expected);
+
+        // A scalar over a table, or a table over a scalar, replaces it whole.
+        let merged = merge_overlay(table("[t]\nx = 1\ns = 1\n"), table("t = 3\n")).unwrap();
+        assert_eq!(merged, table("t = 3\n"));
+        let merged = merge_overlay(table("t = 3\n"), table("[t]\nx = 1\n")).unwrap();
+        assert_eq!(merged, table("[t]\nx = 1\n"));
+
+        // An empty overlay changes nothing.
+        let base = table(&format!("{HEAD}{}", coin("ltc", "")));
+        assert_eq!(
+            merge_overlay(base.clone(), toml::Table::new()).unwrap(),
+            base
+        );
+    }
+
+    #[test]
+    fn overlay_may_not_set_data_dir() {
+        let base = table(&format!("{HEAD}{}", coin("ltc", "")));
+        let e = merge_overlay(base.clone(), table("[pool]\ndata_dir = \"/elsewhere\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("data_dir cannot be set in alamo.local.toml"),
+            "{e}"
+        );
+        // Other [pool] keys are fine.
+        let merged = merge_overlay(base, table("[pool]\nname = \"Mine\"\n")).unwrap();
+        assert_eq!(merged["pool"]["name"].as_str(), Some("Mine"));
+        assert_eq!(merged["pool"]["data_dir"].as_str(), Some("./data"));
+    }
+
+    #[test]
+    fn an_overlay_adding_bitcoin_gives_a_second_lane() {
+        let base = table(&format!(
+            "{HEAD}{}{}",
+            coin("ltc", ""),
+            coin("doge", "merge_mined_with = \"ltc\"")
+        ));
+        let overlay = table(
+            "[coins.btc]\nenabled = true\nrpc_url = \"http://192.168.1.20:8332\"\n\
+             rpc_user = \"umbrel\"\nrpc_password = \"pw\"\nfallback_address = \"bc1q\"\n\
+             [coins.btc.stratum]\nlisten = \"0.0.0.0:3334\"\n",
+        );
+        let cfg = Config::from_table(merge_overlay(base, overlay).unwrap()).unwrap();
+        let lanes = cfg.lanes();
+        assert_eq!(
+            lanes.iter().map(|l| l.key.as_str()).collect::<Vec<_>>(),
+            vec!["btc", "ltc"]
+        );
+        let (btc, ltc) = (&lanes[0], &lanes[1]);
+        assert_eq!(btc.algorithm, Algorithm::Sha256d);
+        assert!(btc.own_stratum);
+        assert_eq!(btc.stratum.listen.port(), 3334);
+        assert_eq!(btc.vardiff(), &VardiffConfig::SHA256D);
+        assert_eq!(ltc.stratum.listen.port(), 3333);
+        assert_eq!(ltc.aux, vec!["doge".to_string()]);
+        assert_eq!(cfg.primary_lane().unwrap().key, "ltc");
+        // The redacted view is the merged one.
+        let text = cfg.redacted_toml();
+        assert!(
+            text.contains("[coins.btc]") && !text.contains("\"pw\""),
+            "{text}"
+        );
+    }
+
+    /// A fresh directory under the system temp dir, removed on drop.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "alamo-config-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_main(dir: &Path) -> PathBuf {
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let text = format!(
+            "{}{}{}",
+            HEAD.replace("./data", &data.display().to_string()),
+            coin("ltc", ""),
+            coin("doge", "merge_mined_with = \"ltc\"")
+        );
+        let path = dir.join("alamo.toml");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_without_an_overlay_reads_the_main_file_alone() {
+        let dir = TempDir::new("absent");
+        let path = write_main(&dir.0);
+        let cfg = Config::load_with(&path, |_| None).unwrap();
+        assert_eq!(cfg.lanes().len(), 1);
+        assert_eq!(cfg.coins["ltc"].rpc_password, "p");
+    }
+
+    #[test]
+    fn load_applies_the_overlay_with_env_expansion() {
+        let dir = TempDir::new("present");
+        let path = write_main(&dir.0);
+        std::fs::write(
+            dir.0.join("data").join(LOCAL_OVERLAY),
+            "# rpc_password = \"${NOT_SET}\" in a comment is fine\n\
+             [coins.ltc]\nrpc_password = \"${LTC_PASS}\"\n\
+             [coins.btc]\nrpc_url = \"http://${BTC_HOST}:8332\"\nrpc_user = \"umbrel\"\n\
+             rpc_password = \"${BTC_PASS}\"\nfallback_address = \"bc1q\"\n\
+             [coins.btc.stratum]\nlisten = \"0.0.0.0:3334\"\n",
+        )
+        .unwrap();
+        let env = |name: &str| match name {
+            "LTC_PASS" => Some("ltc-secret".to_string()),
+            "BTC_HOST" => Some("192.168.1.20".to_string()),
+            "BTC_PASS" => Some("btc-secret".to_string()),
+            _ => None,
+        };
+        let cfg = Config::load_with(&path, env).unwrap();
+        assert_eq!(cfg.coins["ltc"].rpc_password, "ltc-secret");
+        assert_eq!(
+            cfg.coins["ltc"].rpc_user, "u",
+            "untouched keys keep the file's value"
+        );
+        assert_eq!(cfg.coins["btc"].rpc_url, "http://192.168.1.20:8332");
+        assert_eq!(cfg.coins["btc"].rpc_password, "btc-secret");
+        assert_eq!(cfg.lanes().len(), 2);
+
+        // An unset variable in the overlay names the variable and the overlay file.
+        let e = format!("{:#}", Config::load_with(&path, |_| None).unwrap_err());
+        assert!(e.contains("LTC_PASS") && e.contains(LOCAL_OVERLAY), "{e}");
+
+        // Validation errors after the merge name both files.
+        std::fs::write(
+            dir.0.join("data").join(LOCAL_OVERLAY),
+            "[coins.btc]\nrpc_url = \"http://x\"\nrpc_user = \"u\"\nrpc_password = \"p\"\n\
+             fallback_address = \"a\"\n",
+        )
+        .unwrap();
+        let e = format!("{:#}", Config::load_with(&path, |_| None).unwrap_err());
+        assert!(
+            e.contains("with overlay") && e.contains(LOCAL_OVERLAY),
+            "{e}"
+        );
+        assert!(e.contains("coins 'btc' and 'ltc' would both listen"), "{e}");
+
+        // An overlay that moves data_dir is refused.
+        std::fs::write(
+            dir.0.join("data").join(LOCAL_OVERLAY),
+            "[pool]\ndata_dir = \"/tmp\"\n",
+        )
+        .unwrap();
+        let e = format!("{:#}", Config::load_with(&path, |_| None).unwrap_err());
+        assert!(e.contains("data_dir cannot be set"), "{e}");
+    }
+
+    #[test]
+    fn errors_never_quote_a_credential() {
+        let dir = TempDir::new("secret");
+        let path = write_main(&dir.0);
+        let overlay = dir.0.join("data").join(LOCAL_OVERLAY);
+        for text in [
+            // A syntax error on the password line (an unescaped quote).
+            "[coins.btc]\nrpc_password = \"hunter2\"x\"\n",
+            // An unknown key next to the password.
+            "[coins.ltc]\nrpc_pasword = \"hunter2\"\n",
+            // A wrong type.
+            "[coins.ltc]\nrpc_password = [\"hunter2\"]\n",
+        ] {
+            std::fs::write(&overlay, text).unwrap();
+            let e = format!("{:#}", Config::load_with(&path, |_| None).unwrap_err());
+            assert!(!e.contains("hunter2"), "{e}");
+            assert!(e.contains(LOCAL_OVERLAY), "{e}");
+        }
+        // The same holds for the main file.
+        std::fs::remove_file(&overlay).unwrap();
+        let main = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            main.replacen("rpc_password = \"p\"", "rpc_password = \"hunter2\"x\"", 1),
+        )
+        .unwrap();
+        let e = format!("{:#}", Config::load_with(&path, |_| None).unwrap_err());
+        assert!(!e.contains("hunter2"), "{e}");
+        assert!(e.contains("line "), "{e}");
     }
 
     #[test]

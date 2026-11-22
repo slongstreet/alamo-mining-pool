@@ -219,10 +219,25 @@ Block construction must be byte-exact (see `CLAUDE.md`), so:
 - When `[coins.btc]` is absent, a "Bitcoin not configured" card with the TOML snippet to
   add. Endpoints and credentials stay in the file because the API has no authentication.
 
-## Open decision
-**Umbrel packaging.** The app's `dependencies` are mandatory and an unset `${VAR}` stops
-the daemon, so one app cannot make Bitcoin optional. Options:
+## Packaging decision
+**One Umbrel app; the Bitcoin lane is optional and its node is not a dependency.** The
+app keeps depending only on `longstreet-litecoin` and `longstreet-dogecoin`. An operator
+who wants Bitcoin points the pool at a `bitcoind` of their choosing, typically elsewhere on
+the LAN (for example the Bitcoin Node app on a second Umbrel), by writing `[coins.btc]` and
+`[coins.btc.stratum]` into `data/alamo.local.toml`, which the daemon merges over
+`alamo.toml` at startup. The compose file publishes 3334 for it; nothing listens there
+until the lane exists. Why not the options considered before:
 
-1. A second store app, "Alamo BTC": the same image with a BTC-only config on port 3334,
-   depending only on the Bitcoin node app. (Recommended.)
-2. One app that requires the Litecoin, Dogecoin, and Bitcoin node apps.
+- Umbrel `dependencies` are mandatory, and an unset `${VAR}` stops the daemon, so
+  `${APP_BITCOIN_*}` references in the shipped `alamo.toml` would make Bitcoin required.
+  A required third node app (or a second "Alamo BTC" store app) is more than most
+  operators want for an optional lane.
+- A node on another device cannot come from any app's `exports.sh`: exports describe apps
+  on the same Umbrel, on its internal network.
+- So the endpoint and credentials must be the operator's, kept on the device and never in
+  the store. Umbrel updates copy only a fixed list of files (`docker-compose.yml`,
+  `umbrel-app.yml`, `exports.sh`, `*.template`, ...) and never touch `data/`. An edited
+  `alamo.toml` happens to survive too, but it is the store's file (a later release could
+  ship it as a template), and newer releases of it never reach an existing install. The
+  data directory is the one place that is plainly the operator's and is already
+  persisted, so the overlay lives there. See docs/OPERATING.md, "Bitcoin on Umbrel".

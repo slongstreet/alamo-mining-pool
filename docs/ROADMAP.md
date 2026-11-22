@@ -113,7 +113,8 @@ Design in [BITCOIN.md](BITCOIN.md).
   regtest round trip in CI.
 - [x] Dashboard: lane cards, lane-scoped panels, "1 in N" odds, per-lane miner setup and
   vardiff settings, Bitcoin node card.
-- [ ] Packaging: example config, operator docs, Umbrel app.
+- [x] Packaging: example config, operator docs, Umbrel app with an optional Bitcoin lane
+  configured through the local overlay `<data_dir>/alamo.local.toml`.
 
 ## Later
 - More sha256d parents (BCH) as additional lanes.

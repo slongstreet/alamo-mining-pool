@@ -95,7 +95,10 @@ for x86-64 and arm64 Linux and publishes `ghcr.io/slongstreet/alamo-mining-pool`
 
 ## Configuration
 
-Copy `config/alamo.example.toml` to `alamo.toml` and edit it. Miners connect with their
+Copy `config/alamo.example.toml` to `alamo.toml` and edit it. Settings of your own can
+also go in `alamo.local.toml` in the pool's data directory, merged over `alamo.toml` at
+startup; that is how the Umbrel app adds an optional Bitcoin lane (see
+[docs/OPERATING.md](docs/OPERATING.md)). Miners connect with their
 payout address as the stratum username (ckpool style), for example
 `ltc1q...` for Litecoin or `bc1q...`/`bc1p...` for Bitcoin (on the Bitcoin lane's port). A worker name can be appended after a dot: `ltc1q....rig1`.
 

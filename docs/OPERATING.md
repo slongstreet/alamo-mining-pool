@@ -114,7 +114,7 @@ can reach (`host.docker.internal` on Docker Desktop) and publish ports 3333 and 
 depends on the `longstreet-litecoin` and `longstreet-dogecoin` node apps and reads their
 RPC and ZMQ endpoints from the variables those apps export, so no credential is ever
 written into the store. This directory is the source of truth; the store repository holds
-a copy of it. To publish a release:
+a copy of it.
 
 The Umbrel app version, the image tag it pins, and the workspace version are one number:
 an Alamo release is an Umbrel app release, and a store-only fix gets a patch release of
@@ -137,12 +137,74 @@ To install:
 
 1. Install the app from the Umbrel UI. Umbrel copies the directory to the app's data
    directory and sources the node apps' exports before starting the container.
-3. Edit the two `fallback_address` values in `alamo.toml` under the app's data directory
-   and restart the app.
-4. Point miners at the Umbrel's LAN address on port 3333. The dashboard opens from the
+2. Set the two fallback payout addresses on the dashboard's Settings page, or edit the
+   `fallback_address` values in `alamo.toml` under the app's data directory and restart
+   the app.
+3. Point miners at the Umbrel's LAN address on port 3333. The dashboard opens from the
    Umbrel home screen.
 
 The container runs as the `umbrel` user so it can write the bind-mounted data directory.
+
+An app update copies only a fixed list of files from the store (`docker-compose.yml`,
+`umbrel-app.yml`, `exports.sh`, `*.template`, `torrc`, `hooks`) and leaves the rest of
+`~/umbrel/app-data/longstreet-alamo/` alone, so an edited `alamo.toml` is kept, and a
+newer release's `alamo.toml` never reaches an existing install. The `data/` directory
+(mounted at `/var/lib/alamo`, the pool's `data_dir`) holds the database and is never
+touched by an update; that is where anything you add belongs.
+
+#### Bitcoin on Umbrel
+
+The app depends only on the Litecoin and Dogecoin node apps. The Bitcoin lane is optional
+and points at a `bitcoind` you name, typically elsewhere on your network, so its address
+and credentials come from you rather than from Umbrel:
+
+1. Create `~/umbrel/app-data/longstreet-alamo/data/alamo.local.toml` (over SSH on the
+   Umbrel that runs Alamo) with your node's values:
+
+   ```toml
+   [coins.btc]
+   enabled = true
+   rpc_url = "http://192.168.1.20:8332"
+   rpc_user = "umbrel"
+   rpc_password = "the node's RPC password"
+   # Only if the node's ZMQ hashblock port is reachable from this Umbrel:
+   # zmq_hashblock = "tcp://192.168.1.20:28334"
+   # A Bitcoin address you control, paid when a miner's username is not one.
+   fallback_address = "bc1q..."
+   coinbase_tag = "/alamo/"
+
+   [coins.btc.stratum]
+   listen = "0.0.0.0:3334"
+   ```
+
+   The file holds a password, so `chmod 600` it. It must stay readable by the container's
+   user, `1000:1000` (the `umbrel` user), so create it as that user or `chown 1000:1000` it.
+2. Restart the app. The log says `applying local config overlay` with the file's path,
+   and the dashboard shows a Bitcoin lane and a Bitcoin node card ("Test connection"
+   checks the RPC details).
+3. Point SHA-256 miners at the Umbrel's LAN address on port 3334, with a Bitcoin address
+   as the username (see [Bitcoin](#bitcoin)).
+
+To remove the lane, delete the file (or set `enabled = false` in it) and restart.
+
+##### The Bitcoin Node app on another Umbrel
+
+- **RPC details.** In the Bitcoin Node app, the **Connect** button opens "Connect to
+  Bitcoin Node"; its **RPC Details** tab, in Local mode, shows the username (`umbrel`),
+  password, host, and port (8332). The password is generated once when that app is
+  installed. The host is shown as that Umbrel's `.local` name; with two Umbrels on the
+  network both may be `umbrel.local`, so use the node Umbrel's LAN IP address in
+  `rpc_url`.
+- **RPC from the LAN.** The app publishes RPC port 8332 on its Umbrel's LAN address, but
+  the `bitcoind` configuration it generates only allows RPC from Umbrel's internal app
+  network and localhost (`rpcallowip`), and the Connect dialog warns that a client on the
+  LAN must be allowed by hand. If "Test connection" on Alamo's Settings page is refused,
+  add `rpcallowip=<LAN IP of the Umbrel running Alamo>` to the custom `bitcoin.conf` in
+  the Bitcoin Node app's advanced settings and restart that app.
+- **ZMQ.** The app does not publish its ZMQ ports (hashblock is 28334) outside its own
+  Umbrel, so leave `zmq_hashblock` out. The pool then polls the node for a new tip twice
+  a second (`poll_interval_ms`, default 500), which costs a fraction of a second per
+  block at most.
 
 ### From source
 
@@ -174,6 +236,31 @@ The dashboard is embedded at build time, so build `web/dist` first.
 | `coins.<coin>.template_stale_secs` | How long a node may be unreachable before its template is withdrawn (default 120). |
 
 `alamo --config alamo.toml --check` validates the file and exits.
+
+### Local overlay: `alamo.local.toml`
+
+After reading the main file the daemon looks for `alamo.local.toml` in the main file's
+`pool.data_dir` and, if it exists, merges it over the main file before validating. This
+keeps settings you add yourself, and the secrets that go with them, out of a file that
+someone else ships: the Umbrel app's `alamo.toml` comes from the app store, and the data
+directory is the part of an install that is yours. On Docker the file goes in the
+directory mounted at `/var/lib/alamo`.
+
+- Tables merge key by key, at every depth: an overlay with only `[coins.ltc]
+  fallback_address = "..."` changes that one value. A whole new table, such as
+  `[coins.btc]` with `[coins.btc.stratum]`, is added.
+- Any other value, arrays included, replaces the main file's value whole.
+- `${NAME}` is expanded in the overlay exactly as in the main file.
+- The overlay may not set `pool.data_dir` (it is found through it); doing so is a startup
+  error.
+- A missing overlay is fine. A present one is logged once by path, never by contents; an
+  unreadable or invalid one stops startup with an error naming the file. Errors in either
+  file give the line and column, never the line's text, so a password cannot end up in
+  the log.
+
+Precedence, lowest first: the main file, then `alamo.local.toml`, then the values stored
+from the Settings page. The Settings page's "Effective configuration" and "revert to the
+file's value" both mean the merged file. `--check` validates the merged result.
 
 ### Settings page
 
@@ -215,7 +302,9 @@ test rig, lower `initial_difficulty` and `min_difficulty`, or use `d=`.
 
 Bitcoin is a lane of its own: its own port, vardiff, statistics, and blocks, next to (or
 instead of) the Litecoin lane. Add `[coins.btc]` and `[coins.btc.stratum]` as in the
-commented example in `config/alamo.example.toml`, pointing at a `bitcoind` that:
+commented example in `config/alamo.example.toml` (in `alamo.toml`, or in
+[`alamo.local.toml`](#local-overlay-alamolocaltoml); on Umbrel, see
+[Bitcoin on Umbrel](#bitcoin-on-umbrel)), pointing at a `bitcoind` that:
 
 - has RPC enabled (`server=1`, credentials, `rpcallowip` for the pool's host);
 - is fully synced. The lane opens its port once the node answers RPC, but a syncing
