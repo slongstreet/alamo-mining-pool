@@ -321,9 +321,12 @@
         <h2>Bitcoin is not configured</h2>
         <p class="lead muted">
           To solo-mine Bitcoin on its own SHA-256 port, add this to <code>alamo.toml</code> (see
-          <code>config/alamo.example.toml</code> for the optional vardiff table) and restart the pool. Node
-          endpoints and credentials can only be set in the file, because the dashboard's API has no
-          authentication.
+          <code>config/alamo.example.toml</code> for the optional vardiff table) and restart the pool. On
+          Umbrel or Docker, put it in <code>alamo.local.toml</code> in the pool's data directory instead
+          (<code>~/umbrel/app-data/longstreet-alamo/data/</code> on Umbrel): it is merged over
+          <code>alamo.toml</code> at startup and survives app updates. Leave out <code>zmq_hashblock</code> if
+          the node's ZMQ port is not reachable; the pool then polls. Node endpoints and credentials can only
+          be set in a file, because the dashboard's API has no authentication.
         </p>
         <pre class="config">{btcSnippet}</pre>
       </section>

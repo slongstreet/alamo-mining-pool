@@ -43,3 +43,28 @@ zmq_hashblock = "tcp://${APP_LONGSTREET_DOGECOIN_NODE_IP}:${APP_LONGSTREET_DOGEC
 # CHANGE ME: a Dogecoin address you control. Paid when a miner gives no Dogecoin address in
 # the stratum password field.
 fallback_address = "DExampleExampleExampleExampleExampl"
+
+# Optional: Bitcoin solo mining (SHA-256d) on port 3334, against a bitcoind elsewhere on
+# your network (for example the Bitcoin Node app on another Umbrel). It is not configured
+# here: Umbrel does not provide that node's address or credentials, and secrets never go
+# in the app store. Instead create the local overlay
+#   ~/umbrel/app-data/longstreet-alamo/data/alamo.local.toml
+# (inside the container: /var/lib/alamo/alamo.local.toml). The daemon merges it over this
+# file at startup, it lives in the app's data directory, which app updates never touch,
+# and the dashboard's Settings page still overrides both. Put this in it, uncommented,
+# with your node's values, run `chmod 600` on it, and restart the app:
+#
+# [coins.btc]
+# enabled = true
+# rpc_url = "http://192.168.1.20:8332"
+# rpc_user = "umbrel"
+# rpc_password = "the node's RPC password"
+# # Only if the node's ZMQ hashblock port is reachable from this device; without it the
+# # pool polls the node twice a second.
+# # zmq_hashblock = "tcp://192.168.1.20:28334"
+# # CHANGE ME: a Bitcoin address you control, paid when a miner's username is not one.
+# fallback_address = "bc1qexampleexampleexampleexampleexampleexamp"
+# coinbase_tag = "/alamo/"
+#
+# [coins.btc.stratum]
+# listen = "0.0.0.0:3334"

@@ -19,6 +19,9 @@ services:
     ports:
       # Stratum for miners on the LAN. The dashboard goes through app_proxy.
       - "3333:3333"
+      # Stratum for the optional Bitcoin (SHA-256d) lane, served only once
+      # data/alamo.local.toml adds [coins.btc]; nothing listens here otherwise.
+      - "3334:3334"
     volumes:
       - ${APP_DATA_DIR}/alamo.toml:/etc/alamo/alamo.toml:ro
       - ${APP_DATA_DIR}/data:/var/lib/alamo

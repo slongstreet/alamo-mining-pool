@@ -3,7 +3,7 @@ id: longstreet-alamo
 category: bitcoin
 name: Alamo Mining Pool
 version: "0.1.13"
-tagline: Solo mine Litecoin and merge-mine Dogecoin against your own nodes
+tagline: Solo mine Litecoin and Dogecoin, and optionally Bitcoin, on your own nodes
 description: >-
   Alamo is a self-hosted solo mining pool. Miners connect over stratum with their
   Litecoin address as the username (and a Dogecoin address as the password) and every
@@ -14,6 +14,12 @@ description: >-
   and ZMQ endpoints automatically. Set your fallback payout addresses on the dashboard's
   Settings page (or in alamo.toml under the app's data directory) before pointing miners
   at port 3333.
+
+  Optional Bitcoin solo mining: point the pool at a Bitcoin node on your network (for
+  example the Bitcoin Node app on another Umbrel) by adding its RPC details to
+  data/alamo.local.toml in the app's data directory, then connect SHA-256 miners with
+  their Bitcoin address as the username to port 3334. The Bitcoin node is not a
+  dependency of this app.
 releaseNotes: >-
   Alamo 0.1.13: groundwork for mining more than one parent chain. Workers, shares, and
   hashrate history are now kept per lane (a parent coin and its merge-mined coins); your
