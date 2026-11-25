@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "alamo"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "alamo-coins",
  "alamo-core",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "alamo-coins"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "alamo-core",
  "bitcoin",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "alamo-core"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "bitcoin",
  "hex",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "alamo-store"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "chrono",
  "serde",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "alamo-stratum"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "alamo-core",
  "futures",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "alamo-web"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "alamo-core",
  "alamo-store",
