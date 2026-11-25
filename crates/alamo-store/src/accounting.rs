@@ -2,6 +2,7 @@
 
 use crate::{Store, StoreError};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// An aux-chain payout recorded for a worker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,16 +62,16 @@ pub struct WorkerWrite {
 pub struct NewShare {
     /// Unix time received.
     pub ts: i64,
-    /// Worker name.
-    pub worker: String,
+    /// Worker name, shared with the stratum session that sent the share.
+    pub worker: Arc<str>,
     /// Difficulty the job required.
     pub difficulty: f64,
     /// Difficulty the hash achieved (0 if it was never hashed).
     pub share_diff: f64,
     /// Whether the share was accepted.
     pub accepted: bool,
-    /// Rejection slug, if rejected.
-    pub reject_reason: Option<String>,
+    /// Rejection slug, if rejected (`RejectReason::as_str`).
+    pub reject_reason: Option<&'static str>,
 }
 
 /// A stored share.
@@ -145,6 +146,82 @@ fn aux_address(aux: &[AuxPayoutRecord]) -> Option<&str> {
     aux.first().map(|a| a.address.as_str())
 }
 
+/// One worker's share counters accumulated over a batch, applied with one UPDATE.
+struct WorkerDelta<'a> {
+    name: &'a str,
+    /// Time of the worker's first share in the batch: what a stub row is created with.
+    first_ts: i64,
+    /// Newest share time.
+    last_ts: i64,
+    accepted: i64,
+    rejected: i64,
+    /// Best share in the batch (rejected shares count as 0) and when it first arrived.
+    best: f64,
+    best_at: i64,
+    work: f64,
+}
+
+impl<'a> WorkerDelta<'a> {
+    fn new(share: &'a NewShare) -> Self {
+        Self {
+            name: &share.worker,
+            first_ts: share.ts,
+            last_ts: share.ts,
+            accepted: 0,
+            rejected: 0,
+            best: share_best(share),
+            best_at: share.ts,
+            work: 0.0,
+        }
+    }
+
+    fn add(&mut self, share: &NewShare) {
+        self.last_ts = self.last_ts.max(share.ts);
+        if share.accepted {
+            self.accepted += 1;
+            self.work += share.difficulty;
+        } else {
+            self.rejected += 1;
+        }
+        // Strictly greater, so a tie keeps the earlier share's time, as the per-share
+        // `CASE WHEN best > best_difficulty` did.
+        let best = share_best(share);
+        if best > self.best {
+            self.best = best;
+            self.best_at = share.ts;
+        }
+    }
+}
+
+/// What a share contributes to its worker's best difficulty.
+fn share_best(share: &NewShare) -> f64 {
+    if share.accepted {
+        share.share_diff
+    } else {
+        0.0
+    }
+}
+
+/// Fold a batch's shares into one delta per distinct worker, in first-seen order.
+fn worker_deltas(shares: &[NewShare]) -> Vec<WorkerDelta<'_>> {
+    let mut deltas: Vec<WorkerDelta<'_>> = Vec::new();
+    for share in shares {
+        // Batches come from few workers, often in runs: check the last one first.
+        let i = match deltas.last() {
+            Some(d) if d.name == &*share.worker => deltas.len() - 1,
+            _ => match deltas.iter().position(|d| d.name == &*share.worker) {
+                Some(i) => i,
+                None => {
+                    deltas.push(WorkerDelta::new(share));
+                    deltas.len() - 1
+                }
+            },
+        };
+        deltas[i].add(share);
+    }
+    deltas
+}
+
 /// The `pool_counters` key holding a lane's retired work.
 pub(crate) fn retired_work_key(lane: &str) -> String {
     format!("retired_work:{lane}")
@@ -189,7 +266,12 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
-        for s in shares {
+        // Worker rows are created and updated once per distinct worker rather than once
+        // per share. The result matches applying each share in turn: counts and work add
+        // up, last_seen and best_difficulty take the maximum, and best_at is the time of
+        // the first share reaching the batch's best, if that beats the stored best.
+        let deltas = worker_deltas(shares);
+        for d in &deltas {
             sqlx::query(
                 "INSERT INTO workers (
                     lane, name, payout_address, aux_payouts, fallback, first_seen, last_seen
@@ -197,11 +279,13 @@ impl Store {
                  ON CONFLICT(lane, name) DO NOTHING",
             )
             .bind(lane)
-            .bind(&s.worker)
-            .bind(s.ts)
-            .bind(s.ts)
+            .bind(d.name)
+            .bind(d.first_ts)
+            .bind(d.first_ts)
             .execute(&mut *tx)
             .await?;
+        }
+        for s in shares {
             sqlx::query(
                 "INSERT INTO shares (
                     lane, ts, worker, difficulty, share_diff, accepted, reject_reason
@@ -209,17 +293,15 @@ impl Store {
             )
             .bind(lane)
             .bind(s.ts)
-            .bind(&s.worker)
+            .bind(&*s.worker)
             .bind(s.difficulty)
             .bind(s.share_diff)
             .bind(s.accepted as i64)
-            .bind(&s.reject_reason)
+            .bind(s.reject_reason)
             .execute(&mut *tx)
             .await?;
-            let accepted = s.accepted as i64;
-            let rejected = (!s.accepted) as i64;
-            let best = if s.accepted { s.share_diff } else { 0.0 };
-            let work = if s.accepted { s.difficulty } else { 0.0 };
+        }
+        for d in &deltas {
             sqlx::query(
                 "UPDATE workers SET
                     last_seen = MAX(last_seen, ?),
@@ -230,15 +312,15 @@ impl Store {
                     work_accepted = work_accepted + ?
                  WHERE lane = ? AND name = ?",
             )
-            .bind(s.ts)
-            .bind(accepted)
-            .bind(rejected)
-            .bind(best)
-            .bind(s.ts)
-            .bind(best)
-            .bind(work)
+            .bind(d.last_ts)
+            .bind(d.accepted)
+            .bind(d.rejected)
+            .bind(d.best)
+            .bind(d.best_at)
+            .bind(d.best)
+            .bind(d.work)
             .bind(lane)
-            .bind(&s.worker)
+            .bind(d.name)
             .execute(&mut *tx)
             .await?;
         }
@@ -455,7 +537,7 @@ mod tests {
             difficulty: 16.0,
             share_diff: if accepted { 32.0 } else { 0.0 },
             accepted,
-            reject_reason: (!accepted).then(|| "low_difficulty".into()),
+            reject_reason: (!accepted).then_some("low_difficulty"),
         }
     }
 
@@ -549,6 +631,86 @@ mod tests {
             .unwrap()
             .is_empty());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_batch_updates_workers_as_its_shares_would_one_by_one() {
+        let s = |worker: &str,
+                 ts: i64,
+                 difficulty: f64,
+                 share_diff: f64,
+                 reject: Option<&'static str>| NewShare {
+            ts,
+            worker: worker.into(),
+            difficulty,
+            share_diff,
+            accepted: reject.is_none(),
+            reject_reason: reject,
+        };
+        // rig1 already has a best of 100 from an earlier batch.
+        let earlier = [s("rig1", 1001, 16.0, 100.0, None)];
+        let batch = [
+            s("rig1", 1010, 16.0, 50.0, None),
+            // rig2 never authorized: its row comes from this share, first_seen 1011.
+            s("rig2", 1011, 8.0, 64.0, None),
+            // Rejected: counts, but no work and no best whatever its share_diff says.
+            s("rig1", 1012, 16.0, 999.0, Some("low_difficulty")),
+            // Older than the share before it: last_seen must not go backwards.
+            s("rig2", 1009, 8.0, 128.0, None),
+            // Ties rig2's best: the earlier share keeps best_at.
+            s("rig2", 1013, 4.0, 128.0, None),
+            s("rig2", 1014, 0.0, 0.0, Some("stale_job")),
+            // rig1's batch best (80) does not beat its stored 100: best_at stays 1001.
+            s("rig1", 1008, 16.0, 80.0, None),
+        ];
+
+        let batched = temp_path("batched");
+        let one_by_one = temp_path("one-by-one");
+        let a = Store::open(&batched).await.unwrap();
+        let b = Store::open(&one_by_one).await.unwrap();
+        for store in [&a, &b] {
+            store
+                .persist_batch(LTC, &[worker("rig1", 1000)], &earlier)
+                .await
+                .unwrap();
+        }
+        a.persist_batch(LTC, &[], &batch).await.unwrap();
+        for share in &batch {
+            b.persist_batch(LTC, &[], std::slice::from_ref(share))
+                .await
+                .unwrap();
+        }
+
+        let workers = a.load_workers(LTC).await.unwrap();
+        assert_eq!(workers.len(), 2);
+        let (rig1, rig2) = (&workers[0], &workers[1]);
+        assert_eq!(rig1.name, "rig1");
+        assert_eq!(rig1.payout_address, "ltc1qtest");
+        assert_eq!((rig1.first_seen, rig1.last_seen), (1000, 1012));
+        assert_eq!((rig1.shares_accepted, rig1.shares_rejected), (3, 1));
+        assert_eq!((rig1.best_difficulty, rig1.best_at), (100.0, Some(1001)));
+        assert_eq!(rig1.work_accepted, 48.0);
+        assert_eq!(rig2.name, "rig2");
+        assert_eq!(rig2.payout_address, "");
+        assert_eq!((rig2.first_seen, rig2.last_seen), (1011, 1014));
+        assert_eq!((rig2.shares_accepted, rig2.shares_rejected), (3, 1));
+        assert_eq!((rig2.best_difficulty, rig2.best_at), (128.0, Some(1009)));
+        assert_eq!(rig2.work_accepted, 20.0);
+
+        assert_eq!(workers, b.load_workers(LTC).await.unwrap());
+        // Share rows go in one per share, in order, either way.
+        let shares = a.recent_shares(LTC, 100).await.unwrap();
+        assert_eq!(shares.len(), 1 + batch.len());
+        assert_eq!(shares, b.recent_shares(LTC, 100).await.unwrap());
+        let mut by_id = shares.clone();
+        by_id.sort_by_key(|r| r.id);
+        let order: Vec<i64> = by_id.iter().map(|r| r.ts).collect();
+        assert_eq!(order, [1001, 1010, 1011, 1012, 1009, 1013, 1014, 1008]);
+        assert_eq!(by_id[3].reject_reason.as_deref(), Some("low_difficulty"));
+        drop((a, b));
+        for path in [batched, one_by_one] {
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
     }
 
     #[tokio::test]

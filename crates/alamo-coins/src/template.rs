@@ -5,10 +5,12 @@ use crate::zmq::ZmqStatus;
 use crate::Coin;
 use alamo_core::encode::{push_data, push_script_num};
 use alamo_core::hash::from_display_hex;
+use alamo_core::hash::Hash256;
 use alamo_core::job::JobId;
 use alamo_core::time::now_unix;
 use alamo_core::work::{TemplateTx, WorkTemplate};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -49,6 +51,19 @@ pub struct RawTx {
     pub data: String,
     /// Transaction id, display order.
     pub txid: String,
+    /// Witness transaction id (`hash` in `getblocktemplate`), display order. It commits to
+    /// every byte of `data`, so it is what [`TxCache`] keys on. Optional: a missing or
+    /// malformed value only means the transaction is never reused from the cache.
+    #[serde(default)]
+    pub hash: Option<String>,
+}
+
+/// The decoded transactions of the previous template, keyed by wtxid, so the next template
+/// can share the bytes of transactions the two have in common instead of decoding a second
+/// copy. Holds at most one template's transactions.
+#[derive(Debug, Default)]
+pub struct TxCache {
+    by_wtxid: HashMap<Hash256, Arc<[u8]>>,
 }
 
 /// Why a template could not be converted.
@@ -70,14 +85,49 @@ pub fn convert(
     id: JobId,
     clean_jobs: bool,
 ) -> Result<WorkTemplate, TemplateError> {
+    convert_cached(
+        raw,
+        coin,
+        coinbase_tag,
+        id,
+        clean_jobs,
+        &mut TxCache::default(),
+    )
+}
+
+/// [`convert`], reusing the bytes of any transaction `cache` already holds by wtxid. On
+/// success the cache is replaced by this template's transactions; on error it is left as
+/// it was.
+pub fn convert_cached(
+    raw: RawTemplate,
+    coin: &dyn Coin,
+    coinbase_tag: &[u8],
+    id: JobId,
+    clean_jobs: bool,
+    cache: &mut TxCache,
+) -> Result<WorkTemplate, TemplateError> {
     let prev_hash = from_display_hex(&raw.previousblockhash)
         .map_err(|_| TemplateError::Hex("previousblockhash"))?;
     let bits = u32::from_str_radix(&raw.bits, 16).map_err(|_| TemplateError::Hex("bits"))?;
     let extra_payload = coin.extra_block_payload(&raw)?;
     let mut transactions = Vec::with_capacity(raw.transactions.len());
+    let mut next_cache = HashMap::with_capacity(raw.transactions.len());
     for tx in raw.transactions {
+        let wtxid = tx.hash.as_deref().and_then(|h| from_display_hex(h).ok());
+        let cached = wtxid
+            .and_then(|w| cache.by_wtxid.get(&w))
+            .filter(|bytes| tx.data.len() == 2 * bytes.len());
+        let data: Arc<[u8]> = match cached {
+            Some(bytes) => Arc::clone(bytes),
+            None => hex::decode(&tx.data)
+                .map_err(|_| TemplateError::Hex("transactions.data"))?
+                .into(),
+        };
+        if let Some(w) = wtxid {
+            next_cache.insert(w, Arc::clone(&data));
+        }
         transactions.push(TemplateTx {
-            data: hex::decode(&tx.data).map_err(|_| TemplateError::Hex("transactions.data"))?,
+            data,
             txid: from_display_hex(&tx.txid)
                 .map_err(|_| TemplateError::Hex("transactions.txid"))?,
         });
@@ -114,6 +164,7 @@ pub fn convert(
         created_at: now_unix(),
     };
     work.compute_merkle_branch();
+    cache.by_wtxid = next_cache;
     Ok(work)
 }
 
@@ -197,13 +248,20 @@ impl TemplateSource {
         let mut last_refresh = Instant::now() - self.refresh_interval;
         let mut last_ok: Option<Instant> = None;
         let mut health = NodeHealth::default();
+        let mut tx_cache = TxCache::default();
         let mut zmq_blocks = self
             .zmq
             .as_mut()
             .map_or(0, |rx| rx.borrow_and_update().blocks);
         loop {
             match self
-                .fetch(&last_tip, &last_tag, last_refresh, JobId(next_id))
+                .fetch(
+                    &last_tip,
+                    &last_tag,
+                    last_refresh,
+                    JobId(next_id),
+                    &mut tx_cache,
+                )
                 .await
             {
                 Ok(fetched) => {
@@ -294,36 +352,31 @@ impl TemplateSource {
         tokio::pin!(sleep);
         // A tag fixed at construction has no sender; then only the timer and ZMQ apply.
         let mut tag_live = !self.coinbase_tag.has_changed().is_err();
+        let Self {
+            coin,
+            coinbase_tag,
+            zmq,
+            ..
+        } = self;
         loop {
-            let Some(rx) = self.zmq.as_mut() else {
-                tokio::select! {
-                    _ = &mut sleep => return,
-                    changed = self.coinbase_tag.changed(), if tag_live => {
-                        if changed.is_ok() {
-                            return;
-                        }
-                        tag_live = false;
-                    }
-                }
-                continue;
-            };
             tokio::select! {
                 _ = &mut sleep => return,
-                changed = self.coinbase_tag.changed(), if tag_live => {
+                changed = coinbase_tag.changed(), if tag_live => {
                     if changed.is_ok() {
                         return;
                     }
                     tag_live = false;
                 }
-                changed = rx.changed() => {
+                changed = changed_or_pending(zmq.as_mut()), if zmq.is_some() => {
                     if changed.is_err() {
-                        self.zmq = None;
+                        *zmq = None;
                         continue;
                     }
+                    let Some(rx) = zmq.as_mut() else { continue };
                     let blocks = rx.borrow_and_update().blocks;
                     if blocks != *zmq_blocks {
                         *zmq_blocks = blocks;
-                        tracing::debug!(coin = self.coin.symbol(), "block notification; polling now");
+                        tracing::debug!(coin = coin.symbol(), "block notification; polling now");
                         return;
                     }
                     // Connection state changed but no new block: keep waiting.
@@ -340,6 +393,7 @@ impl TemplateSource {
         last_tag: &Option<Vec<u8>>,
         last_refresh: Instant,
         id: JobId,
+        tx_cache: &mut TxCache,
     ) -> Result<Option<(String, Vec<u8>, WorkTemplate)>, TemplateError> {
         let tip = self.rpc.get_best_block_hash().await?;
         let tip_changed = last_tip.as_deref() != Some(tip.as_str());
@@ -352,15 +406,27 @@ impl TemplateSource {
             .rpc
             .get_block_template(self.coin.template_rules())
             .await?;
-        let work = convert(raw, self.coin.as_ref(), &tag, id, tip_changed)?;
+        let work = convert_cached(raw, self.coin.as_ref(), &tag, id, tip_changed, tx_cache)?;
         Ok(Some((tip, tag, work)))
+    }
+}
+
+/// `rx.changed()`, or a future that never completes when there is no receiver. Lets a
+/// `select!` branch over an optional receiver be built unconditionally; the branch's
+/// precondition keeps it disabled while the receiver is absent.
+async fn changed_or_pending<T>(
+    rx: Option<&mut watch::Receiver<T>>,
+) -> Result<(), watch::error::RecvError> {
+    match rx {
+        Some(rx) => rx.changed().await,
+        None => std::future::pending().await,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Dogecoin, Litecoin};
+    use crate::{Bitcoin, Dogecoin, Litecoin};
     use serde_json::json;
 
     #[test]
@@ -412,6 +478,146 @@ mod tests {
         assert_eq!(work.coin, "DOGE");
         assert!(work.witness_commitment.is_none());
         assert_eq!(work.coinbase_script_prefix[..2], [0x01, 31]);
+    }
+
+    fn hash_of(n: u8) -> String {
+        format!("{n:02x}").repeat(32)
+    }
+
+    /// A Bitcoin-shaped template whose transactions are `(data, txid, hash)` triples.
+    fn raw_with(txs: &[(&str, u8, Option<u8>)]) -> RawTemplate {
+        let transactions: Vec<_> = txs
+            .iter()
+            .map(|(data, txid, hash)| {
+                let mut tx = json!({ "data": data, "txid": hash_of(*txid) });
+                if let Some(h) = hash {
+                    tx["hash"] = json!(hash_of(*h));
+                }
+                tx
+            })
+            .collect();
+        serde_json::from_value(json!({
+            "version": 536870912,
+            "previousblockhash": hash_of(0xee),
+            "transactions": transactions,
+            "coinbasevalue": 5000000000u64,
+            "mintime": 1296688603,
+            "curtime": 1788619193,
+            "bits": "207fffff",
+            "height": 5,
+            "default_witness_commitment": "6a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn successive_templates_share_common_transaction_bytes() {
+        let first = [
+            ("aa01", 1, Some(0x81)), // kept
+            ("bb02", 2, Some(0x82)), // kept
+            ("cc03", 3, Some(0x83)), // same txid next time, different witness
+            ("dd04", 4, None),       // no hash: never cached
+            ("ee05", 5, Some(0x85)), // dropped from the next template
+        ];
+        let second = [
+            ("bb02", 2, Some(0x82)),
+            ("cc0399", 3, Some(0x93)),
+            ("dd04", 4, None),
+            ("aa01", 1, Some(0x81)),
+            ("ff06", 6, Some(0x86)), // new
+        ];
+        let mut cache = TxCache::default();
+        let a =
+            convert_cached(raw_with(&first), &Bitcoin, b"", JobId(1), true, &mut cache).unwrap();
+        assert_eq!(
+            cache.by_wtxid.len(),
+            4,
+            "the hashless transaction is not cached"
+        );
+        let b = convert_cached(
+            raw_with(&second),
+            &Bitcoin,
+            b"",
+            JobId(2),
+            false,
+            &mut cache,
+        )
+        .unwrap();
+
+        // Shared transactions are the same allocation.
+        assert!(Arc::ptr_eq(
+            &a.transactions[1].data,
+            &b.transactions[0].data
+        ));
+        assert!(Arc::ptr_eq(
+            &a.transactions[0].data,
+            &b.transactions[3].data
+        ));
+        // Same txid, different wtxid: decoded fresh with its own bytes.
+        assert_eq!(a.transactions[2].txid, b.transactions[1].txid);
+        assert!(!Arc::ptr_eq(
+            &a.transactions[2].data,
+            &b.transactions[1].data
+        ));
+        assert_eq!(&b.transactions[1].data[..], &[0xcc, 0x03, 0x99]);
+        // No hash: never reused, even with identical bytes.
+        assert!(!Arc::ptr_eq(
+            &a.transactions[3].data,
+            &b.transactions[2].data
+        ));
+
+        // The cache now holds exactly the second template's hashed transactions.
+        let mut keys: Vec<Hash256> = cache.by_wtxid.keys().copied().collect();
+        keys.sort();
+        let mut expected: Vec<Hash256> = [0x81, 0x82, 0x86, 0x93]
+            .iter()
+            .map(|n| from_display_hex(&hash_of(*n)).unwrap())
+            .collect();
+        expected.sort();
+        assert_eq!(keys, expected);
+        for (i, wtxid) in [(3, 0x81), (0, 0x82)] {
+            let key = from_display_hex(&hash_of(wtxid)).unwrap();
+            assert!(Arc::ptr_eq(&cache.by_wtxid[&key], &b.transactions[i].data));
+        }
+
+        // Identical work to cache-less conversion.
+        for (work, raw) in [(&a, raw_with(&first)), (&b, raw_with(&second))] {
+            let plain = convert(raw, &Bitcoin, b"", work.id, work.clean_jobs).unwrap();
+            assert_eq!(work.transactions, plain.transactions);
+            assert_eq!(work.merkle_branch, plain.merkle_branch);
+            assert_eq!(work.extra_payload, plain.extra_payload);
+        }
+    }
+
+    #[test]
+    fn cached_bytes_need_a_matching_length_and_failures_keep_the_cache() {
+        let mut cache = TxCache::default();
+        let first = [("aa01", 1, Some(0x81))];
+        let a =
+            convert_cached(raw_with(&first), &Bitcoin, b"", JobId(1), true, &mut cache).unwrap();
+        // Same wtxid but a different length: not trusted, decoded as given.
+        let longer = [("aa0102", 1, Some(0x81))];
+        let b = convert_cached(
+            raw_with(&longer),
+            &Bitcoin,
+            b"",
+            JobId(2),
+            false,
+            &mut cache,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(
+            &a.transactions[0].data,
+            &b.transactions[0].data
+        ));
+        assert_eq!(&b.transactions[0].data[..], &[0xaa, 0x01, 0x02]);
+
+        // A conversion that fails leaves the cache as it was.
+        let bad = raw_with(&[("aa0102", 1, Some(0x81)), ("zz", 2, Some(0x82))]);
+        assert!(convert_cached(bad, &Bitcoin, b"", JobId(3), false, &mut cache).is_err());
+        assert_eq!(cache.by_wtxid.len(), 1);
+        let key = from_display_hex(&hash_of(0x81)).unwrap();
+        assert!(Arc::ptr_eq(&cache.by_wtxid[&key], &b.transactions[0].data));
     }
 
     #[test]

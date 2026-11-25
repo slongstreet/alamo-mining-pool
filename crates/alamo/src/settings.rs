@@ -114,7 +114,7 @@ pub struct LiveSettings {
     store: Store,
     state: AppState,
     lanes: Vec<LaneSlot>,
-    /// Index of the lane the single-lane settings document describes.
+    /// Index of the primary lane, listed first in the document.
     primary: usize,
     /// Tightest coinbase tag budget over every configured lane.
     tag_budget: usize,
@@ -645,7 +645,6 @@ impl LiveSettings {
 
     /// The settings document. `coins` lists every configured coin, connected or not;
     /// a stored fallback address still waiting for its coin's node shows as overridden.
-    /// The top-level `vardiff` is the primary lane's.
     fn doc(&self, ov: &BTreeMap<String, String>) -> SettingsDoc {
         let pending = self.pending.lock().expect("pending lock").clone();
         let text = |key: &str, file: &str| match ov.get(key).or_else(|| pending.get(key)) {
@@ -684,7 +683,6 @@ impl LiveSettings {
             coinbase_tag: text("pool.coinbase_tag", &self.file.coinbase_tag),
             coinbase_tag_max_bytes: self.tag_budget(),
             coins,
-            vardiff: Self::vardiff_doc(&self.lanes[self.primary], ov),
             lanes: self
                 .lane_order()
                 .map(|i| {
@@ -702,8 +700,7 @@ impl LiveSettings {
         }
     }
 
-    /// The overrides `patch` produces on top of `current`. The patch's vardiff is the
-    /// primary lane's.
+    /// The overrides `patch` produces on top of `current`.
     fn patched(
         &self,
         current: &BTreeMap<String, String>,
@@ -738,11 +735,9 @@ impl LiveSettings {
             }
             set(Self::fallback_key(key), &Some(change.clone()));
         }
-        // The deprecated top-level vardiff is the primary lane's; `lanes` names lanes. Two
-        // lanes on the default section write the same keys, so a patch may not give one key
-        // two different values.
-        let mut vardiff: Vec<(usize, &str, &VardiffPatch)> =
-            vec![(self.primary, "vardiff", &patch.vardiff)];
+        // Two lanes on the default section write the same keys, so a patch may not give
+        // one key two different values.
+        let mut vardiff: Vec<(usize, &str, &VardiffPatch)> = Vec::new();
         for (key, lane_patch) in &patch.lanes {
             let lane = self
                 .lane_index(key)
@@ -765,11 +760,7 @@ impl LiveSettings {
                 };
                 let as_text = change.map(|n| n.to_string());
                 let key = Self::vardiff_key(lane, field);
-                let origin = if source == "vardiff" {
-                    format!("vardiff.{field}")
-                } else {
-                    format!("lanes.{source}.vardiff.{field}")
-                };
+                let origin = format!("lanes.{source}.vardiff.{field}");
                 if let Some((earlier, from)) = written.get(&key) {
                     if *earlier != as_text {
                         return Err(SettingsError::Invalid(format!(
@@ -895,6 +886,11 @@ mod tests {
     static DOGE_OTHER: LazyLock<String> = LazyLock::new(|| {
         encode_base58(Dogecoin.address_params(Chain::Main).p2pkh_prefix, &[4; 20])
     });
+
+    /// A `lanes` patch changing one lane's vardiff.
+    fn lane_vardiff(key: &str, vardiff: VardiffPatch) -> BTreeMap<String, LanePatch> {
+        [(key.to_string(), LanePatch { vardiff })].into()
+    }
 
     fn node(key: &str, coin: Arc<dyn Coin>, fallback: &str, parent: Option<&str>) -> ChainNode {
         let chain = Chain::Main;
@@ -1022,10 +1018,7 @@ variance_percent = 20
     }
 
     async fn temp_store(tag: &str) -> (Store, std::path::PathBuf) {
-        let path = std::env::temp_dir()
-            .join(format!("alamo-settings-{tag}-{}", std::process::id()))
-            .join("pool.db");
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let path = alamo_store::temp_path(&format!("settings-{tag}"));
         (Store::open(&path).await.unwrap(), path)
     }
 
@@ -1071,7 +1064,8 @@ variance_percent = 20
         assert_eq!(doc.coins[0].symbol, "LTC");
         assert_eq!(doc.coins[1].merge_mined_with.as_deref(), Some("ltc"));
         assert_eq!(doc.coins[1].fallback_address.value, *DOGE_FALLBACK);
-        assert_eq!(doc.vardiff.min_difficulty.value, 1024.0);
+        assert_eq!(doc.lanes[0].key, "ltc");
+        assert_eq!(doc.lanes[0].vardiff.min_difficulty.value, 1024.0);
         assert_eq!(doc.log_level.value, "info");
         assert!(doc.config_toml.contains("<redacted>"));
         assert!(!doc.config_toml.contains("secret"));
@@ -1087,12 +1081,14 @@ variance_percent = 20
                 pool_name: Some(Some("  Renamed  ".into())),
                 coinbase_tag: Some(Some("/new tag/".into())),
                 fallback_addresses: [("ltc".to_string(), Some(LTC_OTHER.clone()))].into(),
-                vardiff: VardiffPatch {
-                    min_difficulty: Some(Some(2048.0)),
-                    ..Default::default()
-                },
+                lanes: lane_vardiff(
+                    "ltc",
+                    VardiffPatch {
+                        min_difficulty: Some(Some(2048.0)),
+                        ..Default::default()
+                    },
+                ),
                 log_level: Some(Some("debug".into())),
-                ..Default::default()
             })
             .await
             .unwrap();
@@ -1183,10 +1179,13 @@ variance_percent = 20
             ),
             (
                 SettingsPatch {
-                    vardiff: VardiffPatch {
-                        min_difficulty: Some(Some(1e9)),
-                        ..Default::default()
-                    },
+                    lanes: lane_vardiff(
+                        "ltc",
+                        VardiffPatch {
+                            min_difficulty: Some(Some(1e9)),
+                            ..Default::default()
+                        },
+                    ),
                     ..Default::default()
                 },
                 "stratum.vardiff.max_difficulty must be >= min_difficulty",
@@ -1284,17 +1283,21 @@ variance_percent = 20
         assert!(!stored.contains_key("coins.ltc.stratum.vardiff.min_difficulty"));
         assert_eq!(stored.len(), 2);
 
-        // The document and the patch speak for the primary lane, LTC (on [stratum]).
+        // LTC's document and patch go to the default [stratum] table it uses.
         let doc = live.settings();
+        assert_eq!(doc.lanes[0].key, "ltc");
         assert_eq!(
-            doc.vardiff.min_difficulty,
+            doc.lanes[0].vardiff.min_difficulty,
             Setting::overridden(1024.0, 2048.0)
         );
         live.apply(SettingsPatch {
-            vardiff: VardiffPatch {
-                min_difficulty: Some(Some(4096.0)),
-                ..Default::default()
-            },
+            lanes: lane_vardiff(
+                "ltc",
+                VardiffPatch {
+                    min_difficulty: Some(Some(4096.0)),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         })
         .await
@@ -1499,10 +1502,7 @@ variance_percent = 20
             ]
         );
         assert_eq!(doc.lanes[1].vardiff.initial_difficulty.value, 8.0);
-        assert_eq!(
-            doc.vardiff, doc.lanes[0].vardiff,
-            "the alias is the primary lane"
-        );
+        assert_eq!(doc.lanes[0].vardiff.min_difficulty.value, 1024.0);
 
         // A lane by name writes its own table's keys.
         let doc = live
@@ -1531,52 +1531,6 @@ variance_percent = 20
         let stored = store.load_settings().await.unwrap();
         assert_eq!(stored["coins.doge.stratum.vardiff.min_difficulty"], "2");
 
-        // The alias and the primary lane by name write the same key; they must agree.
-        live.apply(SettingsPatch {
-            vardiff: VardiffPatch {
-                min_difficulty: Some(Some(2048.0)),
-                ..Default::default()
-            },
-            lanes: [(
-                "ltc".to_string(),
-                LanePatch {
-                    vardiff: VardiffPatch {
-                        min_difficulty: Some(Some(2048.0)),
-                        ..Default::default()
-                    },
-                },
-            )]
-            .into(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        assert_eq!(live.vardiff("ltc").unwrap().borrow().min_difficulty, 2048.0);
-        let err = live
-            .apply(SettingsPatch {
-                vardiff: VardiffPatch {
-                    min_difficulty: Some(Some(1.0e3)),
-                    ..Default::default()
-                },
-                lanes: [(
-                    "ltc".to_string(),
-                    LanePatch {
-                        vardiff: VardiffPatch {
-                            min_difficulty: Some(Some(2.0e3)),
-                            ..Default::default()
-                        },
-                    },
-                )]
-                .into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("both set stratum.vardiff.min_difficulty to different values"),
-            "{err}"
-        );
         let err = live
             .apply(SettingsPatch {
                 lanes: [("btc".to_string(), LanePatch::default())].into(),
@@ -1640,6 +1594,48 @@ fallback_address = "{}"
             && l.vardiff.max_difficulty == Setting::overridden(16_777_216.0, 1.0e6)));
         assert_eq!(live.vardiff("doge").unwrap().borrow().max_difficulty, 1.0e6);
         assert_eq!(live.vardiff("ltc").unwrap().borrow().max_difficulty, 1.0e6);
+
+        // Both lanes name the same key; they may repeat a value but not contradict it.
+        let both = |ltc: f64, doge: f64| SettingsPatch {
+            lanes: [
+                (
+                    "ltc".to_string(),
+                    LanePatch {
+                        vardiff: VardiffPatch {
+                            min_difficulty: Some(Some(ltc)),
+                            ..Default::default()
+                        },
+                    },
+                ),
+                (
+                    "doge".to_string(),
+                    LanePatch {
+                        vardiff: VardiffPatch {
+                            min_difficulty: Some(Some(doge)),
+                            ..Default::default()
+                        },
+                    },
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        live.apply(both(2048.0, 2048.0)).await.unwrap();
+        assert_eq!(live.vardiff("ltc").unwrap().borrow().min_difficulty, 2048.0);
+        assert_eq!(
+            live.vardiff("doge").unwrap().borrow().min_difficulty,
+            2048.0
+        );
+        let err = live
+            .apply(both(1.0e3, 2.0e3))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("both set stratum.vardiff.min_difficulty to different values"),
+            "{err}"
+        );
+        assert_eq!(live.vardiff("ltc").unwrap().borrow().min_difficulty, 2048.0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

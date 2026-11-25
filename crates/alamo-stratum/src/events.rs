@@ -2,6 +2,7 @@
 
 use alamo_core::hash::Hash256;
 use alamo_core::job::RejectReason;
+use std::sync::Arc;
 
 /// Something happened on a stratum connection.
 #[derive(Clone, Debug)]
@@ -11,7 +12,7 @@ pub enum PoolEvent {
         /// Session id.
         session: u64,
         /// Full worker name as sent by the miner.
-        worker: String,
+        worker: Arc<str>,
         /// Address that will be paid.
         address: String,
         /// Whether the fallback address was substituted.
@@ -24,14 +25,14 @@ pub enum PoolEvent {
         /// Session id.
         session: u64,
         /// Workers that were authorized on it.
-        workers: Vec<String>,
+        workers: Vec<Arc<str>>,
     },
     /// A share was processed.
     Share {
         /// Session id.
         session: u64,
-        /// Worker name.
-        worker: String,
+        /// Worker name, shared with the session so a share costs no allocation.
+        worker: Arc<str>,
         /// Coin ticker of the job.
         coin: &'static str,
         /// Difficulty the job required.

@@ -165,8 +165,9 @@ public-pool ANDs with the miner's mask or looks at `min-bit-count`.
   with key, algorithm, stratum port, `state` (`connecting`/`running`/`failed`) and
   `error`, chain, share multiplier, hashrate, share counts, work, best share,
   `scoring_since`, coins, and workers. It is published from startup.
-- ~~Top-level fields mirror the first lane.~~ Done: they mirror the primary lane while it
-  runs (defaults otherwise), for one release, marked deprecated. `blocks` stays global,
+- ~~Top-level fields mirror the first lane.~~ Done: they mirrored the primary lane for
+  0.1.14 only and are removed after it, with the settings document's and patch's
+  top-level `vardiff`; read `lanes[]` and patch `lanes.<key>.vardiff`. `blocks` stays global,
   each row converted with its own lane's share multiplier; rounds are keyed by lane and
   coin.
 - ~~`lane` parameters.~~ Done: `/api/hashrate`, `/api/shares`, the stats reset, and

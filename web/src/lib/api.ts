@@ -163,28 +163,6 @@ export interface Status {
   now: number;
   /** Every configured lane, primary first. */
   lanes: LaneStatus[];
-  /** @deprecated Use `lanes[0].coins`. Mirrors the primary lane while it is running. */
-  coins: CoinStatus[];
-  /** @deprecated Use `lanes[0].hashrate`. */
-  hashrate: number;
-  /** @deprecated Use `lanes[0].shares_accepted`. */
-  shares_accepted: number;
-  /** @deprecated Use `lanes[0].shares_rejected`. */
-  shares_rejected: number;
-  /** @deprecated Use `lanes[0].total_work`. */
-  total_work: number;
-  /** @deprecated Use `lanes[0].share_multiplier`. 0 until the primary lane is running. */
-  share_multiplier: number;
-  /** @deprecated Use `lanes[0].best_share_difficulty`. */
-  best_share_difficulty: number;
-  /** @deprecated Use `lanes[0].best_share_worker`. */
-  best_share_worker: string | null;
-  /** @deprecated Use `lanes[0].best_share_at`. */
-  best_share_at: number | null;
-  /** @deprecated Use `lanes[0].scoring_since`. */
-  scoring_since: number | null;
-  /** @deprecated Use `lanes[0].workers`. */
-  workers: WorkerStatus[];
   /** Every lane's recent blocks; each `share_diff` is in its own lane's network units. */
   blocks: BlockRow[];
 }
@@ -266,8 +244,6 @@ export interface SettingsDoc {
   coinbase_tag_max_bytes: number;
   /** Every configured coin, primary lane first, connected or not. */
   coins: CoinSettings[];
-  /** @deprecated Use `lanes[0].vardiff`: the primary lane's vardiff. */
-  vardiff: VardiffSettings;
   /** Every configured lane, primary first. */
   lanes: LaneSettings[];
   log_level: Setting<string>;
@@ -279,8 +255,6 @@ export interface SettingsPatch {
   pool_name?: string | null;
   coinbase_tag?: string | null;
   fallback_addresses?: Record<string, string | null>;
-  /** @deprecated Use `lanes[<primary>].vardiff`. */
-  vardiff?: Partial<Record<VardiffField, number | null>>;
   /**
    * Per-lane changes. A lane on the default [stratum] section shares its vardiff
    * overrides with every other lane on that section.

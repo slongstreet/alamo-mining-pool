@@ -50,9 +50,8 @@ its own lane's work.
 The status document is published from startup. Its `lanes` lists every configured lane,
 primary first (the parent on the default `[stratum]` section, else the first by key), in
 state `connecting`, `running`, or `failed`, each with its own coins, workers, and
-figures. The older top-level fields mirror the primary lane while it runs, for one
-release. Block rows are global; each one's winning share is converted with its own lane's
-share multiplier. The history endpoints, share-count reset, worker removal, and metrics
+figures; there are no top-level copies of the primary lane's. Block rows are global;
+each one's winning share is converted with its own lane's share multiplier. The history endpoints, share-count reset, worker removal, and metrics
 all take or carry the lane.
 
 Settings start from the config alone. The coinbase tag is one global value whose byte

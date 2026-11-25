@@ -171,7 +171,7 @@ impl Stats {
                 aux,
             } => {
                 self.note_seen(now);
-                let w = self.workers.entry(worker.clone()).or_default();
+                let w = known_worker(&mut self.workers, worker);
                 w.address = address.clone();
                 w.fallback = *fallback;
                 w.aux = aux
@@ -186,7 +186,7 @@ impl Stats {
             }
             PoolEvent::Disconnected { session, workers } => {
                 for name in workers {
-                    if let Some(w) = self.workers.get_mut(name) {
+                    if let Some(w) = self.workers.get_mut(&**name) {
                         w.sessions.remove(session);
                     }
                 }
@@ -198,7 +198,7 @@ impl Stats {
                 rejected,
                 ..
             } => {
-                let w = self.workers.entry(worker.clone()).or_default();
+                let w = known_worker(&mut self.workers, worker);
                 if rejected.is_some() {
                     w.rejected += 1;
                     self.shares_rejected += 1;
@@ -405,6 +405,20 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// The stats for `name`, created if new. Looks up by `&str` first so a known worker's
+/// share costs no allocation; only a first sighting copies the name into a key.
+fn known_worker<'a>(
+    workers: &'a mut HashMap<String, WorkerStats>,
+    name: &str,
+) -> &'a mut WorkerStats {
+    if !workers.contains_key(name) {
+        workers.insert(name.to_owned(), WorkerStats::default());
+    }
+    workers
+        .get_mut(name)
+        .expect("inserted above if it was missing")
+}
+
 fn trim(window: &mut VecDeque<(u64, f64)>, now: u64) {
     while let Some((t, _)) = window.front() {
         if now.saturating_sub(*t) > HASHRATE_WINDOW_SECS {
@@ -430,7 +444,6 @@ fn hashrate(window: &VecDeque<(u64, f64)>, now: u64) -> f64 {
 mod tests {
     use super::*;
     use alamo_store::{AuxPayoutRecord, NewShare, WorkerWrite};
-    use std::path::PathBuf;
 
     fn authorized(session: u64, worker: &str) -> PoolEvent {
         PoolEvent::Authorized {
@@ -453,22 +466,9 @@ mod tests {
         }
     }
 
-    fn temp_db() -> PathBuf {
-        std::env::temp_dir()
-            .join(format!(
-                "alamo-stats-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ))
-            .join("pool.db")
-    }
-
     #[tokio::test]
     async fn restore_converts_persisted_work_from_stratum_units() {
-        let path = temp_db();
+        let path = alamo_store::temp_path("stats");
         let store = Store::open(&path).await.unwrap();
         let t0 = 1_700_000_000i64;
         let worker = |name: &str| WorkerWrite {
@@ -636,7 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_rebuilds_counters_and_hashrate_after_restart() {
-        let path = temp_db();
+        let path = alamo_store::temp_path("stats");
         let store = Store::open(&path).await.unwrap();
         let t0 = 1_700_000_000i64;
         store

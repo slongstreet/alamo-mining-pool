@@ -6,10 +6,8 @@ use serde::Serialize;
 
 /// Everything the dashboard shows, refreshed by the daemon every couple of seconds.
 ///
-/// Per-lane figures live in `lanes`. The top-level `coins`, `hashrate`, share counts,
-/// work, share multiplier, best share, `scoring_since`, and `workers` are deprecated: for
-/// one release they mirror the primary lane (`lanes[0]`) while it is running and hold
-/// their defaults otherwise.
+/// Per-lane figures (coins, hashrate, share counts, work, share multiplier, best share,
+/// `scoring_since`, workers) live in `lanes`; the primary lane is `lanes[0]`.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct PoolSnapshot {
     /// Configured pool name.
@@ -25,57 +23,20 @@ pub struct PoolSnapshot {
     pub now: u64,
     /// Every configured lane, primary first, then by key.
     pub lanes: Vec<LaneStatus>,
-    /// Deprecated: `lanes[0].coins`.
-    pub coins: Vec<CoinStatus>,
-    /// Deprecated: `lanes[0].hashrate`.
-    pub hashrate: f64,
-    /// Deprecated: `lanes[0].shares_accepted`.
-    pub shares_accepted: u64,
-    /// Deprecated: `lanes[0].shares_rejected`.
-    pub shares_rejected: u64,
-    /// Deprecated: `lanes[0].total_work`.
-    pub total_work: f64,
-    /// Deprecated: `lanes[0].share_multiplier`.
-    pub share_multiplier: f64,
-    /// Deprecated: `lanes[0].best_share_difficulty`.
-    pub best_share_difficulty: f64,
-    /// Deprecated: `lanes[0].best_share_worker`.
-    pub best_share_worker: Option<String>,
-    /// Deprecated: `lanes[0].best_share_at`.
-    pub best_share_at: Option<u64>,
-    /// Deprecated: `lanes[0].scoring_since`.
-    pub scoring_since: Option<u64>,
-    /// Deprecated: `lanes[0].workers`.
-    pub workers: Vec<WorkerStatus>,
     /// Recent blocks of every lane, newest first. Each row's `share_diff` is in its own
     /// lane's network units.
     pub blocks: Vec<BlockRow>,
 }
 
 impl PoolSnapshot {
-    /// A snapshot of `lanes` (primary first) and `blocks`, with the deprecated top-level
-    /// fields mirroring the primary lane while it is running.
+    /// A snapshot of `lanes` (primary first) and `blocks` built at `now`.
     pub fn from_lanes(now: u64, lanes: Vec<LaneStatus>, blocks: Vec<BlockRow>) -> Self {
-        let mut s = Self {
+        Self {
             now,
+            lanes,
             blocks,
             ..Default::default()
-        };
-        if let Some(p) = lanes.first().filter(|l| l.state == LaneState::Running) {
-            s.coins = p.coins.clone();
-            s.hashrate = p.hashrate;
-            s.shares_accepted = p.shares_accepted;
-            s.shares_rejected = p.shares_rejected;
-            s.total_work = p.total_work;
-            s.share_multiplier = p.share_multiplier;
-            s.best_share_difficulty = p.best_share_difficulty;
-            s.best_share_worker = p.best_share_worker.clone();
-            s.best_share_at = p.best_share_at;
-            s.scoring_since = p.scoring_since;
-            s.workers = p.workers.clone();
         }
-        s.lanes = lanes;
-        s
     }
 
     /// The lane with config key `key`.
@@ -290,22 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_fields_mirror_a_running_primary_lane_only() {
-        let s = PoolSnapshot::from_lanes(
-            7,
-            vec![
-                lane("ltc", LaneState::Running, 3),
-                lane("doge", LaneState::Failed, 9),
-            ],
-            vec![],
-        );
-        assert_eq!(s.now, 7);
-        assert_eq!(s.shares_accepted, 3);
-        assert_eq!(s.hashrate, 3.0);
-        assert_eq!(s.share_multiplier, 65536.0);
-        assert_eq!(s.best_share_worker.as_deref(), Some("ltc-rig"));
-        assert_eq!(s.lane("doge").unwrap().shares_accepted, 9);
-
+    fn lane_figures_are_reported_per_lane_only() {
         let s = PoolSnapshot::from_lanes(
             7,
             vec![
@@ -314,11 +260,35 @@ mod tests {
             ],
             vec![],
         );
-        assert_eq!(s.shares_accepted, 0, "defaults until the primary lane runs");
-        assert_eq!(s.share_multiplier, 0.0);
-        assert!(s.best_share_worker.is_none());
+        assert_eq!(s.now, 7);
+        assert_eq!(s.lanes[0].key, "ltc", "primary lane first");
+        assert_eq!(s.lane("ltc").unwrap().shares_accepted, 3);
+        assert_eq!(s.lane("doge").unwrap().shares_accepted, 9);
+        assert_eq!(s.lane("doge").unwrap().hashrate, 9.0);
+        assert_eq!(s.lane("doge").unwrap().share_multiplier, 65536.0);
+        assert_eq!(
+            s.lane("doge").unwrap().best_share_worker.as_deref(),
+            Some("doge-rig")
+        );
+        assert!(s.lane("btc").is_none());
         let json = serde_json::to_value(&s).unwrap();
+        for gone in [
+            "coins",
+            "hashrate",
+            "shares_accepted",
+            "shares_rejected",
+            "total_work",
+            "share_multiplier",
+            "best_share_difficulty",
+            "best_share_worker",
+            "best_share_at",
+            "scoring_since",
+            "workers",
+        ] {
+            assert!(json.get(gone).is_none(), "no top-level {gone}");
+        }
         assert_eq!(json["lanes"][0]["state"], "connecting");
+        assert_eq!(json["lanes"][0]["shares_accepted"], 3);
         assert_eq!(json["lanes"][0]["error"], serde_json::Value::Null);
         assert_eq!(json["lanes"][1]["state"], "running");
         assert_eq!(

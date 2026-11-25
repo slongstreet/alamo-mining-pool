@@ -74,7 +74,7 @@ impl Persistence {
                 aux,
                 ..
             } => self.authorized.push(WorkerWrite {
-                name: worker.clone(),
+                name: worker.to_string(),
                 payout_address: address.clone(),
                 fallback: *fallback,
                 aux_payouts: aux
@@ -99,7 +99,7 @@ impl Persistence {
                 difficulty: *job_difficulty,
                 share_diff: *share_difficulty,
                 accepted: rejected.is_none(),
-                reject_reason: rejected.map(|r| r.as_str().to_string()),
+                reject_reason: rejected.map(|r| r.as_str()),
             }),
             PoolEvent::Disconnected { .. } | PoolEvent::DifficultyChanged { .. } => {}
         }
@@ -173,24 +173,10 @@ mod tests {
     use super::*;
     use alamo_core::job::RejectReason;
     use alamo_stratum::AuxPayoutInfo;
-    use std::path::PathBuf;
-
-    fn temp_db() -> PathBuf {
-        std::env::temp_dir()
-            .join(format!(
-                "alamo-persist-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ))
-            .join("pool.db")
-    }
 
     #[tokio::test]
     async fn flush_then_reload_matches_live_counters() {
-        let path = temp_db();
+        let path = alamo_store::temp_path("persist");
         let store = Store::open(&path).await.unwrap();
         let mut persist = Persistence::new(store.clone(), "ltc");
         let mut stats = Stats::default();
