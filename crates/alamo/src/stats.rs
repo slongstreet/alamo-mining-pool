@@ -1,11 +1,12 @@
 //! In-memory pool statistics built from stratum events, restorable from the store.
 
+use alamo_core::job::RejectReason;
 use alamo_core::odds::HASHES_PER_DIFF1;
 use alamo_store::{ShareRow, Store, StoreError, WorkerRow};
 use alamo_stratum::PoolEvent;
 use alamo_web::{AuxPayoutStatus, WorkerStatus};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 /// Window over which hashrate is estimated, in seconds.
 pub const HASHRATE_WINDOW_SECS: u64 = 600;
@@ -19,6 +20,12 @@ struct WorkerStats {
     difficulty: f64,
     accepted: u64,
     rejected: u64,
+    /// Rejected shares by reason (indexed by [`RejectReason::index`]) since the daemon
+    /// started or the last counter reset. Not persisted: `rejected` above is lifetime and
+    /// restored, so it can be larger than the sum of these.
+    rejects: [u64; RejectReason::ALL.len()],
+    /// Display name the operator gave the worker.
+    alias: Option<String>,
     /// Best share found, in network difficulty-1 units (comparable to block difficulty).
     best_difficulty: f64,
     /// When the best share arrived.
@@ -93,6 +100,8 @@ impl Stats {
                 difficulty: 0.0,
                 accepted: row.shares_accepted.max(0) as u64,
                 rejected: row.shares_rejected.max(0) as u64,
+                rejects: [0; RejectReason::ALL.len()],
+                alias: row.alias.clone(),
                 // Persisted in stratum share units (a MAX and a SUM over share rows).
                 best_difficulty: row.best_difficulty / share_multiplier,
                 best_at: row.best_at.map(|t| t.max(0) as u64),
@@ -199,8 +208,9 @@ impl Stats {
                 ..
             } => {
                 let w = known_worker(&mut self.workers, worker);
-                if rejected.is_some() {
+                if let Some(reason) = rejected {
                     w.rejected += 1;
+                    w.rejects[reason.index()] += 1;
                     self.shares_rejected += 1;
                 } else {
                     w.accepted += 1;
@@ -232,12 +242,14 @@ impl Stats {
         }
     }
 
-    /// Zero accepted/rejected counts and best share for every worker and the pool.
-    /// Hashrate windows, accepted work, and payout details are kept.
+    /// Zero accepted/rejected counts, the per-reason reject breakdown, and best share for
+    /// every worker and the pool. Hashrate windows, accepted work, payout details, and
+    /// aliases are kept.
     pub fn reset_counters(&mut self) {
         for w in self.workers.values_mut() {
             w.accepted = 0;
             w.rejected = 0;
+            w.rejects = [0; RejectReason::ALL.len()];
             w.best_difficulty = 0.0;
             w.best_at = None;
         }
@@ -258,6 +270,17 @@ impl Stats {
         self.shares_rejected -= w.rejected;
         self.retired_work += w.work_accepted;
         true
+    }
+
+    /// Set or clear a worker's display alias. Returns false when the worker is unknown.
+    pub fn set_alias(&mut self, name: &str, alias: Option<String>) -> bool {
+        match self.workers.get_mut(name) {
+            Some(w) => {
+                w.alias = alias;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether `name` currently has a live stratum session.
@@ -344,9 +367,12 @@ impl Stats {
                 hashrate: hashrate(&w.window, now),
                 shares_accepted: w.accepted,
                 shares_rejected: w.rejected,
+                rejects: reject_breakdown(&w.rejects),
                 best_difficulty: w.best_difficulty,
+                best_at: w.best_at,
                 work_accepted: w.work_accepted,
                 last_share_seconds: w.last_share.map(|t| now.saturating_sub(t)),
+                alias: w.alias.clone(),
             })
             .collect();
         out.sort_by(|a, b| {
@@ -417,6 +443,16 @@ fn known_worker<'a>(
     workers
         .get_mut(name)
         .expect("inserted above if it was missing")
+}
+
+/// Non-zero per-reason counts keyed by reason slug.
+fn reject_breakdown(counts: &[u64; RejectReason::ALL.len()]) -> BTreeMap<&'static str, u64> {
+    RejectReason::ALL
+        .iter()
+        .zip(counts)
+        .filter(|(_, &n)| n > 0)
+        .map(|(r, &n)| (r.as_str(), n))
+        .collect()
 }
 
 fn trim(window: &mut VecDeque<(u64, f64)>, now: u64) {
@@ -620,6 +656,11 @@ mod tests {
         );
         assert_eq!(w.shares_accepted, 10);
         assert_eq!(w.best_difficulty, 2.0);
+        assert_eq!(
+            w.best_at,
+            Some(t0),
+            "the first of equal shares keeps the record"
+        );
         assert_eq!(w.work_accepted, 10.0);
         assert_eq!(s.total_work(), 10.0);
         assert_eq!(s.best_difficulty(), 2.0);
@@ -679,6 +720,7 @@ mod tests {
         assert_eq!(w.connections, 0);
         assert_eq!(w.shares_accepted, 10);
         assert_eq!(w.best_difficulty, 2.0);
+        assert_eq!(w.best_at, Some(t0 as u64), "best_at survives a restart");
         assert_eq!(restored.total_work(), 10.0);
         assert!(
             (w.hashrate - 10.0 * HASHES_PER_DIFF1 / 90.0).abs() < 1.0,
@@ -722,6 +764,7 @@ mod tests {
         assert_eq!(s.best_difficulty(), 0.0);
         let w = &s.workers(t0 + 90)[0];
         assert_eq!(w.shares_accepted, 0);
+        assert_eq!(w.best_at, None);
         assert!(w.hashrate > 0.0, "hashrate window survives a reset");
         assert_eq!(w.work_accepted, 10.0);
     }
@@ -751,6 +794,100 @@ mod tests {
         assert_eq!(s.total_work(), 11.0, "retired work still counts");
     }
 
+    fn rejected_share(worker: &str, reason: RejectReason) -> PoolEvent {
+        PoolEvent::Share {
+            session: 1,
+            worker: worker.into(),
+            coin: "LTC",
+            job_difficulty: 1.0,
+            share_difficulty: 0.0,
+            rejected: Some(reason),
+        }
+    }
+
+    #[test]
+    fn rejects_are_broken_down_by_reason_until_a_reset() {
+        let mut s = Stats::default();
+        let t0 = 1_000;
+        s.apply(&authorized(1, "a"), t0);
+        s.apply(&authorized(2, "b"), t0);
+        s.apply(&accepted_share(1, "a", 1.0), t0);
+        for _ in 0..3 {
+            s.apply(&rejected_share("a", RejectReason::StaleJob), t0);
+        }
+        s.apply(&rejected_share("a", RejectReason::LowDifficulty), t0);
+        let workers = s.workers(t0);
+        let a = workers.iter().find(|w| w.name == "a").unwrap();
+        let b = workers.iter().find(|w| w.name == "b").unwrap();
+        assert_eq!(a.shares_rejected, 4);
+        assert_eq!(
+            a.rejects,
+            BTreeMap::from([("low_difficulty", 1), ("stale_job", 3)]),
+            "zero reasons are left out"
+        );
+        assert!(b.rejects.is_empty());
+        let json = serde_json::to_value(a).unwrap();
+        assert_eq!(
+            json["rejects"],
+            serde_json::json!({ "stale_job": 3, "low_difficulty": 1 })
+        );
+        assert_eq!(
+            serde_json::to_value(b).unwrap()["rejects"],
+            serde_json::json!({})
+        );
+
+        s.reset_counters();
+        let a = &s.workers(t0)[0];
+        assert_eq!(a.shares_rejected, 0);
+        assert!(a.rejects.is_empty(), "a reset clears the breakdown too");
+        s.apply(&rejected_share("a", RejectReason::Duplicate), t0 + 1);
+        assert_eq!(
+            s.workers(t0 + 1)[0].rejects,
+            BTreeMap::from([("duplicate", 1)])
+        );
+    }
+
+    #[tokio::test]
+    async fn aliases_are_set_cleared_and_restored_from_the_store() {
+        let path = alamo_store::temp_path("stats-alias");
+        let store = Store::open(&path).await.unwrap();
+        let write = |name: &str| WorkerWrite {
+            name: name.into(),
+            payout_address: "ltc1qabc".into(),
+            fallback: false,
+            aux_payouts: vec![],
+            ts: 1,
+        };
+        store
+            .persist_batch("ltc", &[write("rig1"), write("rig2")], &[])
+            .await
+            .unwrap();
+        store
+            .set_worker_alias("ltc", "rig1", Some("Basement"))
+            .await
+            .unwrap();
+        let mut s = Stats::load(&store, "ltc", 10, 1.0).await.unwrap();
+        let alias = |s: &Stats, name: &str| {
+            s.workers(10)
+                .into_iter()
+                .find(|w| w.name == name)
+                .unwrap()
+                .alias
+        };
+        assert_eq!(alias(&s, "rig1").as_deref(), Some("Basement"));
+        assert_eq!(alias(&s, "rig2"), None);
+        // Re-authorizing keeps it; a reset keeps it.
+        s.apply(&authorized(1, "rig1"), 11);
+        s.reset_counters();
+        assert_eq!(alias(&s, "rig1").as_deref(), Some("Basement"));
+        assert!(s.set_alias("rig2", Some("Shed".into())));
+        assert!(s.set_alias("rig1", None));
+        assert!(!s.set_alias("nobody", Some("x".into())));
+        assert_eq!(alias(&s, "rig1"), None);
+        assert_eq!(alias(&s, "rig2").as_deref(), Some("Shed"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn restored_best_share_is_converted_from_stratum_units() {
         let row = WorkerRow {
@@ -765,9 +902,18 @@ mod tests {
             best_difficulty: 229_126_140.0, // a 3496.2-diff share in scrypt share units
             best_at: Some(90),
             work_accepted: 0.0,
+            alias: None,
         };
-        let s = Stats::restore(&[row], &[], 100, 65536.0);
+        let older = WorkerRow {
+            name: "b".into(),
+            best_at: None, // persisted before the time was recorded
+            ..row.clone()
+        };
+        let s = Stats::restore(&[row, older], &[], 100, 65536.0);
         assert!((s.best_difficulty() - 3496.187).abs() < 0.01);
         assert_eq!(s.best_share().unwrap().at, Some(90));
+        let workers = s.workers(100);
+        assert_eq!(workers[0].best_at, Some(90));
+        assert_eq!(workers[1].best_at, None);
     }
 }

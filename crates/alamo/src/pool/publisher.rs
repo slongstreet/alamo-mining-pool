@@ -11,10 +11,10 @@ use alamo_core::time::now_unix;
 use alamo_core::work::WorkTemplate;
 use alamo_core::Algorithm;
 use alamo_store::{BlockRow, CoinRounds, Store};
-use alamo_stratum::{PoolEvent, WorkReceiver};
+use alamo_stratum::{PoolEvent, VardiffConfig, WorkReceiver};
 use alamo_web::{
     AppState, CoinStatus, Command, LaneCoin, LaneState, LaneStatus, NodeStatus, PoolSnapshot,
-    RoundStatus,
+    RoundStatus, SettingsDoc,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,6 +37,8 @@ struct LaneView {
     /// Last template seen per coin, so a coin whose template was withdrawn keeps its
     /// place on the dashboard, flagged stale, instead of vanishing.
     templates: HashMap<&'static str, Arc<WorkTemplate>>,
+    /// The lane's vardiff as in force, Settings-page changes included.
+    vardiff: watch::Receiver<VardiffConfig>,
 }
 
 /// One lane's statistics and accounting, owned by the publisher.
@@ -52,9 +54,19 @@ struct LaneAccount {
     view: Option<LaneView>,
     /// Why the lane gave up starting, once it has.
     failed: Option<String>,
+    /// Vardiff share interval to report until the lane is up and its live vardiff can be
+    /// watched: the file's, or the effective one read from the settings at start.
+    target_share_seconds: f64,
 }
 
 impl LaneAccount {
+    /// Seconds between shares the lane's vardiff aims for right now.
+    fn target_share_seconds(&self) -> f64 {
+        self.view.as_ref().map_or(self.target_share_seconds, |v| {
+            v.vardiff.borrow().target_share_seconds
+        })
+    }
+
     fn state(&self) -> LaneState {
         if self.failed.is_some() {
             LaneState::Failed
@@ -127,6 +139,7 @@ impl Publisher {
                 persist: Persistence::new(store.clone(), &lane.key),
                 view: None,
                 failed: None,
+                target_share_seconds: lane.vardiff().target_share_seconds,
             });
         }
         Self {
@@ -140,6 +153,16 @@ impl Publisher {
         }
     }
 
+    /// Take each lane's effective vardiff share interval (overrides included) from the
+    /// settings document, for lanes not yet up; a lane that is up watches its own.
+    fn seed_targets(&mut self, doc: &SettingsDoc) {
+        for l in &mut self.lanes {
+            if let Some(lane) = doc.lanes.iter().find(|s| s.key == l.key) {
+                l.target_share_seconds = lane.vardiff.target_share_seconds.value;
+            }
+        }
+    }
+
     fn notice(&mut self, notice: LaneNotice) {
         match notice {
             LaneNotice::Up(up) => {
@@ -149,6 +172,7 @@ impl Publisher {
                         work: up.work,
                         nodes: up.nodes,
                         templates: HashMap::new(),
+                        vardiff: up.vardiff,
                     });
                 }
             }
@@ -181,16 +205,17 @@ impl Publisher {
 
     /// Carry out an operator command on the lane it names.
     async fn command(&mut self, command: Command) {
-        let (lane, name) = match &command {
-            Command::ResetStats { lane } => (lane, None),
-            Command::RemoveWorker { lane, name } => (lane, Some(name)),
+        let lane = match &command {
+            Command::ResetStats { lane }
+            | Command::RemoveWorker { lane, .. }
+            | Command::SetAlias { lane, .. } => lane,
         };
         let Some(l) = self.lanes.iter_mut().find(|l| l.key == *lane) else {
             tracing::warn!(lane = %lane, "command for an unknown lane ignored");
             return;
         };
-        match name {
-            None => {
+        match command {
+            Command::ResetStats { .. } => {
                 // Queued shares must land before the zeroing or they would be
                 // counted on top of it.
                 flush_persist(&l.key, &mut l.persist).await;
@@ -204,7 +229,8 @@ impl Publisher {
                     }
                 }
             }
-            Some(name) => {
+            Command::RemoveWorker { name, .. } => {
+                let name = name.as_str();
                 // The API already refused connected workers, but a session may have
                 // arrived since; and queued shares must land before the row goes.
                 if l.stats.is_connected(name) {
@@ -219,6 +245,26 @@ impl Publisher {
                     }
                     Err(err) => {
                         tracing::warn!(lane = %l.key, %err, worker = %name, "could not remove worker")
+                    }
+                }
+            }
+            Command::SetAlias { name, alias, .. } => {
+                // A worker that just authorized may only be queued for the store yet.
+                flush_persist(&l.key, &mut l.persist).await;
+                match self
+                    .store
+                    .set_worker_alias(&l.key, &name, alias.as_deref())
+                    .await
+                {
+                    Ok(true) => {
+                        tracing::info!(lane = %l.key, worker = %name, alias = ?alias, "worker alias set by operator");
+                        l.stats.set_alias(&name, alias);
+                    }
+                    Ok(false) => {
+                        tracing::warn!(lane = %l.key, worker = %name, "no such worker; alias not set")
+                    }
+                    Err(err) => {
+                        tracing::warn!(lane = %l.key, %err, worker = %name, "could not set worker alias")
                     }
                 }
             }
@@ -327,6 +373,9 @@ pub(super) async fn publisher(
     mut commands: mpsc::Receiver<Command>,
     shutdown: CancellationToken,
 ) {
+    if let Some(op) = state.operator() {
+        p.seed_targets(&op.settings());
+    }
     let mut start = 0usize;
     let mut interval = tokio::time::interval(PUBLISH_INTERVAL);
     loop {
@@ -519,6 +568,7 @@ fn lane_status(l: &LaneAccount, rounds: &[CoinRounds], now: u64) -> LaneStatus {
         best_share_worker: best.as_ref().map(|b| b.worker.clone()),
         best_share_at: best.and_then(|b| b.at),
         scoring_since: stats.scoring_since(),
+        target_share_seconds: l.target_share_seconds(),
         configured_coins: l.configured_coins.clone(),
         coins,
         workers,
@@ -691,6 +741,23 @@ mod tests {
         assert_eq!(snapshot.lanes[1].shares_accepted, 1);
         assert_eq!(snapshot.lanes[0].algorithm, "scrypt");
         assert_eq!(snapshot.lanes[0].share_multiplier, 65_536.0);
+        assert_eq!(
+            snapshot.lanes[0].target_share_seconds,
+            lanes[ltc].vardiff().target_share_seconds,
+            "the file's interval before the lane is up"
+        );
+        // The settings document (overrides included) is read at start for lanes not up.
+        let mut doc = SettingsDoc::default();
+        doc.lanes.push(alamo_web::LaneSettings {
+            key: "ltc".into(),
+            vardiff: alamo_web::VardiffSettings {
+                target_share_seconds: alamo_web::Setting::overridden(10.0, 7.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        p.seed_targets(&doc);
+        assert_eq!(p.snapshot().lanes[0].target_share_seconds, 7.0);
 
         // DOGE fails to start; LTC comes up.
         let (_work_tx, work) = watch::channel(None);
@@ -704,13 +771,22 @@ mod tests {
             snapshot.lanes[1].error.as_deref(),
             Some("lane 'doge': wrong network")
         );
+        let (vardiff_tx, vardiff) = watch::channel(VardiffConfig {
+            target_share_seconds: 15.0,
+            ..lanes[ltc].vardiff().clone()
+        });
         p.notice(LaneNotice::Up(LaneUp {
             lane: ltc,
             chain: Chain::Regtest,
             work,
             nodes: vec![],
+            vardiff,
         }));
         let snapshot = p.snapshot();
+        assert_eq!(snapshot.lanes[0].target_share_seconds, 15.0);
+        // A Settings change reaches the lane's vardiff channel; the next snapshot has it.
+        vardiff_tx.send_modify(|v| v.target_share_seconds = 4.0);
+        assert_eq!(p.snapshot().lanes[0].target_share_seconds, 4.0);
         let primary = &snapshot.lanes[0];
         assert_eq!(primary.state, LaneState::Running);
         assert_eq!(primary.chain.as_deref(), Some("regtest"));
@@ -725,6 +801,25 @@ mod tests {
         assert_eq!(snapshot.lanes[1].workers[0].connections, 0);
 
         // Operator commands act on the lane they name.
+        p.command(Command::SetAlias {
+            lane: "ltc".into(),
+            name: "rig".into(),
+            alias: Some("Garage".into()),
+        })
+        .await;
+        assert_eq!(rows("ltc").await[0].alias.as_deref(), Some("Garage"));
+        assert_eq!(rows("doge").await[0].alias, None, "only the lane named");
+        assert_eq!(
+            p.snapshot().lanes[0].workers[0].alias.as_deref(),
+            Some("Garage")
+        );
+        assert_eq!(p.snapshot().lanes[1].workers[0].alias, None);
+        p.command(Command::SetAlias {
+            lane: "ltc".into(),
+            name: "nobody".into(),
+            alias: Some("x".into()),
+        })
+        .await;
         p.command(Command::ResetStats { lane: "ltc".into() }).await;
         assert_eq!(p.lanes[ltc].stats.shares_accepted(), 0);
         assert_eq!(p.lanes[doge].stats.shares_accepted(), 1);
@@ -757,6 +852,11 @@ mod tests {
         // Restored per lane on restart.
         let p = Publisher::load(store.clone(), &lanes, primary_index, t0 + 3).await;
         assert!(p.lanes[doge].stats.workers(t0 + 3).is_empty());
+        assert_eq!(
+            p.lanes[ltc].stats.workers(t0 + 3)[0].alias.as_deref(),
+            Some("Garage"),
+            "the alias survives a restart and a reset"
+        );
         assert_eq!(p.lanes[ltc].stats.shares_accepted(), 0);
         assert_eq!(p.lanes[ltc].stats.total_work(), 12.0 / 65_536.0);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

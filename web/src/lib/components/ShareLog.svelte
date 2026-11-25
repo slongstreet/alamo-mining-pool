@@ -1,14 +1,24 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { api, type ShareRow } from '../api';
-  import { formatAgo, formatClock, formatDifficulty, formatInteger, shortWorker } from '../format';
+  import { onMount, untrack } from 'svelte';
+  import { api, type ShareRow, type WorkerStatus } from '../api';
+  import { formatAgo, formatClock, formatDifficulty, formatInteger } from '../format';
+  import { aliasMap, rejectLabel } from '../workers';
   import Info from './Info.svelte';
+  import WorkerName from './WorkerName.svelte';
 
   /**
    * One lane's recent shares. `shareMultiplier` is that lane's: it converts the job
-   * difficulty (stratum units) to network units.
+   * difficulty (stratum units) to network units. `workers` (the lane's, from the
+   * snapshot) supplies aliases for the worker column.
    */
-  let { now, lane, shareMultiplier }: { now: number; lane: string; shareMultiplier: number } = $props();
+  let {
+    now,
+    lane,
+    shareMultiplier,
+    workers = [],
+  }: { now: number; lane: string; shareMultiplier: number; workers?: WorkerStatus[] } = $props();
+
+  const aliases = $derived(aliasMap(workers));
 
   const jobHelp = $derived(
     'The difficulty the pool asked the miner for, in stratum units: the number the miner itself ' +
@@ -21,13 +31,18 @@
   let shares = $state<ShareRow[]>([]);
   let paused = $state(false);
 
+  // The parent rebuilds its props from every snapshot, so reading `lane` directly would
+  // wake an effect every couple of seconds; a derived primitive only notifies when the
+  // key itself changes.
+  const laneKey = $derived(lane);
+
   // A lane switch can overtake an answer in flight; only the latest request counts.
   let request = 0;
   async function load(force = false) {
     if (!force && paused) return;
     const mine = ++request;
     try {
-      const next = await api.shares(40, lane);
+      const next = await api.shares(40, laneKey);
       if (mine === request) shares = next;
     } catch {
       // Keep the last list.
@@ -40,21 +55,12 @@
   });
   // First load, and a fresh list for another lane (even while paused).
   $effect(() => {
-    void lane;
-    shares = [];
-    load(true);
+    void laneKey;
+    untrack(() => {
+      shares = [];
+      load(true);
+    });
   });
-
-  const reasons: Record<string, string> = {
-    stale_job: 'stale',
-    unknown_job: 'unknown job',
-    low_difficulty: 'low diff',
-    duplicate: 'duplicate',
-    invalid_ntime: 'bad ntime',
-    invalid_extranonce2: 'bad extranonce',
-    unauthorized: 'unauthorized',
-    invalid_version_bits: 'bad version bits',
-  };
 </script>
 
 <section class="panel">
@@ -80,7 +86,7 @@
           {#each shares as s (s.id)}
             <tr>
               <td class="muted num" title={formatClock(s.ts)}>{formatAgo(s.ts, now)}</td>
-              <td class="mono worker" title={s.worker}>{shortWorker(s.worker)}</td>
+              <td class="worker"><WorkerName name={s.worker} {aliases} /></td>
               <td class="r num">{formatDifficulty(s.difficulty)}</td>
               <td class="r num" class:hot={s.accepted && s.share_diff * shareMultiplier >= s.difficulty * 100}>
                 {s.accepted ? formatDifficulty(s.share_diff) : '—'}
@@ -89,7 +95,7 @@
                 {#if s.accepted}
                   <span class="badge ok">accepted</span>
                 {:else}
-                  <span class="badge bad">{reasons[s.reject_reason ?? ''] ?? s.reject_reason ?? 'rejected'}</span>
+                  <span class="badge bad">{rejectLabel(s.reject_reason)}</span>
                 {/if}
               </td>
             </tr>

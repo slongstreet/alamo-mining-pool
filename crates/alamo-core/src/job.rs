@@ -45,6 +45,23 @@ pub enum RejectReason {
 }
 
 impl RejectReason {
+    /// Every reason, in declaration order: `ALL[r.index()] == r`.
+    pub const ALL: [RejectReason; 8] = [
+        RejectReason::StaleJob,
+        RejectReason::UnknownJob,
+        RejectReason::LowDifficulty,
+        RejectReason::Duplicate,
+        RejectReason::InvalidNtime,
+        RejectReason::InvalidExtranonce2,
+        RejectReason::Unauthorized,
+        RejectReason::InvalidVersionBits,
+    ];
+
+    /// Position in [`RejectReason::ALL`], for per-reason counters kept in a fixed array.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
     /// The stratum error code conventionally sent for this rejection.
     pub fn stratum_code(self) -> i32 {
         match self {
@@ -121,5 +138,15 @@ mod tests {
         assert_eq!(r.stratum_code(), 20);
         assert_eq!(r.message(), "Invalid version bits");
         assert_eq!(r.as_str(), "invalid_version_bits");
+    }
+
+    #[test]
+    fn all_lists_every_reason_at_its_index() {
+        for (i, r) in RejectReason::ALL.iter().enumerate() {
+            assert_eq!(r.index(), i, "{r:?}");
+        }
+        let slugs: std::collections::HashSet<_> =
+            RejectReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(slugs.len(), RejectReason::ALL.len());
     }
 }

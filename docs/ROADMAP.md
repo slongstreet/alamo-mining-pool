@@ -120,4 +120,6 @@ hardware; no mainnet Bitcoin block has been found yet.
 ## Later
 - More sha256d parents (BCH) as additional lanes.
 - Stratum v2.
-- Notifications (webhook, email) on block found.
+- [x] Webhook notifications: block found, worker offline/online, node down/up, lane
+  failed (`[notify]`, see OPERATING.md).
+- Email notifications.

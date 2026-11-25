@@ -40,6 +40,8 @@ pub struct WorkerRow {
     pub best_at: Option<i64>,
     /// Lifetime accepted work: the sum of job difficulty over accepted shares.
     pub work_accepted: f64,
+    /// Display name the operator gave the worker, if any.
+    pub alias: Option<String>,
 }
 
 /// Fields written when a worker authorizes.
@@ -117,6 +119,7 @@ struct WorkerSql {
     best_difficulty: f64,
     best_at: Option<i64>,
     work_accepted: f64,
+    alias: Option<String>,
 }
 
 impl From<WorkerSql> for WorkerRow {
@@ -134,6 +137,7 @@ impl From<WorkerSql> for WorkerRow {
             best_difficulty: row.best_difficulty,
             best_at: row.best_at,
             work_accepted: row.work_accepted,
+            alias: row.alias,
         }
     }
 }
@@ -380,6 +384,23 @@ impl Store {
         Ok(Some(work))
     }
 
+    /// Set or clear (`None`) the display alias of a worker in `lane`. Returns false when the
+    /// lane has no such worker. The caller validates the text.
+    pub async fn set_worker_alias(
+        &self,
+        lane: &str,
+        name: &str,
+        alias: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let done = sqlx::query("UPDATE workers SET alias = ? WHERE lane = ? AND name = ?")
+            .bind(alias)
+            .bind(lane)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// Accepted work of workers removed from `lane`, in difficulty units. Zero for a lane
     /// that has never removed one.
     pub async fn retired_work(&self, lane: &str) -> Result<f64, StoreError> {
@@ -394,7 +415,8 @@ impl Store {
     pub async fn load_workers(&self, lane: &str) -> Result<Vec<WorkerRow>, StoreError> {
         let rows: Vec<WorkerSql> = sqlx::query_as(
             "SELECT name, payout_address, aux_payouts, fallback, first_seen, last_seen,
-                    shares_accepted, shares_rejected, best_difficulty, best_at, work_accepted
+                    shares_accepted, shares_rejected, best_difficulty, best_at, work_accepted,
+                    alias
              FROM workers WHERE lane = ? ORDER BY name",
         )
         .bind(lane)
@@ -886,6 +908,66 @@ mod tests {
         assert_eq!(store.remove_worker(LTC, "rig").await.unwrap(), Some(16.0));
         assert_eq!(store.retired_work(LTC).await.unwrap(), 16.0);
         assert_eq!(store.retired_work(BTC).await.unwrap(), 100.0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn alias_is_lane_scoped_survives_reauthorize_and_goes_with_the_row() {
+        const BTC: &str = "btc";
+        let path = temp_path("alias");
+        let store = Store::open(&path).await.unwrap();
+        for lane in [LTC, BTC] {
+            store
+                .persist_batch(lane, &[worker("rig", 1000)], &[])
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.load_workers(LTC).await.unwrap()[0].alias, None);
+        assert!(store
+            .set_worker_alias(LTC, "rig", Some("Garage S19"))
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .set_worker_alias(LTC, "nobody", Some("x"))
+                .await
+                .unwrap(),
+            "an unknown worker reports false"
+        );
+        assert_eq!(
+            store.load_workers(LTC).await.unwrap()[0].alias.as_deref(),
+            Some("Garage S19")
+        );
+        assert_eq!(
+            store.load_workers(BTC).await.unwrap()[0].alias,
+            None,
+            "the same name in another lane has its own alias"
+        );
+
+        // Re-authorizing (with a new address) and new shares leave the alias alone.
+        let mut again = worker("rig", 2000);
+        again.payout_address = "ltc1qother".into();
+        store
+            .persist_batch(LTC, &[again], &[share("rig", 2001, true)])
+            .await
+            .unwrap();
+        store.reset_share_counters(LTC).await.unwrap();
+        let row = &store.load_workers(LTC).await.unwrap()[0];
+        assert_eq!(row.payout_address, "ltc1qother");
+        assert_eq!(row.alias.as_deref(), Some("Garage S19"));
+
+        // Removing the worker removes its alias: it comes back without one.
+        store.remove_worker(LTC, "rig").await.unwrap();
+        store
+            .persist_batch(LTC, &[worker("rig", 3000)], &[])
+            .await
+            .unwrap();
+        assert_eq!(store.load_workers(LTC).await.unwrap()[0].alias, None);
+
+        // Clearing.
+        store.set_worker_alias(BTC, "rig", Some("b")).await.unwrap();
+        assert!(store.set_worker_alias(BTC, "rig", None).await.unwrap());
+        assert_eq!(store.load_workers(BTC).await.unwrap()[0].alias, None);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

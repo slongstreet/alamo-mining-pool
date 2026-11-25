@@ -227,13 +227,14 @@ The dashboard is embedded at build time, so build `web/dist` first.
 | `stratum.vardiff.*` | Share difficulty range and target share interval, in the units miners display: for scrypt a share of difficulty 65536 equals one unit of network difficulty, as in cgminer and every Litecoin pool; for SHA-256d a share of difficulty 1 is one unit. Optional: without the table a lane on `[stratum]` gets its algorithm's built-in values (scrypt 65536 / 1024 to 16777216; SHA-256d 1024 / 0.001 to 4294967296; both 10 s target, 60 s retarget, 30 % variance). |
 | `coins.<coin>.stratum.listen`, `.vardiff.*` | A parent coin's own listener and vardiff, instead of `[stratum]`. Each parent coin is its own lane; two parents cannot share an address. Not allowed on a merge-mined coin. A lane with its own section and no vardiff table gets its algorithm's built-in values, never `[stratum.vardiff]`. |
 | `web.listen` | Dashboard and API. Bind to `127.0.0.1` and put a reverse proxy in front if the box is reachable from the internet; the API has no authentication. |
-| `web.read_only` | Refuse every change from the dashboard (settings, share-count reset, worker removal). |
+| `web.read_only` | Refuse every change from the dashboard (settings, share-count reset, worker removal, worker aliases). |
 | `coins.<coin>.rpc_url`, `rpc_user`, `rpc_password` | Node RPC. The password is never logged. |
 | `[coins.<coin>]` keys | Case does not matter (`[coins.LTC]` is `ltc`); two keys that differ only by case are refused. |
 | `${NAME}` in any value | Replaced with the environment variable `NAME` when the file is read; startup fails naming the variable if it is unset. Comment lines are not expanded. |
 | `coins.<coin>.zmq_hashblock` | The node's `zmqpubhashblock` endpoint, `tcp://host:port`. |
 | `coins.<coin>.fallback_address` | Paid when a miner's username is not a valid address. |
 | `coins.<coin>.template_stale_secs` | How long a node may be unreachable before its template is withdrawn (default 120). |
+| `notify.webhook_url`, `events`, `worker_offline_minutes` | Webhook notifications; see [Notifications](#notifications). The URL is a secret, like `rpc_password`. |
 
 `alamo --config alamo.toml --check` validates the file and exits.
 
@@ -356,6 +357,25 @@ payouts.
 
 - **Dashboard** at `web.listen`: hashrate, odds, rounds and luck, workers, live shares,
   blocks, and a badge per coin when its node is unreachable or its template is stale.
+  - The Workers table sorts by any column (click a header; a third click returns to the
+    pool's order: connected first, then by name), and the choice is remembered in the
+    browser. A connected worker with no accepted share for 12 of the lane's vardiff target
+    intervals (never less than two minutes) is flagged `quiet`. Hovering a worker's
+    rejected count breaks it down by reason (stale, low diff, duplicate, ...) since the
+    pool last started or its counters were reset.
+  - When no update has arrived for 10 seconds, or the daemon cannot be reached, the
+    panels are dimmed and a "Not updating — last update 42s ago" notice counts up until
+    the next one. The browser tab's title carries the hashrate and connected workers
+    (each lane's hashrate with several lanes), prefixed `⚠ offline` while stale.
+  - A block found while the page is open shows a notice (coin, height, worker, status)
+    for a minute and puts `★ <coin> block found` in the tab title until the tab is looked
+    at; a worker that has had no connection for a minute and a node that goes away get a
+    notice too. Nothing is reported for what was already there when the page loaded or
+    reconnected.
+  - "Enable desktop notifications" in the header adds a desktop notification for found
+    blocks. Browsers allow these only on HTTPS or `localhost`, so on a plain-HTTP install
+    (such as Umbrel's, opened by LAN address) the control is not offered; use
+    [webhook notifications](#notifications) there.
 - **`GET /api/health`** returns `{"status":"ok"}` while the daemon runs. Suitable for a
   liveness probe.
 - **`GET /api/status`** is the full status document as JSON. `lanes` has one entry per
@@ -375,6 +395,14 @@ payouts.
   move. A worker connected in that lane is refused with 409. Both take `?lane=<key>`
   (default the primary lane) and are applied by the pool task within one publish
   interval.
+- **`PUT /api/workers/{name}/alias[?lane=<key>]`** with a JSON body
+  `{"alias": "Garage S19"}` gives a worker of the lane (default: the primary lane) a
+  display name, shown on the dashboard in place of its long stratum name. The alias is
+  trimmed, 1–32 characters with no control characters; `null` or `""` clears it. An
+  unknown worker is a 404 and an unknown lane or invalid alias is a 400. Like the other
+  write endpoints it is refused with 403 when `[web] read_only = true`, and it answers 202
+  once queued. The alias is stored with the worker, so it survives restarts and
+  re-authorization and is deleted when the worker is removed.
 - **`GET /metrics`** is a Prometheus text endpoint. Every series about a lane carries a
   `lane` label (`lane="ltc"`), next to `worker` or `coin` where those apply;
   `alamo_lane_state{lane,state}` is 1 for the state each lane is in. Useful alerts:
@@ -396,6 +424,59 @@ payouts.
 
 Logs go to stdout in a structured format. `RUST_LOG=debug` is verbose;
 `RUST_LOG=info,alamo_coins::zmq=debug` shows each block notification.
+
+### Notifications
+
+The daemon can POST to a webhook when something happens, so you hear about it without
+the dashboard open. Configure it in the main file or `alamo.local.toml` (not on the
+Settings page):
+
+```toml
+[notify]
+webhook_url = "${ALAMO_WEBHOOK_URL}"   # absent or empty: off; http:// or https:// only
+events = ["block_found", "worker_offline", "worker_online", "node_down", "node_up", "lane_failed"]  # default: all
+worker_offline_minutes = 5             # 1 to 10080
+```
+
+| Event | When |
+| --- | --- |
+| `block_found` | A block candidate was submitted, once the node has accepted or rejected it (with the reason). Fields: `lane`, `coin`, `height`, `hash`, `worker`, `accepted`, `reason`. |
+| `worker_offline` | A worker that had a connection in this run has had none for `worker_offline_minutes`. Workers that were idle at startup are never reported. Fields: `lane`, `worker`, `offline_minutes`. |
+| `worker_online` | A worker reported offline connected again. Fields: `lane`, `worker`. |
+| `node_down` | A coin's node has been unreachable, or its template withdrawn, for 30 seconds. Fields: `lane`, `coin`, `error`. |
+| `node_up` | A node reported down answers again. Fields: `lane`, `coin`. |
+| `lane_failed` | A lane gave up starting. Fields: `lane`, `error`. |
+
+Each fires once per transition. The body is JSON:
+
+```json
+{"event": "block_found", "pool": "Alamo Solo Pool", "time": 1764000000,
+ "text": "Alamo Solo Pool: BTC block 977562 found by rig1 — accepted by node",
+ "content": "Alamo Solo Pool: BTC block 977562 found by rig1 — accepted by node",
+ "lane": "btc", "coin": "BTC", "height": 977562, "hash": "00000000…", "worker": "rig1",
+ "accepted": true, "reason": null}
+```
+
+`text` (Slack, Mattermost) and `content` (Discord) carry the same sentence, so those
+receivers need no setup:
+
+- **Discord**: Server Settings → Integrations → Webhooks → New Webhook, copy its URL
+  (`https://discord.com/api/webhooks/<id>/<token>`) into `webhook_url`.
+- **ntfy**: ntfy's JSON publishing wants `topic` and `message` fields, so point at the
+  topic with a message template instead:
+  `webhook_url = "https://ntfy.sh/<your-topic>?tpl=yes&m=%7B%7B.text%7D%7D"` (that is
+  `m={{.text}}`, URL-encoded; needs a ntfy server with message templating). Without the
+  template ntfy shows the raw JSON as the message.
+
+Delivery is an HTTP POST with a 10 second timeout, tried three times with a short pause;
+after that the notification is dropped with a warning naming the event. Notifications wait
+in a queue of 64 and are dropped, with a warning, if it is full; mining never waits for
+them.
+
+**The webhook URL is a secret.** Discord, Slack, and ntfy URLs carry the token that lets
+anyone post to your channel. Treat it like `rpc_password`: it is never logged, never part
+of an error message, and shown as `<redacted>` in the Settings page's configuration view.
+Prefer `${NAME}` with an environment variable over writing it into the file.
 
 ## Signals and shutdown
 

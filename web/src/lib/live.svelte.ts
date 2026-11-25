@@ -13,6 +13,8 @@ export class LiveStatus {
   status = $state<Status | null>(null);
   connection = $state<Connection>('connecting');
   error = $state<string | null>(null);
+  /** Client clock (ms) when the last status arrived; null before the first. */
+  receivedAt = $state<number | null>(null);
 
   #socket: WebSocket | null = null;
   #attempt = 0;
@@ -52,7 +54,7 @@ export class LiveStatus {
     };
     socket.onmessage = (event) => {
       try {
-        this.status = JSON.parse(event.data as string) as Status;
+        this.#accept(JSON.parse(event.data as string) as Status);
       } catch (e) {
         this.error = e instanceof Error ? e.message : String(e);
       }
@@ -82,7 +84,7 @@ export class LiveStatus {
       const status = await api.status();
       // The socket may have opened while the request was in flight; its snapshots win.
       if (this.#isLive()) return;
-      this.status = status;
+      this.#accept(status);
       this.error = null;
       this.connection = 'polling';
     } catch (e) {
@@ -90,6 +92,11 @@ export class LiveStatus {
       this.error = e instanceof Error ? e.message : String(e);
       this.connection = 'offline';
     }
+  }
+
+  #accept(status: Status) {
+    this.status = status;
+    this.receivedAt = Date.now();
   }
 
   #isLive(): boolean {

@@ -1,15 +1,22 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { api, type HashrateSample } from '../api';
-  import { formatClock, formatHashrate, shortWorker } from '../format';
+  import { onMount, untrack } from 'svelte';
+  import { api, type HashrateSample, type WorkerStatus } from '../api';
+  import { formatClock, formatHashrate } from '../format';
+  import { axisTicks, chartTop } from '../scale';
+  import { aliasMap, workerLabel } from '../workers';
 
-  /** One lane's hashrate history: scrypt and SHA-256 rates do not add up. */
+  /**
+   * One lane's hashrate history: scrypt and SHA-256 rates do not add up. `workers` are the
+   * lane's, from the snapshot, for the worker selector (shown by alias where there is one).
+   */
   let {
     live,
     workers,
     lane,
     allLabel = 'Pool',
-  }: { live: number; workers: string[]; lane: string; allLabel?: string } = $props();
+  }: { live: number; workers: WorkerStatus[]; lane: string; allLabel?: string } = $props();
+
+  const aliases = $derived(aliasMap(workers));
 
   const spans = [
     { label: '1h', secs: 3600 },
@@ -17,6 +24,9 @@
     { label: '7d', secs: 7 * 86_400 },
     { label: '30d', secs: 30 * 86_400 },
   ];
+  // The parent rebuilds its props from every snapshot, so effects read the lane through a
+  // derived primitive, which only notifies when the key itself changes.
+  const laneKey = $derived(lane);
   let span = $state(86_400);
   let worker = $state('');
   let samples = $state<HashrateSample[]>([]);
@@ -25,13 +35,30 @@
   const height = 190;
   const pad = { top: 12, right: 12, bottom: 24, left: 56 };
 
+  // The time axis follows one clock, ticking at a pace that suits the span (a pixel or
+  // so of scroll per tick), not the snapshots: the plot scrolls steadily and the start
+  // label changes only when the clock does.
+  const nowSecs = () => Math.floor(Date.now() / 1000);
+  let clock = $state(nowSecs());
+  const tickMs = $derived(span <= 3600 ? 10_000 : 60_000);
+  $effect(() => {
+    const ms = tickMs;
+    clock = nowSecs();
+    const timer = setInterval(() => (clock = nowSecs()), ms);
+    return () => clearInterval(timer);
+  });
+
   // Answers can arrive out of order after a lane or span change; only the latest counts.
   let request = 0;
   async function load() {
     const mine = ++request;
     try {
-      const next = await api.hashrate(span, worker, lane);
-      if (mine === request) samples = next;
+      const next = await api.hashrate(span, worker, laneKey);
+      if (mine === request) {
+        samples = next;
+        // Fresh samples run up to now; catch the axis up so the newest is not past it.
+        clock = nowSecs();
+      }
     } catch {
       // Keep the last good series; the header shows the connection state.
     }
@@ -40,39 +67,41 @@
   // Another lane has other workers and another series: start from its whole-lane view.
   let shownLane: string | undefined;
   $effect.pre(() => {
-    if (shownLane !== undefined && lane !== shownLane) {
-      worker = '';
-      samples = [];
-      hover = null;
-    }
-    shownLane = lane;
+    const key = laneKey;
+    untrack(() => {
+      if (shownLane !== undefined && key !== shownLane) {
+        worker = '';
+        samples = [];
+        hover = null;
+        shownTop = null;
+      }
+      shownLane = key;
+    });
   });
 
   onMount(() => {
-    load();
     const timer = setInterval(load, 60_000);
     return () => clearInterval(timer);
   });
+  // First fetch, and a re-fetch when the selection changes.
   $effect(() => {
-    // Re-fetch when the selection changes.
     void span;
     void worker;
-    void lane;
-    load();
+    void laneKey;
+    untrack(load);
   });
 
-  const points = $derived.by(() => {
-    if (samples.length === 0) return [];
-    const now = Math.floor(Date.now() / 1000);
-    const start = now - span;
-    return samples.filter((s) => s.ts >= start);
+  const start = $derived(clock - span);
+  const points = $derived(samples.length === 0 ? [] : samples.filter((s) => s.ts >= start));
+  const dataMax = $derived(points.reduce((m, p) => Math.max(m, p.hashrate), live));
+  // The top steps along a ladder of round values, with hysteresis (see `chartTop`), so
+  // the live estimate's wobble does not rescale the chart. `shownTop` is the memory.
+  let shownTop: number | null = null;
+  const maxY = $derived.by(() => {
+    shownTop = chartTop(dataMax, shownTop);
+    return shownTop;
   });
-  const maxY = $derived(Math.max(live, ...points.map((p) => p.hashrate)) * 1.15 || 1);
-  const x = $derived((ts: number) => {
-    const now = Math.floor(Date.now() / 1000);
-    const start = now - span;
-    return pad.left + ((ts - start) / span) * (width - pad.left - pad.right);
-  });
+  const x = $derived((ts: number) => pad.left + ((ts - start) / span) * (width - pad.left - pad.right));
   const y = $derived((h: number) => pad.top + (1 - h / maxY) * (height - pad.top - pad.bottom));
   const line = $derived(points.map((p, i) => `${i ? 'L' : 'M'}${x(p.ts).toFixed(1)},${y(p.hashrate).toFixed(1)}`).join(' '));
   const area = $derived(
@@ -80,7 +109,9 @@
       ? `${line} L${x(points[points.length - 1].ts).toFixed(1)},${y(0)} L${x(points[0].ts).toFixed(1)},${y(0)} Z`
       : '',
   );
-  const ticks = $derived([0.25, 0.5, 0.75, 1].map((f) => ({ v: maxY * f, y: y(maxY * f) })));
+  // Keyed by position, not value: when the scale steps, the tick elements move and
+  // relabel rather than being rebuilt.
+  const ticks = $derived(axisTicks(maxY).map((v, i) => ({ i, v, y: y(v) })));
   const hovered = $derived(hover == null ? null : points[hover]);
 
   function onMove(e: MouseEvent) {
@@ -107,8 +138,8 @@
       {#if workers.length}
         <select bind:value={worker} class="ghost">
           <option value="">{allLabel}</option>
-          {#each workers as w (w)}
-            <option value={w}>{shortWorker(w)}</option>
+          {#each workers as w (w.name)}
+            <option value={w.name} title={w.name}>{workerLabel(w.name, aliases)}</option>
           {/each}
         </select>
       {/if}
@@ -119,7 +150,7 @@
   </div>
   <div class="chart" bind:clientWidth={width}>
     <svg viewBox="0 0 {width} {height}" role="img" aria-label="Hashrate over time" onmousemove={onMove} onmouseleave={() => (hover = null)}>
-      {#each ticks as t (t.v)}
+      {#each ticks as t (t.i)}
         <line x1={pad.left} x2={width - pad.right} y1={t.y} y2={t.y} class="grid" />
         <text x={pad.left - 8} y={t.y + 4} class="tick">{formatHashrate(t.v)}</text>
       {/each}
@@ -133,7 +164,7 @@
         <line x1={x(hovered.ts)} x2={x(hovered.ts)} y1={pad.top} y2={height - pad.bottom} class="cursor" />
         <circle cx={x(hovered.ts)} cy={y(hovered.hashrate)} r="4" class="dot" />
       {/if}
-      <text x={pad.left} y={height - 6} class="tick left">{formatClock(Math.floor(Date.now() / 1000) - span)}</text>
+      <text x={pad.left} y={height - 6} class="tick left">{formatClock(start)}</text>
       <text x={width - pad.right} y={height - 6} class="tick">now</text>
     </svg>
     <div class="legend muted">

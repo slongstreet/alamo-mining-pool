@@ -205,7 +205,7 @@ impl SettingsPatch {
 }
 
 /// Distinguish an absent field (`None`) from an explicit `null` (`Some(None)`).
-fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,
     D: Deserializer<'de>,

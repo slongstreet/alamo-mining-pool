@@ -6,13 +6,14 @@ use super::node::{connect_lane, ChainNode, Chains};
 use super::submit::submitter;
 use super::TaskEnd;
 use crate::config::{Config, LaneConfig};
+use crate::notify::Notifier;
 use crate::settings::LiveSettings;
 use alamo_coins::{merge, Chain, NodeHealth, RpcClient, TemplateSource, ZmqStatus, ZmqSubscriber};
 use alamo_core::work::MergedWork;
 use alamo_core::work::WorkTemplate;
 use alamo_store::Store;
 use alamo_stratum::server::Bound;
-use alamo_stratum::{BlockCandidate, PoolEvent, StratumServer, WorkReceiver};
+use alamo_stratum::{BlockCandidate, PoolEvent, StratumServer, VardiffConfig, WorkReceiver};
 use anyhow::Context;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -105,6 +106,8 @@ pub(super) struct LaneTask {
     pub(super) spool: PathBuf,
     pub(super) events: mpsc::Sender<PoolEvent>,
     pub(super) notices: mpsc::Sender<LaneNotice>,
+    /// Where `block_found` notifications go.
+    pub(super) notifier: Notifier,
     pub(super) shutdown: CancellationToken,
 }
 
@@ -129,6 +132,8 @@ pub(super) struct LaneUp {
     pub(super) work: WorkReceiver,
     /// Node health, parent first, in the order the snapshot lists coins.
     pub(super) nodes: Vec<(&'static str, watch::Receiver<NodeHealth>)>,
+    /// The lane's vardiff as currently in force, so the snapshot follows Settings changes.
+    pub(super) vardiff: watch::Receiver<VardiffConfig>,
 }
 
 /// A lane that has connected and bound its listener, before any of its tasks run.
@@ -138,6 +143,7 @@ struct StartedLane {
     work_tx: watch::Sender<Option<Arc<MergedWork>>>,
     work_rx: WorkReceiver,
     blocks_rx: mpsc::Receiver<BlockCandidate>,
+    vardiff: watch::Receiver<VardiffConfig>,
 }
 
 /// Connect one lane, then run its template sources, merger, stratum server, submitter,
@@ -184,6 +190,7 @@ async fn start_lane(task: &LaneTask) -> anyhow::Result<Option<StartedLane>> {
             .context("no vardiff settings for this lane")?;
         let (work_tx, work_rx) = watch::channel(None);
         let (blocks_tx, blocks_rx) = mpsc::channel::<BlockCandidate>(64);
+        let vardiff_rx = vardiff.clone();
         let bound = StratumServer {
             listen: task.lane.stratum.listen,
             vardiff,
@@ -196,16 +203,17 @@ async fn start_lane(task: &LaneTask) -> anyhow::Result<Option<StartedLane>> {
         .bind()
         .await
         .context("binding stratum")?;
-        anyhow::Ok((bound, work_tx, work_rx, blocks_rx))
+        anyhow::Ok((bound, work_tx, work_rx, blocks_rx, vardiff_rx))
     }
     .await;
-    let (bound, work_tx, work_rx, blocks_rx) = attached?;
+    let (bound, work_tx, work_rx, blocks_rx, vardiff) = attached?;
     Ok(Some(StartedLane {
         chains,
         bound,
         work_tx,
         work_rx,
         blocks_rx,
+        vardiff,
     }))
 }
 
@@ -217,6 +225,7 @@ async fn run_started_lane(task: LaneTask, started: StartedLane) -> anyhow::Resul
         store,
         spool,
         notices,
+        notifier,
         shutdown,
         ..
     } = task;
@@ -226,6 +235,7 @@ async fn run_started_lane(task: LaneTask, started: StartedLane) -> anyhow::Resul
         work_tx,
         work_rx,
         blocks_rx,
+        vardiff,
     } = started;
 
     // Every task returns its name when it stops; none of them stops on its own.
@@ -277,6 +287,7 @@ async fn run_started_lane(task: LaneTask, started: StartedLane) -> anyhow::Resul
         lane.key.clone(),
         spool,
         blocks_rx,
+        notifier,
         shutdown.child_token(),
     ));
     for node in chains.nodes() {
@@ -294,6 +305,7 @@ async fn run_started_lane(task: LaneTask, started: StartedLane) -> anyhow::Resul
             chain: chains.parent.chain,
             work: work_rx,
             nodes,
+            vardiff,
         }))
         .await;
 
