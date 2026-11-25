@@ -2,7 +2,7 @@ manifestVersion: 1
 id: longstreet-alamo
 category: bitcoin
 name: Alamo Mining Pool
-version: "0.1.15"
+version: "0.1.16"
 tagline: Solo mine Litecoin and Dogecoin, and optionally Bitcoin, on your own nodes
 description: >-
   Alamo is a self-hosted solo mining pool. Miners connect over stratum with their
@@ -21,14 +21,15 @@ description: >-
   their Bitcoin address as the username to port 3334. The Bitcoin node is not a
   dependency of this app.
 releaseNotes: >-
-  Alamo 0.1.15: a lighter daemon. Share accounting does less work per share and writes
-  to the database in fewer statements, and block templates now share the transactions
-  they have in common, which lowers memory use on a Bitcoin lane. Mining, payouts, and
-  the dashboard are unchanged. For API users: the single-lane fields deprecated in
-  0.1.14 are gone. /api/status no longer has the top-level coins, hashrate, share
-  counts, work, best share, scoring_since, or workers (read them from lanes[]; the
-  primary lane is lanes[0]), and /api/settings takes vardiff only under
-  lanes.<key>.vardiff. Prometheus /metrics is unchanged.
+  Alamo 0.1.16: usability. The dashboard no longer flickers when left open. Workers can
+  be given nicknames, the Workers table sorts by any column, flags a connected worker
+  that has gone quiet, and shows the reject rate with a breakdown by reason; hover a
+  worker's best share to see when it arrived. When the page stops receiving updates it
+  dims and says so. The browser tab shows hashrate and workers, and a notice appears
+  when a block is found or a worker or node drops. Optional webhook notifications
+  (block found, worker offline, node down) can be sent to Discord, Slack, or any JSON
+  receiver: add a [notify] section with webhook_url to data/alamo.local.toml in the
+  app's data directory and restart. Mining and payouts are unchanged.
 developer: Scott Longstreet
 website: https://github.com/slongstreet/alamo-mining-pool
 icon: https://raw.githubusercontent.com/slongstreet/longstreet-umbrel-apps/refs/heads/main/longstreet-alamo/icon.svg
