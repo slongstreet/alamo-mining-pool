@@ -67,6 +67,8 @@ export interface WorkerStatus {
   shares_accepted: number;
   shares_rejected: number;
   best_difficulty: number;
+  /** Unix seconds the best share arrived; null when unknown (older rows) or no share yet. */
+  best_at: number | null;
   work_accepted: number;
   last_share_seconds: number | null;
 }

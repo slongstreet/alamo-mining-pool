@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { api, type ShareRow } from '../api';
   import { formatAgo, formatClock, formatDifficulty, formatInteger, shortWorker } from '../format';
   import Info from './Info.svelte';
@@ -21,13 +21,18 @@
   let shares = $state<ShareRow[]>([]);
   let paused = $state(false);
 
+  // The parent rebuilds its props from every snapshot, so reading `lane` directly would
+  // wake an effect every couple of seconds; a derived primitive only notifies when the
+  // key itself changes.
+  const laneKey = $derived(lane);
+
   // A lane switch can overtake an answer in flight; only the latest request counts.
   let request = 0;
   async function load(force = false) {
     if (!force && paused) return;
     const mine = ++request;
     try {
-      const next = await api.shares(40, lane);
+      const next = await api.shares(40, laneKey);
       if (mine === request) shares = next;
     } catch {
       // Keep the last list.
@@ -40,9 +45,11 @@
   });
   // First load, and a fresh list for another lane (even while paused).
   $effect(() => {
-    void lane;
-    shares = [];
-    load(true);
+    void laneKey;
+    untrack(() => {
+      shares = [];
+      load(true);
+    });
   });
 
   const reasons: Record<string, string> = {

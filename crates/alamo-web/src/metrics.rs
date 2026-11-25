@@ -401,6 +401,8 @@ mod tests {
                 shares_accepted: 10,
                 shares_rejected: 1,
                 best_difficulty: 100.0,
+                // Not exported: the expected output below has no metric for it.
+                best_at: Some(1_700_000_000),
                 work_accepted: 80.0,
                 last_share_seconds: Some(1),
             }],

@@ -345,6 +345,7 @@ impl Stats {
                 shares_accepted: w.accepted,
                 shares_rejected: w.rejected,
                 best_difficulty: w.best_difficulty,
+                best_at: w.best_at,
                 work_accepted: w.work_accepted,
                 last_share_seconds: w.last_share.map(|t| now.saturating_sub(t)),
             })
@@ -620,6 +621,11 @@ mod tests {
         );
         assert_eq!(w.shares_accepted, 10);
         assert_eq!(w.best_difficulty, 2.0);
+        assert_eq!(
+            w.best_at,
+            Some(t0),
+            "the first of equal shares keeps the record"
+        );
         assert_eq!(w.work_accepted, 10.0);
         assert_eq!(s.total_work(), 10.0);
         assert_eq!(s.best_difficulty(), 2.0);
@@ -679,6 +685,7 @@ mod tests {
         assert_eq!(w.connections, 0);
         assert_eq!(w.shares_accepted, 10);
         assert_eq!(w.best_difficulty, 2.0);
+        assert_eq!(w.best_at, Some(t0 as u64), "best_at survives a restart");
         assert_eq!(restored.total_work(), 10.0);
         assert!(
             (w.hashrate - 10.0 * HASHES_PER_DIFF1 / 90.0).abs() < 1.0,
@@ -722,6 +729,7 @@ mod tests {
         assert_eq!(s.best_difficulty(), 0.0);
         let w = &s.workers(t0 + 90)[0];
         assert_eq!(w.shares_accepted, 0);
+        assert_eq!(w.best_at, None);
         assert!(w.hashrate > 0.0, "hashrate window survives a reset");
         assert_eq!(w.work_accepted, 10.0);
     }
@@ -766,8 +774,16 @@ mod tests {
             best_at: Some(90),
             work_accepted: 0.0,
         };
-        let s = Stats::restore(&[row], &[], 100, 65536.0);
+        let older = WorkerRow {
+            name: "b".into(),
+            best_at: None, // persisted before the time was recorded
+            ..row.clone()
+        };
+        let s = Stats::restore(&[row, older], &[], 100, 65536.0);
         assert!((s.best_difficulty() - 3496.187).abs() < 0.01);
         assert_eq!(s.best_share().unwrap().at, Some(90));
+        let workers = s.workers(100);
+        assert_eq!(workers[0].best_at, Some(90));
+        assert_eq!(workers[1].best_at, None);
     }
 }

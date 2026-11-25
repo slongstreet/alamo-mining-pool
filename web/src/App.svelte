@@ -41,11 +41,15 @@
   const lane = $derived(
     pickLane(lanes, route.page === 'dashboard' ? route.lane : null, rememberedLane()),
   );
+  // `lane` is a new object with every snapshot; its key only changes on a real lane
+  // switch. Effects that care about which lane, not its figures, read this (children that
+  // take `lane={lane.key}` derive their own copy for the same reason).
+  const laneKey = $derived(lane?.key);
   const workerNames = $derived(lane?.workers.map((w) => w.name) ?? []);
 
   // A lane named in the hash is the one to come back to.
   $effect(() => {
-    if (route.page === 'dashboard' && route.lane && lane?.key === route.lane) rememberLane(lane.key);
+    if (route.page === 'dashboard' && route.lane && laneKey === route.lane) rememberLane(laneKey);
   });
 
   function select(key: string) {

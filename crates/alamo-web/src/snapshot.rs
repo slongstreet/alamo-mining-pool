@@ -211,6 +211,8 @@ pub struct WorkerStatus {
     pub shares_rejected: u64,
     /// Best share difficulty seen.
     pub best_difficulty: f64,
+    /// Unix time the best share arrived; `None` when unknown or no share yet.
+    pub best_at: Option<u64>,
     /// Lifetime accepted work in difficulty units.
     pub work_accepted: f64,
     /// Seconds since the last accepted share, if any.

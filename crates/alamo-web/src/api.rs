@@ -812,6 +812,7 @@ mod tests {
             shares_accepted: 0,
             shares_rejected: 0,
             best_difficulty: 0.0,
+            best_at: None,
             work_accepted: 0.0,
             last_share_seconds: None,
         };

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api, type LaneStatus, type WorkerStatus } from '../api';
-  import { formatDifficulty, formatDuration, formatHashrate, formatInteger, shortAddress, shortWorker } from '../format';
+  import { formatClock, formatDifficulty, formatDuration, formatHashrate, formatInteger, shortAddress, shortWorker } from '../format';
   import { unitsHelp } from '../lanes';
   import Info from './Info.svelte';
   import MinerSetup from './MinerSetup.svelte';
@@ -76,7 +76,7 @@
                 {formatInteger(w.shares_accepted)}
                 {#if w.shares_rejected}<span class="bad"> / {formatInteger(w.shares_rejected)}</span>{/if}
               </td>
-              <td class="r num">{formatDifficulty(w.best_difficulty)}</td>
+              <td class="r num" title={w.best_at == null ? undefined : formatClock(w.best_at)}>{formatDifficulty(w.best_difficulty)}</td>
               <td class="r num muted">{w.last_share_seconds == null ? '—' : `${formatDuration(w.last_share_seconds)} ago`}</td>
               <td class="r">
                 {#if w.connections === 0}

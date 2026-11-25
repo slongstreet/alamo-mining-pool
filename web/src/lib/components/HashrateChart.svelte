@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { api, type HashrateSample } from '../api';
   import { formatClock, formatHashrate, shortWorker } from '../format';
 
@@ -17,6 +17,9 @@
     { label: '7d', secs: 7 * 86_400 },
     { label: '30d', secs: 30 * 86_400 },
   ];
+  // The parent rebuilds its props from every snapshot, so effects read the lane through a
+  // derived primitive, which only notifies when the key itself changes.
+  const laneKey = $derived(lane);
   let span = $state(86_400);
   let worker = $state('');
   let samples = $state<HashrateSample[]>([]);
@@ -30,7 +33,7 @@
   async function load() {
     const mine = ++request;
     try {
-      const next = await api.hashrate(span, worker, lane);
+      const next = await api.hashrate(span, worker, laneKey);
       if (mine === request) samples = next;
     } catch {
       // Keep the last good series; the header shows the connection state.
@@ -40,25 +43,27 @@
   // Another lane has other workers and another series: start from its whole-lane view.
   let shownLane: string | undefined;
   $effect.pre(() => {
-    if (shownLane !== undefined && lane !== shownLane) {
-      worker = '';
-      samples = [];
-      hover = null;
-    }
-    shownLane = lane;
+    const key = laneKey;
+    untrack(() => {
+      if (shownLane !== undefined && key !== shownLane) {
+        worker = '';
+        samples = [];
+        hover = null;
+      }
+      shownLane = key;
+    });
   });
 
   onMount(() => {
-    load();
     const timer = setInterval(load, 60_000);
     return () => clearInterval(timer);
   });
+  // First fetch, and a re-fetch when the selection changes.
   $effect(() => {
-    // Re-fetch when the selection changes.
     void span;
     void worker;
-    void lane;
-    load();
+    void laneKey;
+    untrack(load);
   });
 
   const points = $derived.by(() => {
@@ -80,7 +85,9 @@
       ? `${line} L${x(points[points.length - 1].ts).toFixed(1)},${y(0)} L${x(points[0].ts).toFixed(1)},${y(0)} Z`
       : '',
   );
-  const ticks = $derived([0.25, 0.5, 0.75, 1].map((f) => ({ v: maxY * f, y: y(maxY * f) })));
+  // Keyed by fraction, not value: the scale follows the live hashrate, and the tick
+  // elements should move rather than be rebuilt.
+  const ticks = $derived([0.25, 0.5, 0.75, 1].map((f) => ({ f, v: maxY * f, y: y(maxY * f) })));
   const hovered = $derived(hover == null ? null : points[hover]);
 
   function onMove(e: MouseEvent) {
@@ -119,7 +126,7 @@
   </div>
   <div class="chart" bind:clientWidth={width}>
     <svg viewBox="0 0 {width} {height}" role="img" aria-label="Hashrate over time" onmousemove={onMove} onmouseleave={() => (hover = null)}>
-      {#each ticks as t (t.v)}
+      {#each ticks as t (t.f)}
         <line x1={pad.left} x2={width - pad.right} y1={t.y} y2={t.y} class="grid" />
         <text x={pad.left - 8} y={t.y + 4} class="tick">{formatHashrate(t.v)}</text>
       {/each}
