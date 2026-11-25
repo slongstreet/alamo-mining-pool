@@ -16,7 +16,8 @@ next to your own full nodes, and watch your odds of hitting the next block in re
 
 > Status: Litecoin solo mining and Dogecoin merge mining work end to end on regtest,
 > including Litecoin MWEB blocks, and so does Bitcoin solo mining with version rolling
-> (the dashboard does not yet have a per-lane view). Shares, workers, hashrate samples, and blocks persist
+> on a lane of its own, which the dashboard shows beside the Litecoin lane. Shares,
+> workers, hashrate samples, and blocks persist
 > across restarts; the live dashboard covers odds, rounds and luck, hashrate, workers,
 > shares, and blocks; the daemon survives node outages, takes ZMQ block notifications,
 > and exposes Prometheus metrics. Releases ship static Linux binaries and a multi-arch

@@ -1,8 +1,9 @@
 # Bitcoin solo mining — design
 
-Status: Wave 7 in [ROADMAP.md](ROADMAP.md). Lanes (1, 2, 6, 7), the Bitcoin coin (3),
-version rolling (4), vardiff (5), and the proof (8) are implemented; the dashboard and
-settings UI below are not.
+Status: implemented. This was Wave 7 in [ROADMAP.md](ROADMAP.md), released as 0.1.14:
+lanes, the Bitcoin coin, version rolling, vardiff, the proof, the dashboard and settings
+UI, and packaging are all in. The document is kept as the design record; where it and the
+code disagree, the code and [OPERATING.md](OPERATING.md) are right.
 
 Adding Bitcoin is mostly a runtime-shape problem, not a hashing problem.
 `Algorithm::Sha256d` already exists, but the daemon assumes exactly one parent chain

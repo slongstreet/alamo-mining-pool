@@ -102,8 +102,9 @@ Work proceeds in waves. Each wave ends with something runnable and tested.
   view of the effective configuration.
 - [x] `[web] read_only` refuses every change from the dashboard.
 
-## Wave 7 — Bitcoin solo mining (SHA-256)
-Design in [BITCOIN.md](BITCOIN.md).
+## Wave 7 — Bitcoin solo mining (SHA-256) (done)
+Design in [BITCOIN.md](BITCOIN.md). Released as 0.1.14 and running on mainnet with SHA-256
+hardware; no mainnet Bitcoin block has been found yet.
 - [x] Lanes: one parent chain, its aux chains, stratum listener, vardiff, and stats per
   lane, each started independently. Per-lane block submission with retry and a
   write-ahead copy of the block. Migration adding `lane` to workers, shares, and hashrate
