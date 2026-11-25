@@ -109,3 +109,17 @@ fallback_address = "DExampleExampleExampleExampleExampl"
 # target_share_seconds = 10
 # retarget_seconds = 60
 # variance_percent = 30
+
+# Webhook notifications: a block found (accepted or rejected), a worker offline or back
+# online, a node unreachable for ~30 s or back, a lane that could not start. Each event is
+# POSTed as JSON with the sentence in both "text" (Slack, Mattermost) and "content"
+# (Discord). The URL carries the webhook's token: treat it like rpc_password (it is never
+# logged and is redacted on the Settings page); "${NAME}" works here too. It is read from
+# this file (or alamo.local.toml) only. Absent or empty: notifications are off.
+#
+# [notify]
+# webhook_url = "${ALAMO_WEBHOOK_URL}"
+# # Default: all of them.
+# events = ["block_found", "worker_offline", "worker_online", "node_down", "node_up", "lane_failed"]
+# # A worker that had a connection must have none for this long before worker_offline.
+# worker_offline_minutes = 5

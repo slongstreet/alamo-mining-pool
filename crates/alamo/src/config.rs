@@ -1,5 +1,6 @@
 //! Top-level configuration file.
 
+use crate::notify::NotifyConfig;
 use alamo_coins::CoinConfig;
 use alamo_core::Algorithm;
 use alamo_stratum::{StratumConfig, VardiffConfig};
@@ -23,6 +24,9 @@ pub struct Config {
     /// Coins keyed by short name (`ltc`, `doge`), lower case once loaded.
     #[serde(default)]
     pub coins: BTreeMap<String, CoinConfig>,
+    /// Webhook notifications. File-only; the URL is a secret like an RPC password.
+    #[serde(default, skip_serializing_if = "NotifyConfig::is_default")]
+    pub notify: NotifyConfig,
 }
 
 /// Pool identity and storage.
@@ -174,13 +178,14 @@ impl Config {
         self.pool.data_dir.join("alamo.db")
     }
 
-    /// The effective configuration as TOML, with every RPC password replaced by a
-    /// placeholder, for the dashboard's diagnostics view.
+    /// The effective configuration as TOML, with every RPC password and the webhook URL
+    /// replaced by a placeholder, for the dashboard's diagnostics view.
     pub fn redacted_toml(&self) -> String {
         let mut copy = self.clone();
         for coin in copy.coins.values_mut() {
             coin.rpc_password = "<redacted>".to_string();
         }
+        copy.notify.redact();
         toml::to_string_pretty(&copy).unwrap_or_else(|err| format!("# could not render: {err}"))
     }
 
@@ -251,6 +256,7 @@ impl Config {
                 }
             }
         }
+        self.notify.validate()?;
         Ok(())
     }
 }
@@ -955,6 +961,49 @@ variance_percent = 20"#,
         let e = format!("{:#}", Config::load_with(&path, |_| None).unwrap_err());
         assert!(!e.contains("hunter2"), "{e}");
         assert!(e.contains("line "), "{e}");
+    }
+
+    #[test]
+    fn notify_section_validates_and_its_url_is_redacted() {
+        let base = format!("{HEAD}{}", coin("ltc", ""));
+        let cfg = Config::parse(&base).unwrap();
+        assert!(cfg.notify.webhook_url().is_none(), "off by default");
+        assert!(!cfg.redacted_toml().contains("[notify]"));
+
+        let url = "https://discord.com/api/webhooks/123/very-secret-token";
+        let cfg = Config::parse(&format!(
+            "{base}[notify]\nwebhook_url = \"{url}\"\nevents = [\"block_found\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.notify.webhook_url(), Some(url));
+        let text = cfg.redacted_toml();
+        assert!(!text.contains("very-secret-token"), "{text}");
+        assert!(text.contains("webhook_url = \"<redacted>\""), "{text}");
+        assert!(!format!("{cfg:?}").contains("very-secret-token"));
+        let again: Config = toml::from_str(&text).unwrap();
+        assert_eq!(again.notify.events, cfg.notify.events);
+
+        // Env expansion applies, and a bad URL is refused without being quoted.
+        let dir = TempDir::new("notify");
+        let path = write_main(&dir.0);
+        let main = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{main}[notify]\nwebhook_url = \"${{HOOK}}\"\n"),
+        )
+        .unwrap();
+        let env = |v: &'static str| move |name: &str| (name == "HOOK").then(|| v.to_string());
+        let cfg = Config::load_with(&path, env("https://ntfy.sh/secret-topic")).unwrap();
+        assert_eq!(
+            cfg.notify.webhook_url(),
+            Some("https://ntfy.sh/secret-topic")
+        );
+        let e = format!(
+            "{:#}",
+            Config::load_with(&path, env("smtp://mail/secret-topic")).unwrap_err()
+        );
+        assert!(e.contains("[notify] webhook_url must be an http://"), "{e}");
+        assert!(!e.contains("secret-topic"), "{e}");
     }
 
     #[test]

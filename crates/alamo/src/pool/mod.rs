@@ -56,6 +56,17 @@ pub async fn run(
         .await
         .context("loading settings")?;
     state.install_operator(settings.clone());
+    // Worker, node, and lane transitions are read off the published snapshots; blocks
+    // are reported by each lane's submitter. Neither path waits for a webhook.
+    let notifier = {
+        let names = state.clone();
+        crate::notify::start(
+            &config.notify,
+            Arc::new(move || names.pool_name()),
+            state.subscribe(),
+            shutdown.child_token(),
+        )?
+    };
 
     let config = Arc::new(config);
     let spool = config.pool.data_dir.join(BLOCK_SPOOL_DIR);
@@ -76,6 +87,7 @@ pub async fn run(
             spool: spool.clone(),
             events: events_tx,
             notices: notice_tx.clone(),
+            notifier: notifier.clone(),
             shutdown: shutdown.child_token(),
         }));
     }

@@ -3,6 +3,7 @@
 use alamo_core::odds::OddsSummary;
 use alamo_store::BlockRow;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 /// Everything the dashboard shows, refreshed by the daemon every couple of seconds.
 ///
@@ -106,6 +107,10 @@ pub struct LaneStatus {
     pub best_share_at: Option<u64>,
     /// Unix time the lane first saw a worker: when it started keeping score.
     pub scoring_since: Option<u64>,
+    /// Seconds between shares the lane's vardiff aims for, as currently in force
+    /// (Settings-page overrides included). The dashboard flags a connected worker as quiet
+    /// when its last share is older than `max(120, 12 × this)`.
+    pub target_share_seconds: f64,
     /// Every coin configured in this lane, parent first, known from startup: what the
     /// lane mines once its nodes answer, whatever its state.
     pub configured_coins: Vec<LaneCoin>,
@@ -209,6 +214,10 @@ pub struct WorkerStatus {
     pub shares_accepted: u64,
     /// Rejected shares (lifetime).
     pub shares_rejected: u64,
+    /// Rejected shares by reason slug (`stale_job`, `low_difficulty`, ...) since the daemon
+    /// last started or the lane's counters were reset. Zero counts are left out. Lifetime
+    /// `shares_rejected` survives restarts, so it can exceed the sum of these.
+    pub rejects: BTreeMap<&'static str, u64>,
     /// Best share difficulty seen.
     pub best_difficulty: f64,
     /// Unix time the best share arrived; `None` when unknown or no share yet.
@@ -217,6 +226,8 @@ pub struct WorkerStatus {
     pub work_accepted: f64,
     /// Seconds since the last accepted share, if any.
     pub last_share_seconds: Option<u64>,
+    /// Display name the operator gave the worker; `null` when none.
+    pub alias: Option<String>,
 }
 
 /// One aux chain payout of a worker.

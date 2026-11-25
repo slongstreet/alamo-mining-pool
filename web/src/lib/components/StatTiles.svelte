@@ -1,7 +1,9 @@
 <script lang="ts">
   import type { LaneStatus } from '../api';
-  import { formatAgo, formatClock, formatDifficulty, formatHashrate, formatInteger, shortWorker } from '../format';
+  import { formatAgo, formatClock, formatDifficulty, formatHashrate, formatInteger } from '../format';
+  import { aliasMap } from '../workers';
   import Info from './Info.svelte';
+  import WorkerName from './WorkerName.svelte';
 
   /** The selected lane's headline figures; `multiLane` names hashrate per lane. */
   let { lane, now, multiLane }: { lane: LaneStatus; now: number; multiLane: boolean } = $props();
@@ -9,6 +11,7 @@
   const online = $derived(lane.workers.filter((w) => w.connections > 0).length);
   const total = $derived(lane.shares_accepted + lane.shares_rejected);
   const rejectRate = $derived(total > 0 ? (lane.shares_rejected / total) * 100 : 0);
+  const aliases = $derived(aliasMap(lane.workers));
   const blocks = $derived(lane.coins.reduce((n, c) => n + c.round.blocks_found, 0));
 </script>
 
@@ -41,7 +44,7 @@
     <div class="value num">{formatDifficulty(lane.best_share_difficulty)}</div>
     {#if lane.best_share_worker}
       <div class="sub">
-        <span class="mono" title={lane.best_share_worker}>{shortWorker(lane.best_share_worker)}</span>
+        <WorkerName name={lane.best_share_worker} {aliases} />
         {#if lane.best_share_at != null}
           · <span title={formatClock(lane.best_share_at)}>{formatAgo(lane.best_share_at, now)}</span>
         {/if}

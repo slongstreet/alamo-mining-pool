@@ -50,6 +50,16 @@ pub enum Command {
         /// Worker name.
         name: String,
     },
+    /// Give a worker of `lane` a display alias, or clear it (`None`). The text has been
+    /// validated by the API (see [`api::normalize_alias`]).
+    SetAlias {
+        /// Lane key.
+        lane: String,
+        /// Worker name.
+        name: String,
+        /// The alias, trimmed; `None` clears it.
+        alias: Option<String>,
+    },
 }
 
 /// State shared with request handlers.
@@ -236,6 +246,7 @@ pub fn router(state: AppState) -> Router {
     let writes = Router::new()
         .route("/api/stats/reset", post(api::reset_stats))
         .route("/api/workers/{name}", delete(api::remove_worker))
+        .route("/api/workers/{name}/alias", put(api::set_worker_alias))
         .route("/api/settings", put(api::put_settings))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

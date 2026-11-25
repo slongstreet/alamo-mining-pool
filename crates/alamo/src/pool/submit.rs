@@ -1,6 +1,7 @@
 //! Block submission: retrying an unreachable node, keeping a copy of the block on disk
 //! until it is accepted, and the per-lane submitter task.
 
+use crate::notify::{Event, Notifier};
 use alamo_coins::{RpcClient, RpcError};
 use alamo_store::{BlockStatus, NewBlock, Store};
 use alamo_stratum::BlockCandidate;
@@ -149,6 +150,18 @@ pub async fn submit_candidate_spooled(
     candidate: &BlockCandidate,
     spool: Option<&Path>,
 ) -> anyhow::Result<SubmitOutcome> {
+    let outcome = submit_spooled(rpc, candidate, spool).await;
+    record_block(store, lane, candidate, &outcome).await?;
+    Ok(outcome)
+}
+
+/// Hand the block to the node (with retries), keeping the spool copy as
+/// [`submit_candidate_spooled`] describes, and log the verdict.
+async fn submit_spooled(
+    rpc: &RpcClient,
+    candidate: &BlockCandidate,
+    spool: Option<&Path>,
+) -> SubmitOutcome {
     let hex_block = Arc::new(hex::encode(&candidate.block));
     let spooled = spool.map(|dir| {
         let path = spool_path(dir, candidate);
@@ -191,6 +204,16 @@ pub async fn submit_candidate_spooled(
             "block REJECTED by node"
         ),
     }
+    outcome
+}
+
+/// Record a submitted block and its verdict.
+async fn record_block(
+    store: &Store,
+    lane: &str,
+    candidate: &BlockCandidate,
+    outcome: &SubmitOutcome,
+) -> anyhow::Result<()> {
     store
         .insert_block(&NewBlock {
             lane: lane.to_string(),
@@ -206,7 +229,24 @@ pub async fn submit_candidate_spooled(
         })
         .await
         .context("recording block")?;
-    Ok(outcome)
+    Ok(())
+}
+
+/// The `block_found` notification for a submitted candidate.
+fn block_event(lane: &str, candidate: &BlockCandidate, outcome: &SubmitOutcome) -> Event {
+    let (accepted, reason) = match outcome {
+        SubmitOutcome::Accepted => (true, None),
+        SubmitOutcome::Rejected(reason) => (false, Some(reason.clone())),
+    };
+    Event::BlockFound {
+        lane: lane.to_string(),
+        coin: candidate.coin.to_string(),
+        height: candidate.height,
+        hash: candidate.block_hash.clone(),
+        worker: candidate.worker.clone(),
+        accepted,
+        reason,
+    }
 }
 
 /// Hand every block candidate to its node. Each submission runs on its own, so a node
@@ -218,6 +258,7 @@ pub(super) async fn submitter(
     lane: String,
     spool: PathBuf,
     mut blocks: mpsc::Receiver<BlockCandidate>,
+    notifier: Notifier,
     shutdown: CancellationToken,
 ) -> &'static str {
     let mut pending: JoinSet<()> = JoinSet::new();
@@ -230,11 +271,13 @@ pub(super) async fn submitter(
                     continue;
                 };
                 let (store, lane, spool) = (store.clone(), lane.clone(), spool.clone());
+                let notifier = notifier.clone();
                 pending.spawn(async move {
-                    let submitted =
-                        submit_candidate_spooled(&rpc, &store, &lane, &candidate, Some(&spool))
-                            .await;
-                    if let Err(err) = submitted {
+                    let outcome = submit_spooled(&rpc, &candidate, Some(&spool)).await;
+                    // The verdict is known: notify before the database write, which
+                    // cannot change it.
+                    notifier.notify(block_event(&lane, &candidate, &outcome));
+                    if let Err(err) = record_block(&store, &lane, &candidate, &outcome).await {
                         tracing::error!(coin = candidate.coin, %err, "block submission failed");
                     }
                 });

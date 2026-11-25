@@ -296,6 +296,68 @@ pub async fn remove_worker(
     )
 }
 
+/// Longest worker alias, in characters.
+pub const MAX_ALIAS_CHARS: usize = 32;
+
+/// Check and tidy an alias: surrounding whitespace is trimmed, and `None` or an empty
+/// result clears it. Refused when longer than [`MAX_ALIAS_CHARS`] characters or when it
+/// holds a control character.
+pub fn normalize_alias(alias: Option<&str>) -> Result<Option<String>, String> {
+    let Some(text) = alias.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    if text.chars().count() > MAX_ALIAS_CHARS {
+        return Err(format!(
+            "alias must be at most {MAX_ALIAS_CHARS} characters"
+        ));
+    }
+    if text.chars().any(char::is_control) {
+        return Err("alias must not contain control characters".into());
+    }
+    Ok(Some(text.to_string()))
+}
+
+/// Body of `PUT /api/workers/{name}/alias`. `alias` must be present: a string sets it,
+/// `null` (or an empty string) clears it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AliasBody {
+    /// The new alias.
+    #[serde(default, deserialize_with = "crate::settings::double_option")]
+    pub alias: Option<Option<String>>,
+}
+
+/// `PUT /api/workers/{name}/alias[?lane=]`: give a worker of the lane (default the
+/// primary lane) a display alias, or clear it. 404 when the lane has never seen the
+/// worker, 400 for an unknown lane or an invalid alias. Like removal, the pool task
+/// stores and applies it within one publish interval.
+pub async fn set_worker_alias(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<LaneQuery>,
+    Json(body): Json<AliasBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), Refusal> {
+    let lane = resolve_lane(&state, q.lane.as_deref())?;
+    if !lane.workers.iter().any(|w| w.name == name) {
+        return Err(error(StatusCode::NOT_FOUND, "no such worker"));
+    }
+    let Some(alias) = body.alias else {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "missing field `alias` (a string, or null to clear)",
+        ));
+    };
+    let alias = normalize_alias(alias.as_deref()).map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+    queued(
+        &state,
+        Command::SetAlias {
+            lane: lane.key,
+            name,
+            alias,
+        },
+    )
+}
+
 /// Blocks found in every lane, newest first. Each row's `share_diff` is converted with
 /// its own lane's share multiplier; a row from a lane no longer configured uses the
 /// primary lane's.
@@ -678,6 +740,7 @@ mod tests {
         for (method, uri) in [
             ("POST", "/api/stats/reset"),
             ("DELETE", "/api/workers/x"),
+            ("PUT", "/api/workers/x/alias"),
             ("PUT", "/api/settings"),
         ] {
             let body = (method == "PUT").then(|| serde_json::json!({}));
@@ -815,6 +878,8 @@ mod tests {
             best_at: None,
             work_accepted: 0.0,
             last_share_seconds: None,
+            rejects: Default::default(),
+            alias: None,
         };
         // The same name is connected in one lane and idle in the other.
         state.publish(PoolSnapshot::from_lanes(
@@ -862,6 +927,168 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         assert!(rx.try_recv().is_err(), "only the offline worker was queued");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn aliases_are_trimmed_bounded_and_free_of_control_characters() {
+        use super::normalize_alias;
+        assert_eq!(
+            normalize_alias(Some("  Garage S19 ")),
+            Ok(Some("Garage S19".into()))
+        );
+        assert_eq!(normalize_alias(None), Ok(None));
+        assert_eq!(normalize_alias(Some("")), Ok(None), "empty clears");
+        assert_eq!(normalize_alias(Some(" \t ")), Ok(None), "blank clears");
+        let max = "é".repeat(32);
+        assert_eq!(
+            normalize_alias(Some(&max)),
+            Ok(Some(max.clone())),
+            "32 characters, not bytes"
+        );
+        assert!(normalize_alias(Some(&"x".repeat(33)))
+            .unwrap_err()
+            .contains("at most 32"));
+        assert!(normalize_alias(Some("rig\u{0}1"))
+            .unwrap_err()
+            .contains("control"));
+        assert!(normalize_alias(Some("a\nb")).is_err());
+        assert_eq!(normalize_alias(Some("rig 🐕")), Ok(Some("rig 🐕".into())));
+    }
+
+    #[tokio::test]
+    async fn set_alias_is_queued_for_known_workers_only() {
+        use crate::{Command, WorkerStatus};
+        let (state, path) = state("alias").await;
+        let mut rx = state.take_commands().unwrap();
+        let worker = |name: &str| WorkerStatus {
+            name: name.into(),
+            address: "addr".into(),
+            fallback: false,
+            aux_payouts: Vec::new(),
+            connections: 1,
+            difficulty: 1.0,
+            hashrate: 0.0,
+            shares_accepted: 0,
+            shares_rejected: 0,
+            rejects: Default::default(),
+            best_difficulty: 0.0,
+            best_at: None,
+            work_accepted: 0.0,
+            last_share_seconds: None,
+            alias: None,
+        };
+        state.publish(PoolSnapshot::from_lanes(
+            0,
+            vec![
+                lane("ltc", 65536.0, vec![worker("ltc1q.rig1")]),
+                lane("doge", 65536.0, vec![worker("D9.rig")]),
+            ],
+            vec![],
+        ));
+        let put = |uri: &str, body: serde_json::Value| {
+            let state = state.clone();
+            let uri = uri.to_string();
+            async move {
+                let (status, _, bytes) = send(&state, "PUT", &uri, Some(body)).await;
+                let json: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                (status, json)
+            }
+        };
+
+        let (status, json) = put(
+            "/api/workers/ltc1q.rig1/alias",
+            serde_json::json!({ "alias": "  Garage " }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{json}");
+        assert_eq!(json["status"], "queued");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::SetAlias {
+                lane: "ltc".into(),
+                name: "ltc1q.rig1".into(),
+                alias: Some("Garage".into()),
+            },
+            "the primary lane by default, trimmed"
+        );
+        let (status, _) = put(
+            "/api/workers/D9.rig/alias?lane=doge",
+            serde_json::json!({ "alias": null }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::SetAlias {
+                lane: "doge".into(),
+                name: "D9.rig".into(),
+                alias: None,
+            }
+        );
+        let (status, _) = put(
+            "/api/workers/D9.rig/alias?lane=doge",
+            serde_json::json!({ "alias": "" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "empty clears");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Command::SetAlias {
+                lane: "doge".into(),
+                name: "D9.rig".into(),
+                alias: None,
+            }
+        );
+
+        // Refusals, in the neighbours' error shape.
+        let (status, json) = put(
+            "/api/workers/D9.rig/alias",
+            serde_json::json!({ "alias": "x" }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the primary lane never saw it"
+        );
+        assert_eq!(json["error"], "no such worker");
+        let (status, json) = put(
+            "/api/workers/ltc1q.rig1/alias?lane=btc",
+            serde_json::json!({ "alias": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "unknown lane 'btc'; lanes: ltc, doge");
+        let (status, json) = put(
+            "/api/workers/ltc1q.rig1/alias",
+            serde_json::json!({ "alias": "x".repeat(33) }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json["error"].as_str().unwrap().contains("at most 32"));
+        let (status, json) = put(
+            "/api/workers/ltc1q.rig1/alias",
+            serde_json::json!({ "alias": "a\u{7}b" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json["error"].as_str().unwrap().contains("control"));
+        let (status, json) = put("/api/workers/ltc1q.rig1/alias", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(json["error"].as_str().unwrap().contains("missing field"));
+        assert!(rx.try_recv().is_err(), "nothing refused was queued");
+
+        state.set_read_only(true);
+        let (status, json) = put(
+            "/api/workers/ltc1q.rig1/alias",
+            serde_json::json!({ "alias": "x" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(json["error"].as_str().unwrap().contains("read-only"));
+        assert!(rx.try_recv().is_err());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

@@ -65,12 +65,21 @@ export interface WorkerStatus {
   difficulty: number;
   hashrate: number;
   shares_accepted: number;
+  /** Rejected shares, lifetime (survives restarts). */
   shares_rejected: number;
+  /**
+   * Rejected shares by reason slug (`stale_job`, `low_difficulty`, ...) since the daemon
+   * last started or the lane's counters were reset; zero counts are left out. Can sum to
+   * less than `shares_rejected`, which is lifetime.
+   */
+  rejects: Record<string, number>;
   best_difficulty: number;
   /** Unix seconds the best share arrived; null when unknown (older rows) or no share yet. */
   best_at: number | null;
   work_accepted: number;
   last_share_seconds: number | null;
+  /** Display name the operator gave the worker; null when none. */
+  alias: string | null;
 }
 
 export type BlockStatus = 'accepted' | 'rejected' | 'confirmed' | 'orphaned';
@@ -149,6 +158,8 @@ export interface LaneStatus {
   best_share_at: number | null;
   /** Unix time the lane first saw a worker: when it started keeping score. */
   scoring_since: number | null;
+  /** Seconds between shares the lane's vardiff aims for, as currently in force. */
+  target_share_seconds: number;
   /** Every coin configured in this lane, parent first, whatever the lane's state. */
   configured_coins: LaneCoin[];
   /** Chains mined in this lane, parent first, once they have had a template. */
@@ -304,6 +315,13 @@ export const api = {
     sendJson<{ status: string }>(
       'DELETE',
       `/api/workers/${encodeURIComponent(name)}${laneParam(lane, true)}`,
+    ),
+  /** Give a worker of a lane a display alias (1–32 characters), or clear it with null or ''. */
+  setWorkerAlias: (name: string, alias: string | null, lane?: string) =>
+    sendJson<{ status: string }>(
+      'PUT',
+      `/api/workers/${encodeURIComponent(name)}/alias${laneParam(lane, true)}`,
+      { alias },
     ),
   status: () => getJson<Status>('/api/status'),
   /** Samples for a lane (empty worker) or one worker over the last `span` seconds. */

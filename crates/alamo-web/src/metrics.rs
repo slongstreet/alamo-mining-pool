@@ -405,6 +405,9 @@ mod tests {
                 best_at: Some(1_700_000_000),
                 work_accepted: 80.0,
                 last_share_seconds: Some(1),
+                // Neither is exported: /metrics stays as it was.
+                rejects: [("stale_job", 1)].into(),
+                alias: Some("Rig One".into()),
             }],
             coins: vec![coin("LTC", Some(95.5), Some(false), true)],
             ..Default::default()
@@ -442,6 +445,7 @@ mod tests {
         assert!(text.contains("alamo_lane_state{lane=\"ltc\",state=\"running\"} 1\n"));
         assert!(text.contains("alamo_lane_state{lane=\"ltc\",state=\"failed\"} 0\n"));
         assert!(text.contains("alamo_lane_state{lane=\"doge\",state=\"failed\"} 1\n"));
+        assert!(!text.contains("stale_job") && !text.contains("Rig One"));
         // Nothing per lane is left without its label.
         for line in text.lines().filter(|l| !l.starts_with('#')) {
             if !line.starts_with("alamo_info") && !line.starts_with("alamo_uptime") {

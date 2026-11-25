@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Status } from '../api';
+  import type { DesktopNotifications } from '../desktop.svelte';
   import type { Connection } from '../live.svelte';
   import type { ThemePreference } from '../theme.svelte';
   import { formatDuration } from '../format';
@@ -11,12 +12,15 @@
     error,
     theme,
     page,
+    desktop,
   }: {
     status: Status | null;
     connection: Connection;
     error: string | null;
     theme: ThemePreference;
     page: 'dashboard' | 'settings';
+    /** Desktop block notifications; the control is only offered where the browser allows them. */
+    desktop?: DesktopNotifications;
   } = $props();
 
   const labels: Record<Connection, string> = {
@@ -74,6 +78,24 @@
       <i></i>
       {labels[connection]}
     </span>
+    {#if desktop?.supported}
+      {#if desktop.permission === 'denied'}
+        <button class="ghost" disabled title="This site's notifications are blocked in the browser's site settings">
+          Notifications blocked
+        </button>
+      {:else}
+        <button
+          class="ghost"
+          aria-pressed={desktop.active}
+          onclick={() => void desktop.toggle()}
+          title={desktop.active
+            ? 'A desktop notification is shown when a block is found. Click to turn off.'
+            : 'Show a desktop notification when a block is found'}
+        >
+          {desktop.active ? 'Desktop notifications on' : 'Enable desktop notifications'}
+        </button>
+      {/if}
+    {/if}
     <button class="ghost" onclick={() => theme.cycle()} title="Cycle theme">{themeLabel}</button>
     {#if page === 'settings'}
       <a class="ghost" href="#/">Dashboard</a>
@@ -103,6 +125,7 @@
   }
   .controls {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.75rem;
     padding-top: 0.4rem;
