@@ -2,7 +2,7 @@ manifestVersion: 1
 id: longstreet-alamo
 category: bitcoin
 name: Alamo Mining Pool
-version: "0.1.14"
+version: "0.1.15"
 tagline: Solo mine Litecoin and Dogecoin, and optionally Bitcoin, on your own nodes
 description: >-
   Alamo is a self-hosted solo mining pool. Miners connect over stratum with their
@@ -21,15 +21,14 @@ description: >-
   their Bitcoin address as the username to port 3334. The Bitcoin node is not a
   dependency of this app.
 releaseNotes: >-
-  Alamo 0.1.14: Bitcoin solo mining. Bitcoin (SHA-256) is an optional second lane on
-  port 3334 with its own vardiff, statistics, and blocks, and supports version rolling
-  (ASICBoost). It points at a Bitcoin node of your choosing on your network, which is
-  not a dependency of this app: add its RPC details as [coins.btc] in
-  data/alamo.local.toml under the app's data directory and restart (the Settings page
-  shows the snippet). The dashboard gains lane cards to switch between Scrypt and
-  SHA-256 statistics, "1 in N" odds for long shots, and per-lane vardiff settings.
-  Litecoin and Dogecoin mining is unchanged. Config errors no longer quote the
-  offending line, which could have exposed a password in the log.
+  Alamo 0.1.15: a lighter daemon. Share accounting does less work per share and writes
+  to the database in fewer statements, and block templates now share the transactions
+  they have in common, which lowers memory use on a Bitcoin lane. Mining, payouts, and
+  the dashboard are unchanged. For API users: the single-lane fields deprecated in
+  0.1.14 are gone. /api/status no longer has the top-level coins, hashrate, share
+  counts, work, best share, scoring_since, or workers (read them from lanes[]; the
+  primary lane is lanes[0]), and /api/settings takes vardiff only under
+  lanes.<key>.vardiff. Prometheus /metrics is unchanged.
 developer: Scott Longstreet
 website: https://github.com/slongstreet/alamo-mining-pool
 icon: https://raw.githubusercontent.com/slongstreet/longstreet-umbrel-apps/refs/heads/main/longstreet-alamo/icon.svg
