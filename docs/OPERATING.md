@@ -273,7 +273,10 @@ marked on the page and can be reverted to the file's value. Overrides are stored
 the config path they override: `stratum.vardiff.<field>` for lanes on `[stratum]`,
 `coins.<coin>.stratum.vardiff.<field>` for a parent with its own section. A stored value
 that no longer validates (say, after switching a node to another network) is dropped with
-a warning in the log. A coin's fallback address is checked once that coin's node has
+a warning in the log. Through the API (`GET`/`PUT /api/settings`) a lane's vardiff is
+`lanes[].vardiff` in the document and `lanes.<key>.vardiff` in a patch; the top-level
+`vardiff` that stood for the primary lane is gone after 0.1.14, and a patch that still
+sends it, or any other unknown top-level key, is refused with 422. A coin's fallback address is checked once that coin's node has
 answered, so until then its stored override is kept and the page does not list the coin;
 other values are checked at startup.
 
@@ -358,9 +361,10 @@ payouts.
 - **`GET /api/status`** is the full status document as JSON. `lanes` has one entry per
   parent coin, primary lane first (the parent on `[stratum]`, else the first by key), with
   its `state` (`connecting`, `running`, or `failed` with an `error`), port, chain,
-  hashrate, share counts, best share, coins, and workers. The older top-level fields
-  (`coins`, `hashrate`, `workers`, ...) mirror the primary lane for one more release and
-  then go; `blocks` lists every lane's blocks.
+  hashrate, share counts, best share, coins, and workers; `blocks` lists every lane's
+  blocks. The top-level `coins`, `hashrate`, share counts, `total_work`,
+  `share_multiplier`, best share, `scoring_since`, and `workers` that mirrored the primary
+  lane are gone after 0.1.14: read them from `lanes[0]` (or the lane by `key`).
 - **`GET /api/hashrate`** and **`GET /api/shares`** read one lane's history: the primary
   lane's unless `?lane=<key>` names another. An unknown lane is a 400 that lists the
   lanes there are.

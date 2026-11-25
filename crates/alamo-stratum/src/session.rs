@@ -57,7 +57,7 @@ pub struct Session {
     id: u64,
     extranonce1: [u8; EXTRANONCE1_LEN],
     payout: Option<Payouts>,
-    workers: Vec<String>,
+    workers: Vec<Arc<str>>,
     difficulty: f64,
     next_job: u64,
     jobs: VecDeque<SessionJob>,
@@ -109,7 +109,7 @@ impl Session {
     }
 
     /// Authorized worker names.
-    pub fn workers(&self) -> &[String] {
+    pub fn workers(&self) -> &[Arc<str>] {
         &self.workers
     }
 
@@ -276,12 +276,17 @@ impl Session {
                 self.difficulty = self.vardiff.clamp(d);
             }
         }
-        if !self.workers.iter().any(|w| w == username) {
-            self.workers.push(username.to_owned());
-        }
+        let worker = match self.workers.iter().find(|w| &***w == username) {
+            Some(w) => w.clone(),
+            None => {
+                let w: Arc<str> = Arc::from(username);
+                self.workers.push(w.clone());
+                w
+            }
+        };
         fx.events.push(PoolEvent::Authorized {
             session: self.id,
-            worker: username.to_owned(),
+            worker,
             address: payout.parent.address.clone(),
             fallback: payout.parent.fallback,
             aux: payout
@@ -298,7 +303,7 @@ impl Session {
         fx.respond(Response::ok(id, json!(true)));
         if first {
             self.set_difficulty(self.difficulty, fx);
-            self.send_current_job(fx);
+            self.send_job(false, fx);
         }
     }
 
@@ -325,10 +330,11 @@ impl Session {
             fx.respond(Response::err(id, StratumError::other("Malformed submit")));
             return;
         };
-        if !self.workers.iter().any(|w| w == worker) {
+        // The session's own copy of the name, so the share event shares it.
+        let Some(worker) = self.workers.iter().find(|w| &***w == worker).cloned() else {
             fx.respond(Response::err(id, RejectReason::Unauthorized.into()));
             return;
-        }
+        };
         // BIP310's sixth parameter. A lane without version rolling ignores it, as it
         // always has, so a scrypt miner that sends one anyway behaves exactly as before.
         let version_bits = match params.get(5) {
@@ -340,7 +346,7 @@ impl Session {
             Some(_) => Err(()),
         };
         let (Ok(extranonce2), Ok(ntime), Ok(nonce), Ok(version_bits)) = (
-            hex::decode(en2),
+            decode_extranonce2(en2),
             u32::from_str_radix(ntime, 16),
             u32::from_str_radix(nonce, 16),
             version_bits,
@@ -358,7 +364,7 @@ impl Session {
         };
 
         let submit = Submit {
-            worker,
+            worker: &worker,
             extranonce2,
             ntime,
             nonce,
@@ -382,7 +388,7 @@ impl Session {
         };
         fx.events.push(PoolEvent::Share {
             session: self.id,
-            worker: worker.to_owned(),
+            worker,
             coin,
             job_difficulty,
             share_difficulty,
@@ -452,10 +458,6 @@ impl Session {
         fx
     }
 
-    fn send_current_job(&mut self, fx: &mut Effects) {
-        self.send_job(false, fx);
-    }
-
     /// Send the current work as a new job, if there is work and a payout.
     fn send_job(&mut self, clean: bool, fx: &mut Effects) {
         let (Some(work), Some(payout)) = (self.work.clone(), self.payout.as_ref()) else {
@@ -504,6 +506,19 @@ impl Session {
         while self.jobs.len() > MAX_JOBS {
             self.jobs.pop_front();
         }
+    }
+}
+
+/// Parse a submit's extranonce2 hex without allocating on the normal path. `Ok(None)` is
+/// valid hex of the wrong length, which validation rejects as `InvalidExtranonce2` (after
+/// the job lookup and the stale check); anything that is not hex is an error.
+fn decode_extranonce2(en2: &str) -> Result<Option<[u8; EXTRANONCE2_LEN]>, hex::FromHexError> {
+    let mut bytes = [0u8; EXTRANONCE2_LEN];
+    match hex::decode_to_slice(en2, &mut bytes) {
+        Ok(()) => Ok(Some(bytes)),
+        // Even length but not EXTRANONCE2_LEN bytes: still malformed unless it is hex.
+        Err(hex::FromHexError::InvalidStringLength) => hex::decode(en2).map(|_| None),
+        Err(err) => Err(err),
     }
 }
 
@@ -797,6 +812,70 @@ mod tests {
             panic!()
         };
         assert_eq!(r.error.as_ref().unwrap().code, 21);
+    }
+
+    #[test]
+    fn extranonce2_errors_keep_their_replies_and_precedence() {
+        let mut s = session();
+        let a = addr(1);
+        s.handle(req("mining.authorize", json!([a, "x"])), Instant::now(), 0);
+        s.on_work(work(true));
+        s.on_work(work(true)); // job 1 is now stale, job 2 current
+        let submit = |s: &mut Session, job: &str, en2: &str| {
+            s.handle(
+                req(
+                    "mining.submit",
+                    json!([a, job, en2, "6553f100", "00000000"]),
+                ),
+                Instant::now(),
+                1_700_000_000,
+            )
+        };
+        let shares = |fx: &Effects| -> Vec<Option<RejectReason>> {
+            fx.events
+                .iter()
+                .filter_map(|e| match e {
+                    PoolEvent::Share {
+                        worker, rejected, ..
+                    } => {
+                        assert_eq!(&**worker, a);
+                        Some(*rejected)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let error = |reason: RejectReason| {
+            let e = StratumError::from(reason);
+            (e.code, e.message)
+        };
+
+        // Not hex (or odd-length hex): a malformed submit, never a share.
+        for en2 in ["zzzzzzzz", "0000001", "zz"] {
+            let fx = submit(&mut s, "2", en2);
+            assert_eq!(result_error(&fx), (20, "Malformed submit"), "{en2}");
+            assert!(shares(&fx).is_empty(), "{en2}");
+        }
+        // Valid hex of the wrong length: the job lookup and the stale check come first.
+        for en2 in ["000001", "0000000001", ""] {
+            let fx = submit(&mut s, "99", en2);
+            let (code, message) = error(RejectReason::UnknownJob);
+            assert_eq!(result_error(&fx), (code, message.as_str()), "{en2}");
+            assert!(shares(&fx).is_empty());
+
+            let fx = submit(&mut s, "1", en2);
+            let (code, message) = error(RejectReason::StaleJob);
+            assert_eq!(result_error(&fx), (code, message.as_str()), "{en2}");
+            assert_eq!(shares(&fx), [Some(RejectReason::StaleJob)]);
+
+            let fx = submit(&mut s, "2", en2);
+            let (code, message) = error(RejectReason::InvalidExtranonce2);
+            assert_eq!(result_error(&fx), (code, message.as_str()), "{en2}");
+            assert_eq!(shares(&fx), [Some(RejectReason::InvalidExtranonce2)]);
+        }
+        // The right length gets as far as hashing.
+        let fx = submit(&mut s, "2", "0000000a");
+        assert_eq!(shares(&fx), [Some(RejectReason::LowDifficulty)]);
     }
 
     #[test]

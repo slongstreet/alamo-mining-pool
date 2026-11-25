@@ -15,3 +15,7 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[features]
+# Test helpers shared with dependent crates' tests.
+test-util = []

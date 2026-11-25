@@ -63,8 +63,6 @@ pub struct SettingsDoc {
     /// Every configured coin, lane by lane (primary lane first), parent first within a
     /// lane, whether or not its node has answered yet.
     pub coins: Vec<CoinSettings>,
-    /// Deprecated: the primary lane's vardiff, `lanes[0].vardiff`.
-    pub vardiff: VardiffSettings,
     /// Every configured lane, primary first.
     pub lanes: Vec<LaneSettings>,
     /// Log filter directive (`info`, `debug`, ...).
@@ -137,8 +135,10 @@ pub struct VardiffSettings {
 }
 
 /// A change request. Every field is optional; a field set to `null` reverts that setting
-/// to the config file's value, and a value stores an override.
+/// to the config file's value, and a value stores an override. Unknown top-level keys,
+/// including the removed top-level `vardiff` (now `lanes.<key>.vardiff`), are refused.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SettingsPatch {
     /// Display name.
     #[serde(default, deserialize_with = "double_option")]
@@ -149,9 +149,6 @@ pub struct SettingsPatch {
     /// Fallback address per coin key.
     #[serde(default)]
     pub fallback_addresses: BTreeMap<String, Option<String>>,
-    /// Deprecated: vardiff fields for the primary lane, like `lanes.<primary>.vardiff`.
-    #[serde(default)]
-    pub vardiff: VardiffPatch,
     /// Per-lane changes keyed by lane. A lane's vardiff override is stored under the
     /// config table it overrides, so patching a lane on the default `[stratum]` section
     /// changes every lane that shares that section.
@@ -200,7 +197,6 @@ impl SettingsPatch {
             && self.coinbase_tag.is_none()
             && self.fallback_addresses.is_empty()
             && self.log_level.is_none()
-            && self.vardiff == VardiffPatch::default()
             && self
                 .lanes
                 .values()
@@ -276,13 +272,13 @@ mod tests {
         assert_eq!(p.coinbase_tag, Some(Some("/x/".into())));
         assert!(!p.is_empty());
         let p: SettingsPatch = serde_json::from_str(
-            r#"{"fallback_addresses": {"ltc": null, "doge": "D1"}, "vardiff": {"min_difficulty": 2048}}"#,
+            r#"{"fallback_addresses": {"ltc": null, "doge": "D1"}, "lanes": {"ltc": {"vardiff": {"min_difficulty": 2048}}}}"#,
         )
         .unwrap();
         assert_eq!(p.fallback_addresses["ltc"], None);
         assert_eq!(p.fallback_addresses["doge"].as_deref(), Some("D1"));
-        assert_eq!(p.vardiff.min_difficulty, Some(Some(2048.0)));
-        assert_eq!(p.vardiff.max_difficulty, None);
+        assert_eq!(p.lanes["ltc"].vardiff.min_difficulty, Some(Some(2048.0)));
+        assert_eq!(p.lanes["ltc"].vardiff.max_difficulty, None);
         let p: SettingsPatch =
             serde_json::from_str(r#"{"lanes": {"doge": {"vardiff": {"min_difficulty": null}}}}"#)
                 .unwrap();
@@ -290,5 +286,9 @@ mod tests {
         assert!(!p.is_empty());
         let p: SettingsPatch = serde_json::from_str(r#"{"lanes": {"doge": {}}}"#).unwrap();
         assert!(p.is_empty());
+        let err = serde_json::from_str::<SettingsPatch>(r#"{"vardiff": {"min_difficulty": 1}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `vardiff`"), "{err}");
     }
 }

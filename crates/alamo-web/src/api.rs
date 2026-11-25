@@ -142,7 +142,7 @@ fn positive_or_one(m: f64) -> f64 {
 
 /// Resolve the requested lane, defaulting to the primary one. A lane the pool does not
 /// have is a 400 that lists the ones it does. Before the pool has published its lanes
-/// only the primary lane is known.
+/// only the primary lane is known, with no workers and a share multiplier of 1.
 fn resolve_lane(state: &AppState, requested: Option<&str>) -> Result<LaneRef, Refusal> {
     let snapshot = state.snapshot();
     let primary = state.primary_lane();
@@ -151,8 +151,8 @@ fn resolve_lane(state: &AppState, requested: Option<&str>) -> Result<LaneRef, Re
         if key == primary {
             return Ok(LaneRef {
                 key: primary.clone(),
-                share_multiplier: positive_or_one(snapshot.share_multiplier),
-                workers: snapshot.workers,
+                share_multiplier: 1.0,
+                workers: Vec::new(),
             });
         }
     } else if let Some(lane) = snapshot.lane(key) {
@@ -307,7 +307,7 @@ pub async fn blocks(
     let fallback = positive_or_one(
         snapshot
             .lane(&state.primary_lane())
-            .map_or(snapshot.share_multiplier, |l| l.share_multiplier),
+            .map_or(0.0, |l| l.share_multiplier),
     );
     let mut rows = state.store().recent_blocks(q.clamp(50, 500)).await?;
     for r in &mut rows {
@@ -489,19 +489,6 @@ mod tests {
     use std::path::PathBuf;
     use tower::ServiceExt;
 
-    fn temp_db(tag: &str) -> PathBuf {
-        std::env::temp_dir()
-            .join(format!(
-                "alamo-web-{tag}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ))
-            .join("pool.db")
-    }
-
     fn lane(
         key: &str,
         share_multiplier: f64,
@@ -517,7 +504,7 @@ mod tests {
     }
 
     async fn state(tag: &str) -> (AppState, PathBuf) {
-        let path = temp_db(tag);
+        let path = alamo_store::temp_path(&format!("web-{tag}"));
         let store = Store::open(&path).await.unwrap();
         (AppState::new("test", 3333, store), path)
     }
@@ -629,8 +616,10 @@ mod tests {
         assert_eq!(doc["pool_name"]["value"], "Fake");
         assert_eq!(doc["read_only"], false);
 
-        let patch =
-            serde_json::json!({ "pool_name": "Renamed", "vardiff": { "min_difficulty": null } });
+        let patch = serde_json::json!({
+            "pool_name": "Renamed",
+            "lanes": { "ltc": { "vardiff": { "min_difficulty": null } } }
+        });
         let (status, _, body) = send(&state, "PUT", "/api/settings", Some(patch)).await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -639,8 +628,24 @@ mod tests {
         {
             let recorded = op.patches.lock().unwrap();
             assert_eq!(recorded.len(), 1);
-            assert_eq!(recorded[0].vardiff.min_difficulty, Some(None));
+            assert_eq!(recorded[0].lanes["ltc"].vardiff.min_difficulty, Some(None));
         }
+
+        // The top-level vardiff is gone: refused before it reaches the operator.
+        let (status, _, body) = send(
+            &state,
+            "PUT",
+            "/api/settings",
+            Some(serde_json::json!({ "vardiff": { "min_difficulty": 2048 } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            String::from_utf8_lossy(&body).contains("unknown field `vardiff`"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(op.patches.lock().unwrap().len(), 1);
 
         let (status, _, body) = send(
             &state,
@@ -934,7 +939,7 @@ mod tests {
                         difficulty: 8.0,
                         share_diff: 9.0,
                         accepted: i != 2,
-                        reject_reason: (i == 2).then(|| "stale_job".into()),
+                        reject_reason: (i == 2).then_some("stale_job"),
                     })
                     .collect::<Vec<_>>(),
             )
@@ -1006,10 +1011,11 @@ mod tests {
 
         // Once the pool reports its share multiplier, share_diff comes back in network
         // units while the job difficulty stays as the miner saw it.
-        state.publish(PoolSnapshot {
-            share_multiplier: 4.0,
-            ..Default::default()
-        });
+        state.publish(PoolSnapshot::from_lanes(
+            0,
+            vec![lane("ltc", 4.0, vec![]), lane("btc", 1.0, vec![])],
+            vec![],
+        ));
         state
             .store()
             .insert_block(&alamo_store::NewBlock {
@@ -1081,15 +1087,14 @@ mod tests {
         let first: serde_json::Value = serde_json::from_str(&first).unwrap();
         assert_eq!(first["pool_name"], "test");
         assert_eq!(first["stratum_port"], 3333);
-        assert_eq!(first["shares_accepted"], 0);
+        assert_eq!(first["lanes"], serde_json::json!([]));
 
-        state.publish(PoolSnapshot {
-            shares_accepted: 7,
-            ..Default::default()
-        });
+        let mut ltc = lane("ltc", 65536.0, vec![]);
+        ltc.shares_accepted = 7;
+        state.publish(PoolSnapshot::from_lanes(0, vec![ltc], vec![]));
         let second = socket.next().await.unwrap().unwrap().into_text().unwrap();
         let second: serde_json::Value = serde_json::from_str(&second).unwrap();
-        assert_eq!(second["shares_accepted"], 7);
+        assert_eq!(second["lanes"][0]["shares_accepted"], 7);
 
         socket.close(None).await.unwrap();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

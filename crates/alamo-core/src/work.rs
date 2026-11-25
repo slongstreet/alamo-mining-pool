@@ -13,7 +13,8 @@ use std::sync::Arc;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TemplateTx {
     /// Raw serialized transaction (with witness data if any), as the node gave it.
-    pub data: Vec<u8>,
+    /// Shared, so successive templates that carry the same transaction hold one copy.
+    pub data: Arc<[u8]>,
     /// Transaction id in internal byte order.
     pub txid: Hash256,
 }

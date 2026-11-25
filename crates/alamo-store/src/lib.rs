@@ -69,8 +69,10 @@ impl Store {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn temp_path(tag: &str) -> std::path::PathBuf {
+/// A fresh database path under the system temp directory, unique to this process and
+/// call, for tests. Shared with dependent crates' tests through the `test-util` feature.
+#[cfg(any(test, feature = "test-util"))]
+pub fn temp_path(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir()
         .join(format!(
             "alamo-store-{tag}-{}-{}",

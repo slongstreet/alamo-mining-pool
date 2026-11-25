@@ -12,8 +12,8 @@ use alamo_core::job::{RejectReason, ShareOutcome};
 pub struct Submit<'a> {
     /// Worker name.
     pub worker: &'a str,
-    /// extranonce2 bytes.
-    pub extranonce2: Vec<u8>,
+    /// extranonce2 bytes; `None` when the miner sent valid hex of the wrong length.
+    pub extranonce2: Option<[u8; EXTRANONCE2_LEN]>,
     /// Header time.
     pub ntime: u32,
     /// Header nonce.
@@ -41,12 +41,15 @@ pub fn validate(
     if job.stale {
         return (ShareOutcome::Rejected(RejectReason::StaleJob), Vec::new());
     }
-    if submit.extranonce2.len() + EXTRANONCE1_LEN != job.coinbase.extranonce_len {
-        return (
-            ShareOutcome::Rejected(RejectReason::InvalidExtranonce2),
-            Vec::new(),
-        );
-    }
+    let extranonce2 = match submit.extranonce2 {
+        Some(en2) if EXTRANONCE1_LEN + EXTRANONCE2_LEN == job.coinbase.extranonce_len => en2,
+        _ => {
+            return (
+                ShareOutcome::Rejected(RejectReason::InvalidExtranonce2),
+                Vec::new(),
+            )
+        }
+    };
     if u64::from(submit.ntime) < u64::from(job.work.min_time)
         || u64::from(submit.ntime) > now_unix + MAX_FUTURE_NTIME
     {
@@ -65,7 +68,7 @@ pub fn validate(
         Some(bits) => rolled_version(job.work.version, bits, version_mask),
         None => job.work.version,
     };
-    let en2 = u32::from_be_bytes(submit.extranonce2[..].try_into().unwrap());
+    let en2 = u32::from_be_bytes(extranonce2);
     if !job
         .seen
         .insert((en2, submit.ntime, submit.nonce, version as u32))
@@ -75,7 +78,7 @@ pub fn validate(
 
     let mut extranonce = [0u8; EXTRANONCE1_LEN + EXTRANONCE2_LEN];
     extranonce[..EXTRANONCE1_LEN].copy_from_slice(extranonce1);
-    extranonce[EXTRANONCE1_LEN..].copy_from_slice(&submit.extranonce2);
+    extranonce[EXTRANONCE1_LEN..].copy_from_slice(&extranonce2);
 
     let coinbase_txid = job.coinbase.txid(&extranonce);
     let header = BlockHeader {
@@ -226,7 +229,7 @@ mod tests {
     fn submit(nonce: u32) -> Submit<'static> {
         Submit {
             worker: "w",
-            extranonce2: vec![0, 0, 0, 1],
+            extranonce2: Some([0, 0, 0, 1]),
             ntime: 1_700_000_000,
             nonce,
             version_bits: None,
@@ -298,7 +301,7 @@ mod tests {
             ShareOutcome::Rejected(RejectReason::InvalidNtime)
         );
         let mut s = submit(1);
-        s.extranonce2 = vec![0; 3];
+        s.extranonce2 = None;
         assert_eq!(
             validate(&mut j, &[0; 4], &s, 0, "a", 1_700_000_100).0,
             ShareOutcome::Rejected(RejectReason::InvalidExtranonce2)
